@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Backend Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap');
+:root{--bg:#111217;--panel:#1b1c21;--panel-2:#212226;--border:#2c2d33;--border-soft:#28292f;--text:#d8d9da;--muted:#6e7079;--accent:#5794f2;--accent-hover:#4a85e0;--accent-bg:rgba(87,148,242,.15);--green:#7dce9a;--yellow:#f8d16c;--red:#f2495c;--orange:#ff9f4a;--purple:#c38dd4;--cyan:#7ad7f0;--font:'Inter',-apple-system,sans-serif;--mono:'JetBrains Mono',Consolas,'SF Mono',monospace}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
+.topbar-left{display:flex;align-items:center;gap:14px}
+.topbar-left .logo{width:28px;height:28px;background:linear-gradient(135deg,#5794f2,#3d71d9);border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;flex-shrink:0}
+.topbar-left h1{font-size:15px;font-weight:600;letter-spacing:-.2px;color:#f0f1f2}
+.topbar-left .sub{font-size:12px;color:var(--muted);font-weight:400;margin-left:8px;padding-left:12px;border-left:1px solid var(--border)}
+.topbar-right{display:flex;align-items:center;gap:14px}
+.health-pill{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);background:var(--panel-2);border:1px solid var(--border);border-radius:4px;padding:4px 10px;font-variant-numeric:tabular-nums}
+.health-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+.health-pill.online .dot{background:var(--green);box-shadow:0 0 6px rgba(125,206,154,.6)}
+.health-pill.offline .dot{background:var(--red);box-shadow:0 0 6px rgba(242,73,92,.6)}
+.health-pill.latency{color:var(--muted)}
+.health-pill.latency .dot{background:var(--accent)}
+.topbar-right .time{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.topbar-right a.logout{font-size:12px;font-weight:600;color:var(--muted);text-decoration:none;transition:color .2s}
+.topbar-right a.logout:hover{color:var(--red)}
+.menu-bar{display:flex;align-items:center;gap:4px;flex-wrap:wrap;padding:8px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
+.menu-item{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:500;color:var(--muted);padding:6px 10px;border-radius:4px;cursor:pointer;transition:all .15s;user-select:none}
+.menu-item:hover{color:var(--text);background:var(--panel-2)}
+.menu-item svg{width:13px;height:13px;fill:currentColor;flex-shrink:0}
+.menu-bar .sep{width:1px;height:20px;background:var(--border);margin:0 6px;flex-shrink:0}
+.period-btn{padding:5px 14px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--muted);font-size:12px;font-weight:500;font-family:inherit;cursor:pointer;transition:all .15s}
+.period-btn:hover{color:var(--text);background:var(--panel-2);border-color:#3a3b42}
+.period-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.date-input{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
+.date-input input{padding:5px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);font-size:12px;font-family:inherit;outline:none;transition:border-color .2s}
+.date-input input:focus{border-color:var(--accent)}
+.date-input button{padding:5px 12px;border:none;border-radius:4px;background:var(--accent);color:#fff;font-size:12px;font-weight:600;font-family:inherit;cursor:pointer;transition:background .2s}
+.date-input button:hover{background:var(--accent-hover)}
+.date-input button:disabled{opacity:.5;cursor:default}
+.content{max-width:1500px;margin:0 auto;padding:16px 20px 40px;display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:4px;display:flex;flex-direction:column;min-width:0}
+.panel:hover{border-color:#3a3b42}
+.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border-soft);cursor:move}
+.panel-head h3{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.panel-head .badge{font-size:10px;font-weight:600;color:var(--muted);background:var(--panel-2);border:1px solid var(--border);padding:2px 8px;border-radius:10px;flex-shrink:0}
+.panel-head .badge.pill-green{color:var(--green)}
+.panel-head .badge.pill-yellow{color:var(--yellow)}
+.panel-head .badge.pill-red{color:var(--red)}
+.panel-head .badge.pill-blue{color:var(--accent)}
+.panel-body{padding:12px;flex:1;min-height:0;display:flex;flex-direction:column}
+.panel-body.chart-body{padding:10px 12px 12px}
+.panel-body table{width:100%;border-collapse:collapse;font-size:12px}
+.panel-body th{text-align:left;padding:6px 8px;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border-soft)}
+.panel-body td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border-soft);color:var(--text);font-variant-numeric:tabular-nums}
+.panel-body tr:last-child td{border-bottom:none}
+.panel-body td.num{text-align:right;font-family:var(--mono);font-size:11px}
+.panel-body th.num{text-align:right}
+.panel-body td .mono{font-family:var(--mono);font-size:11px}
+.loading{color:var(--muted);font-size:12px;padding:8px 0}
+.spinner{width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;display:inline-block;vertical-align:middle;margin-right:8px}
+.row{display:flex;justify-content:space-between;padding:7px 2px;font-size:12px;border-bottom:1px solid var(--border-soft);line-height:1.4;gap:10px}
+.row:last-child{border-bottom:none}
+.row .label{color:var(--muted);flex-shrink:0}
+.row .val{font-weight:600;text-align:right;overflow-wrap:anywhere;word-break:break-all}
+.row .val.green{color:var(--green)}
+.row .val.yellow{color:var(--yellow)}
+.row .val.red{color:var(--red)}
+.row .val.blue{color:var(--accent)}
+.row .val.mono{font-family:var(--mono);font-size:11px}
+.panel-body .chart-wrap{position:relative;flex:1;min-height:180px}
+.panel-body .chart-wrap canvas{position:absolute;inset:0;width:100%;height:100%}
+.chart-wrap .no-data{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:var(--muted);font-size:12px}
+.chart-wrap.no-data canvas{visibility:hidden}
+.chart-wrap.no-data .no-data{display:flex}
+.summary-body{padding:14px 16px}
+.summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+@media(max-width:900px){.summary-grid{grid-template-columns:repeat(2,1fr)}}
+.summary-item{border-left:2px solid var(--border);padding-left:14px}
+.summary-item .summary-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:600;margin-bottom:6px}
+.summary-item .summary-value{font-size:26px;font-weight:600;letter-spacing:-.5px;font-variant-numeric:tabular-nums;color:#f0f1f2}
+.summary-item .summary-value.accent{color:var(--accent)}
+.summary-item .summary-value.green{color:var(--green)}
+.summary-item .summary-value.yellow{color:var(--yellow)}
+.panel-main{grid-column:span 6}
+.panel-half{grid-column:span 3}
+.panel-third{grid-column:span 2}
+.panel-quarter{grid-column:span 3;grid-row:span 2}
+.panel-full{grid-column:span 6}
+@media(max-width:1200px){.panel-third,.panel-half,.panel-quarter,.panel-main,.panel-full{grid-column:span 6;grid-row:auto}}
+.cap-list{padding:2px 0}
+.cap-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 2px;font-size:12px;border-bottom:1px solid var(--border-soft)}
+.cap-item:last-child{border-bottom:none}
+.cap-item .name{color:var(--text);overflow-wrap:anywhere}
+.cap-item .desc{color:var(--muted);font-size:11px}
+.tag{font-size:10px;font-weight:600;padding:2px 8px;border-radius:10px;letter-spacing:.3px}
+.tag.ok{color:var(--green);background:rgba(125,206,154,.1)}
+.tag.off{color:var(--muted);background:var(--panel-2)}
+.endpoint-row{display:flex;align-items:center;gap:10px;padding:7px 2px;font-size:12px;border-bottom:1px solid var(--border-soft);min-width:0}
+.endpoint-row:last-child{border-bottom:none}
+.method-badge{font-size:10px;font-weight:700;padding:2px 8px;border-radius:3px;flex-shrink:0;letter-spacing:.5px}
+.method-GET{color:var(--green);background:rgba(125,206,154,.12)}
+.method-POST{color:var(--yellow);background:rgba(248,209,108,.12)}
+.method-badge.other{color:var(--purple);background:rgba(195,141,212,.12)}
+.endpoint-path{font-family:var(--mono);font-size:11px;color:var(--text);flex-shrink:0}
+.endpoint-desc{color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.relay-status-list{display:flex;flex-direction:column;gap:10px;padding:2px 0}
+.relay-item{border:1px solid var(--border-soft);border-radius:4px;padding:10px;display:flex;align-items:center;gap:10px}
+.relay-item.ok{border-left:3px solid var(--green)}
+.relay-item.fail{border-left:3px solid var(--red)}
+.relay-item .url{font-family:var(--mono);font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.relay-item .ip{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.relay-item .state{font-size:11px;font-weight:600;flex-shrink:0}
+.relay-item .state.ok{color:var(--green)}
+.relay-item .state.fail{color:var(--red)}
+.log-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.log-toolbar select{background:var(--panel-2);border:1px solid var(--border);color:var(--text);font-size:11px;font-family:inherit;border-radius:4px;padding:4px 8px;outline:none;cursor:pointer}
+.log-toolbar select:focus{border-color:var(--accent)}
+.log-btn{background:var(--panel-2);border:1px solid var(--border);color:var(--muted);font-size:11px;font-weight:600;font-family:inherit;border-radius:4px;padding:4px 10px;cursor:pointer;transition:all .15s}
+.log-btn:hover{color:var(--text);border-color:#3a3b42}
+.log-btn.on{color:var(--accent);border-color:var(--accent)}
+.log-status{font-size:11px;color:var(--muted);margin-left:auto;font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:6px}
+.log-status .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px rgba(125,206,154,.6)}
+.log-status.paused .dot{background:var(--yellow);box-shadow:none}
+.log-status.off .dot{background:var(--red);box-shadow:none}
+.log-box{background:#0d0e11;border:1px solid var(--border-soft);border-radius:4px;height:320px;overflow-y:auto;padding:8px 10px;font-family:var(--mono);font-size:11px;line-height:1.55;flex-shrink:0}
+.panel-quarter .log-box{height:auto;flex:1;min-height:420px;max-height:640px}
+.log-line{white-space:pre-wrap;word-break:break-word;padding:1px 0;color:var(--text)}
+.log-line .ts{color:#55565e}
+.log-lv{font-weight:700;padding:0 6px;border-radius:3px;margin:0 6px 0 2px;font-size:10px}
+.log-lv.INFO{color:var(--green);background:rgba(125,206,154,.1)}
+.log-lv.WARN{color:var(--yellow);background:rgba(248,209,108,.12)}
+.log-lv.ERROR{color:var(--red);background:rgba(242,73,92,.12)}
+.log-lv.RELAY{color:var(--cyan);background:rgba(122,215,240,.1)}
+.log-lv.STREAM{color:var(--accent);background:var(--accent-bg)}
+.log-lv.RESP{color:var(--purple);background:rgba(195,141,212,.12)}
+.log-lv.MODELS,.log-lv.USAGE{color:var(--purple);background:rgba(195,141,212,.1)}
+.zoom-btn{background:var(--panel-2);border:1px solid var(--border);color:var(--muted);width:22px;height:22px;border-radius:4px;cursor:pointer;font-size:12px;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .15s}
+.zoom-btn:hover{color:var(--text);border-color:#3a3b42}
+.modal{position:fixed;inset:0;background:rgba(10,11,13,.6);display:none;align-items:center;justify-content:center;z-index:100;padding:20px}
+.modal.show{display:flex}
+.modal-panel{background:var(--panel);border:1px solid var(--border);border-radius:4px;width:100%;max-width:900px;max-height:85vh;display:flex;flex-direction:column}
+.modal-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border)}
+.modal-head h3{font-size:13px;font-weight:600}
+.modal-head button{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;padding:2px 6px}
+.modal-head button:hover{color:var(--text)}
+.modal-body{padding:14px;flex:1;min-height:0;display:flex;flex-direction:column}
+.modal-body .chart-wrap{min-height:400px}
+html,body{overflow-x:hidden}
+img,canvas{max-width:100%}
+.panel-body{min-width:0;overflow-x:auto}
+@media(max-width:720px){
+.content{grid-template-columns:1fr;padding:12px 12px 32px}
+.topbar{padding:10px 12px}
+.topbar-left .sub{display:none}
+.topbar-right{flex-wrap:wrap;gap:8px}
+.topbar-right .time{display:none}
+.menu-bar{padding:8px 12px;gap:6px}
+.menu-bar .sep{display:none}
+.date-input{flex-wrap:wrap;width:100%}
+.date-input input{flex:1;min-width:0}
+.panel-body .chart-wrap{min-height:220px}
+.panel-quarter .log-box{min-height:280px;max-height:420px}
+.relay-item{flex-wrap:wrap}
+.endpoint-row{flex-wrap:wrap;gap:6px}
+.endpoint-desc{white-space:normal;overflow:visible;text-overflow:clip}
+.summary-item .summary-value{font-size:20px}
+.modal{padding:12px}
+.modal-body .chart-wrap{min-height:280px}
+}
+@media(max-width:560px){
+.summary-grid{grid-template-columns:repeat(2,1fr);gap:10px}
+.summary-body{padding:12px}
+.log-toolbar{gap:6px}
+}
+@media(max-width:380px){
+.summary-grid{grid-template-columns:1fr}
+.period-btn{flex:1;text-align:center}
+}
+</style>
+</head>
+<body>
+<div class="topbar">
+<div class="topbar-left">
+<div class="logo">M</div>
+<h1>Backend Monitor</h1>
+<div class="sub" id="subtitle">Loading...</div>
+</div>
+<div class="topbar-right">
+<span class="health-pill offline" id="healthPill"><span class="dot"></span><span id="healthText">Checking...</span></span>
+<span class="health-pill latency" id="latencyPill"><span class="dot"></span><span id="latencyText">-</span></span>
+<span class="time" id="liveTime"></span>
+<a href="/monitor/logout" class="logout">Sign out</a>
+</div>
+</div>
+
+<div class="menu-bar">
+<span class="menu-item"><svg viewBox="0 0 16 16"><path d="M1 2h14v2H1zm0 4h10v2H1zm0 4h14v2H1zm0 4h8v2H1z"/></svg>Dashboard</span>
+<span class="menu-item" onclick="refresh()"><svg viewBox="0 0 16 16"><path d="M8 2a6 6 0 100 12 6 6 0 000-12zm0 2a4 4 0 110 8 4 4 0 010-8z"/></svg>Refresh</span>
+<div class="sep"></div>
+<button class="period-btn active" data-period="today">Today</button>
+<button class="period-btn" data-period="1d">24H</button>
+<button class="period-btn" data-period="7d">7D</button>
+<button class="period-btn" data-period="30d">30D</button>
+<div class="sep"></div>
+<div class="date-input">
+<span>From</span>
+<input type="date" id="dateStart">
+<span>To</span>
+<input type="date" id="dateEnd">
+<button id="applyDateBtn">Apply</button>
+</div>
+<div class="sep"></div>
+<span class="menu-item" onclick="refresh()" id="autoText">Auto refresh off</span>
+</div>
+
+<div class="content">
+<div class="panel panel-full"><div class="panel-head"><h3>Overview</h3><span class="badge" id="periodBadge">-</span></div><div class="panel-body summary-body"><div class="summary-grid">
+<div class="summary-item"><div class="summary-label">Requests</div><div class="summary-value accent" id="statRequests">-</div></div>
+<div class="summary-item"><div class="summary-label">Prompt Tokens</div><div class="summary-value green" id="statPrompt">-</div></div>
+<div class="summary-item"><div class="summary-label">Completion Tokens</div><div class="summary-value yellow" id="statCompletion">-</div></div>
+<div class="summary-item"><div class="summary-label">Total Tokens</div><div class="summary-value" id="statTotal">-</div></div>
+</div></div></div>
+<div class="panel panel-half"><div class="panel-head"><h3>Token Usage Over Time</h3><button class="zoom-btn" data-zoom="tokenChart" title="Maximize">&#8645;</button></div><div class="panel-body chart-body"><div class="chart-wrap" id="tokenWrap"><canvas id="tokenChart"></canvas><div class="no-data">No data for this period</div></div></div></div>
+<div class="panel panel-half"><div class="panel-head"><h3>Requests Over Time</h3><button class="zoom-btn" data-zoom="reqChart" title="Maximize">&#8645;</button></div><div class="panel-body chart-body"><div class="chart-wrap" id="reqWrap"><canvas id="reqChart"></canvas><div class="no-data">No data for this period</div></div></div></div>
+<div class="panel panel-third"><div class="panel-head"><h3>Relay Status</h3><span style="display:flex;gap:6px;align-items:center"><button class="log-btn" id="relayResetBtn" title="Hapus 429-cooldown + stream-broken (wajib setelah redeploy relay)">Reset</button><span class="badge" id="relayBadge">-</span></span></div><div class="panel-body" id="relayContent"><div class="loading"><span class="spinner"></span>Testing relays...</div></div></div>
+<div class="panel panel-third"><div class="panel-head"><h3>Relay IPs</h3></div><div class="panel-body" id="relayIpsContent"><div class="loading"><span class="spinner"></span>Resolving...</div></div></div>
+<div class="panel panel-third"><div class="panel-head"><h3>Configuration</h3></div><div class="panel-body" id="configContent"><div class="loading"><span class="spinner"></span>Loading...</div></div></div>
+<div class="panel panel-quarter"><div class="panel-head"><h3>Capabilities</h3></div><div class="panel-body"><div class="cap-list" id="capList"></div></div></div>
+<div class="panel panel-quarter"><div class="panel-head"><h3>Usage Per Model</h3></div><div class="panel-body"><table><thead><tr><th>Model</th><th class="num">Req</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total</th></tr></thead><tbody id="modelTableBody"><tr><td colspan="5" class="loading"><span class="spinner"></span>Loading...</td></tr></tbody></table></div></div>
+<div class="panel panel-quarter"><div class="panel-head"><h3>Endpoints</h3></div><div class="panel-body" id="endpointList"><div class="loading"><span class="spinner"></span>Loading...</div></div></div>
+<div class="panel panel-quarter"><div class="panel-head"><h3>Live Logs</h3><span class="badge pill-blue" id="logCount">0</span></div><div class="panel-body">
+<div class="log-toolbar">
+<select id="logLevel"><option value="">ALL</option><option>INFO</option><option>WARN</option><option>ERROR</option><option>RELAY</option><option>STREAM</option><option>RESP</option><option>MODELS</option><option>USAGE</option></select>
+<button class="log-btn on" id="logScrollBtn">Auto-scroll ON</button>
+<button class="log-btn" id="logPauseBtn">Pause</button>
+<button class="log-btn" id="logClearBtn">Clear</button>
+<span class="log-status" id="logStatus"><span class="dot"></span><span id="logStatusText">connecting...</span></span>
+</div>
+<div class="log-box" id="logBox"><div class="loading"><span class="spinner"></span>Connecting to live logs...</div></div>
+</div></div>
+</div>
+
+<div class="modal" id="zoomModal">
+<div class="modal-panel">
+<div class="modal-head"><h3 id="zoomTitle"></h3><button id="zoomClose">&times;</button></div>
+<div class="modal-body"><div class="chart-wrap"><canvas id="zoomCanvas"></canvas></div></div>
+</div>
+</div>
+
+<script>
+const CHART_COLORS={text:'#6e7079',grid:'#28292f',tick:'#8b8d94',
+promptBg:'rgba(87,148,242,.55)',promptBorder:'#5794f2',
+completionBg:'rgba(248,209,108,.55)',completionBorder:'#f8d16c',
+totalBg:'rgba(125,206,154,.4)',totalBorder:'#7dce9a',
+accent:'#5794f2',accentFill:'rgba(87,148,242,.15)',
+purple:'#c38dd4',purpleBg:'rgba(195,141,212,.15)'};
+const SHORT_HOUR=8;
+const FORMATTER=new Intl.NumberFormat('en-US');
+const COMPACT=new Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:1});
+let tokenChartInstance=null,reqChartInstance=null,zoomChartInstance=null;
+let currentPeriod='today',customStart='',customEnd='',bucketsCache=[];
+let zooming=null,lastRefreshTime=null,autoTimer=null,autoRefresh=false;
+
+function updateTime(){const n=new Date;document.getElementById('liveTime').textContent=n.toLocaleString();if(lastRefreshTime){const d=Math.max(0,Math.round((Date.now()-lastRefreshTime)/1000));document.getElementById('latencyText').textContent=d+'s ago'}}
+setInterval(updateTime,1000);updateTime();
+
+function abbreviate(labels){
+if(labels.length<=SHORT_HOUR)return labels;
+return labels.map((l,i)=>i%Math.ceil(labels.length/SHORT_HOUR)===0?l:'');
+}
+
+document.querySelectorAll('.period-btn').forEach(btn=>{
+btn.addEventListener('click',function(){
+document.querySelectorAll('.period-btn').forEach(b=>b.classList.remove('active'));
+this.classList.add('active');
+currentPeriod=this.dataset.period;
+customStart='';customEnd='';
+document.getElementById('dateStart').value='';
+document.getElementById('dateEnd').value='';
+refresh();
+})});
+
+document.getElementById('applyDateBtn').addEventListener('click',function(){
+const s=document.getElementById('dateStart').value;
+const e=document.getElementById('dateEnd').value;
+if(!s||!e){alert('Select both start and end dates');return}
+document.querySelectorAll('.period-btn').forEach(b=>b.classList.remove('active'));
+currentPeriod='custom';customStart=s;customEnd=e;
+refresh();
+});
+
+document.getElementById('zoomClose').addEventListener('click',function(){
+document.getElementById('zoomModal').classList.remove('show');
+if(zooming){if(zooming==='tokenChart')buildTokenChart(bucketsCache);else buildReqChart(bucketsCache);zooming=null}
+});
+
+document.querySelectorAll('.zoom-btn').forEach(btn=>{
+btn.addEventListener('click',function(){
+const id=this.dataset.zoom;
+zooming=id;
+document.getElementById('zoomTitle').textContent=this.parentElement.querySelector('h3').textContent;
+document.getElementById('zoomModal').classList.add('show');
+renderZoom(id);
+})});
+
+document.addEventListener('keydown',function(e){if(e.key==='Escape')document.getElementById('zoomClose').click()});
+document.getElementById('zoomModal').addEventListener('click',function(e){if(e.target===this)document.getElementById('zoomClose').click()});
+
+function buildQuery(){
+if(currentPeriod==='custom'&&customStart&&customEnd)
+return 'period=custom&start='+customStart+'&end='+customEnd;
+return 'period='+currentPeriod;
+}
+
+async function fetchJSON(url){try{const r=await fetch(url,{credentials:'same-origin'});if(r.status===401){window.location.href='/monitor/login';return null}if(!r.ok)return null;return r.json()}catch{return null}}function setHealth(on){
+const pill=document.getElementById('healthPill');
+pill.classList.toggle('online',on);
+pill.classList.toggle('offline',!on);
+document.getElementById('healthText').textContent=on?'Online':'Offline';
+}
+
+function renderStats(u,r,latencyMs){
+if(u){
+document.getElementById('statRequests').textContent=FORMATTER.format(u.request_count);
+document.getElementById('statPrompt').textContent=FORMATTER.format(u.prompt_tokens);
+document.getElementById('statCompletion').textContent=FORMATTER.format(u.completion_tokens);
+document.getElementById('statTotal').textContent=FORMATTER.format(u.total_tokens);
+document.getElementById('periodBadge').textContent=(u.period||currentPeriod).toUpperCase();
+}
+if(r){
+const ok=r.success;
+setHealth(ok);
+document.getElementById('relayBadge').textContent=(ok?'OK':'OFFLINE');
+document.getElementById('relayBadge').className='badge '+(ok?'pill-green':'pill-red');
+document.getElementById('latencyText').textContent=(latencyMs!=null?FORMATTER.format(Math.round(latencyMs))+'ms':'Refresh manual');
+}
+}
+
+function renderRelayContent(r){
+const el=document.getElementById('relayContent');
+const ipsEl=document.getElementById('relayIpsContent');
+if(!r){el.innerHTML='<div class="loading">Relay check failed</div>';ipsEl.innerHTML='<div class="loading">Unavailable</div>';return}
+el.innerHTML='';
+const rows=[['Direct IP',r.direct_ip,''],['Relay IP',r.relay_ip,r.is_masked?'green':'yellow'],['IP Masked',r.is_masked?'Yes':'No',r.is_masked?'green':'yellow'],['Response Time',r.response_time_ms!=null?FORMATTER.format(r.response_time_ms)+' ms':'',r.response_time_ms!=null&&r.response_time_ms<1000?'green':'yellow']];
+rows.forEach(([l,v,cls])=>{el.innerHTML+='<div class="row"><span class="label">'+l+'</span><span class="val mono '+(cls||'')+'">'+(v||'-')+'</span></div>'});
+if(r.all_relays&&r.all_relays.length){
+ipsEl.innerHTML='';
+r.all_relays.forEach(item=>{
+ipsEl.innerHTML+='<div class="relay-item '+(item.ok?'ok':'fail')+'"><span class="url">'+item.url+'</span><span class="ip">'+(item.ip||'-')+'</span><span class="state '+(item.ok?'ok':'fail')+'">'+(item.ok?'OK':'FAIL')+'</span></div>';
+});
+}else{ipsEl.innerHTML='<div class="loading">No relay data</div>'}
+}
+
+function renderModelTable(u){
+const tb=document.getElementById('modelTableBody');
+if(!u||!u.by_model||Object.keys(u.by_model).length===0){tb.innerHTML='<tr><td colspan="5" class="loading">No usage data yet</td></tr>';return}
+tb.innerHTML='';
+for(const[m,s]of Object.entries(u.by_model)){
+tb.innerHTML+='<tr><td>'+m+'</td><td class="num">'+FORMATTER.format(s.request_count)+'</td><td class="num">'+FORMATTER.format(s.prompt_tokens)+'</td><td class="num">'+FORMATTER.format(s.completion_tokens)+'</td><td class="num">'+FORMATTER.format(s.total_tokens)+'</td></tr>'}
+}
+
+function renderConfig(c){
+const el=document.getElementById('configContent');
+if(!c){el.innerHTML='<div class="loading">Unavailable</div>';return}
+let h='';
+h+='<div class="row"><span class="label">Model</span><span class="val mono">'+c.model+'</span></div>';
+h+='<div class="row"><span class="label">Version</span><span class="val blue">'+c.version+'</span></div>';
+h+='<div class="row"><span class="label">Request Timeout</span><span class="val">'+c.request_timeout+'s</span></div>';
+h+='<div class="row"><span class="label">Relay</span><span class="val '+(c.relay.enabled?'green':'red')+'">'+(c.relay.enabled?'ENABLED':'DISABLED')+'</span></div>';
+h+='<div class="row"><span class="label">Relay Fallback</span><span class="val '+(c.relay.fallback?'green':'yellow')+'">'+(c.relay.fallback?'ON':'OFF')+'</span></div>';
+h+='<div class="row"><span class="label">Relay URLs</span><span class="val">'+c.relay_urls.length+'</span></div>';
+h+='<div class="row"><span class="label">Models Cache TTL</span><span class="val">'+(c.models_cache_ttl||'300')+'s</span></div>';
+h+='<div class="row"><span class="label">Stream Relay Attempts</span><span class="val">'+(c.max_relay_stream_attempts!=null?c.max_relay_stream_attempts:'2')+'</span></div>';
+h+='<div class="row"><span class="label">Hermes Compat</span><span class="val '+(c.hermes_compatible?'green':'yellow')+'">'+(c.hermes_compatible?'ON':'OFF')+'</span></div>';
+h+='<div class="row"><span class="label">Usage Tracking</span><span class="val '+(c.usage_tracking?'green':'red')+'">'+(c.usage_tracking?'ON':'OFF')+'</span></div>';
+el.innerHTML=h
+}
+
+function renderCapabilities(c){
+const el=document.getElementById('capList');
+if(!c||!c.capabilities){el.innerHTML='<div class="loading">Unavailable</div>';return}
+el.innerHTML='';
+c.capabilities.forEach(cap=>{
+const sup=!!cap.supported;
+el.innerHTML+='<div class="cap-item"><div><div class="name">'+cap.name+'</div><div class="desc">'+(cap.description||'')+'</div></div><span class="tag '+(sup?'ok':'off')+'">'+(sup?'ON':'OFF')+'</span></div>';
+});
+}
+
+function renderEndpoints(c){
+const el=document.getElementById('endpointList');
+if(!c||!c.endpoints){el.innerHTML='<div class="loading">Unavailable</div>';return}
+el.innerHTML='';
+c.endpoints.forEach(ep=>{
+const m=ep.method.toUpperCase();
+el.innerHTML+='<div class="endpoint-row"><span class="method-badge method-'+m+'">'+m+'</span><span class="endpoint-path">'+ep.path+'</span><span class="endpoint-desc">'+ep.description+'</span></div>';
+});
+}
+
+function chartOpts(baseYStacked){
+const n={
+responsive:true,maintainAspectRatio:false,
+interaction:{mode:'index',intersect:false},
+plugins:{legend:{labels:{color:CHART_COLORS.text,boxWidth:12,boxHeight:12,usePointStyle:true,pointStyle:'circle',font:{size:11,family:'Inter,sans-serif'}}},
+tooltip:{backgroundColor:'#212226',borderColor:'#3a3b42',borderWidth:1,titleColor:'#f0f1f2',bodyColor:'#d8d9da',padding:10,cornerRadius:4,titleFont:{size:12,family:'Inter,sans-serif'},bodyFont:{size:12,family:'Inter,sans-serif'}}},
+scales:{x:{stacked:baseYStacked,grid:{color:CHART_COLORS.grid,drawBorder:false},border:{color:'#3a3b42'},ticks:{color:CHART_COLORS.tick,font:{size:10,family:'Inter,sans-serif'},maxTicksLimit:10}},
+y:{stacked:baseYStacked,grid:{color:CHART_COLORS.grid,drawBorder:false},border:{color:'#3a3b42'},ticks:{color:CHART_COLORS.tick,font:{size:10,family:'Inter,sans-serif'},beginAtZero:true,callback:function(v){return COMPACT.format(v)}}}}};
+return n;
+}
+
+function buildTokenChart(buckets){
+const el=document.getElementById('tokenChart');
+const wrap=document.getElementById('tokenWrap');
+if(tokenChartInstance){tokenChartInstance.destroy();tokenChartInstance=null}
+if(!buckets||buckets.length===0){wrap.classList.add('no-data');return}
+wrap.classList.remove('no-data');
+const labels=buckets.map(b=>b.label);
+tokenChartInstance=new Chart(el.getContext('2d'),{
+type:'bar',
+data:{labels:labels,
+datasets:[
+{label:'Prompt',data:buckets.map(b=>b.prompt_tokens),backgroundColor:CHART_COLORS.promptBg,borderColor:CHART_COLORS.promptBorder,borderWidth:1,borderRadius:2},
+{label:'Completion',data:buckets.map(b=>b.completion_tokens),backgroundColor:CHART_COLORS.completionBg,borderColor:CHART_COLORS.completionBorder,borderWidth:1,borderRadius:2},
+{label:'Total',data:buckets.map(b=>b.total_tokens),backgroundColor:CHART_COLORS.totalBg,borderColor:CHART_COLORS.totalBorder,borderWidth:1,borderRadius:2}
+]},
+options:Object.assign({},chartOpts(true),{scales:Object.assign({},chartOpts(true).scales,{x:Object.assign({},chartOpts(true).scales.x,{ticks:Object.assign({},chartOpts(true).scales.x.ticks,{callback:function(v,i){return abbreviate(labels)[i]||''}})})})})
+})
+}
+
+function buildReqChart(buckets){
+const el=document.getElementById('reqChart');
+const wrap=document.getElementById('reqWrap');
+if(reqChartInstance){reqChartInstance.destroy();reqChartInstance=null}
+if(!buckets||buckets.length===0){wrap.classList.add('no-data');return}
+wrap.classList.remove('no-data');
+const labels=buckets.map(b=>b.label);
+reqChartInstance=new Chart(el.getContext('2d'),{
+type:'line',
+data:{labels:labels,
+datasets:[{label:'Requests',data:buckets.map(b=>b.request_count),borderColor:CHART_COLORS.accent,backgroundColor:CHART_COLORS.accentFill,fill:true,tension:.3,pointRadius:2.5,pointBackgroundColor:CHART_COLORS.accent,pointBorderColor:CHART_COLORS.accent,borderWidth:1.5}]},
+options:Object.assign({},chartOpts(false),{scales:Object.assign({},chartOpts(false).scales,{x:Object.assign({},chartOpts(false).scales.x,{ticks:Object.assign({},chartOpts(false).scales.x.ticks,{callback:function(v,i){return abbreviate(labels)[i]||''}})})})})
+})
+}
+
+function renderZoom(id){
+const el=document.getElementById('zoomCanvas');
+if(zoomChartInstance)zoomChartInstance.destroy();
+zoomChartInstance=null;
+if(!bucketsCache||bucketsCache.length===0){return}
+const labels=bucketsCache.map(b=>b.label);
+if(id==='tokenChart'){
+zoomChartInstance=new Chart(el.getContext('2d'),{
+type:'bar',
+data:{labels:labels,datasets:[
+{label:'Prompt',data:bucketsCache.map(b=>b.prompt_tokens),backgroundColor:CHART_COLORS.promptBg,borderColor:CHART_COLORS.promptBorder,borderWidth:1,borderRadius:2},
+{label:'Completion',data:bucketsCache.map(b=>b.completion_tokens),backgroundColor:CHART_COLORS.completionBg,borderColor:CHART_COLORS.completionBorder,borderWidth:1,borderRadius:2},
+{label:'Total',data:bucketsCache.map(b=>b.total_tokens),backgroundColor:CHART_COLORS.totalBg,borderColor:CHART_COLORS.totalBorder,borderWidth:1,borderRadius:2}]},
+options:chartOpts(true)
+});
+}else{
+zoomChartInstance=new Chart(el.getContext('2d'),{
+type:'line',
+data:{labels:labels,datasets:[{label:'Requests',data:bucketsCache.map(b=>b.request_count),borderColor:CHART_COLORS.accent,backgroundColor:CHART_COLORS.accentFill,fill:true,tension:.3,pointRadius:3,pointBackgroundColor:CHART_COLORS.accent,pointBorderColor:CHART_COLORS.accent,borderWidth:1.5}]},
+options:chartOpts(false)
+});
+}
+}
+
+function setLoading(){
+document.getElementById('relayContent').innerHTML='<div class="loading"><span class="spinner"></span>Testing relays...</div>';
+document.getElementById('relayIpsContent').innerHTML='<div class="loading"><span class="spinner"></span>Resolving...</div>';
+document.getElementById('periodBadge').textContent=(currentPeriod==='custom'?'CUSTOM':currentPeriod).toUpperCase();
+document.getElementById('periodBadge').className='badge pill-blue';
+}
+
+let refreshing=false;
+async function refresh(){
+if(refreshing)return;
+refreshing=true;
+try{
+const q=buildQuery();
+setLoading();
+lastRefreshTime=Date.now();
+const[u,r,c,h]=await Promise.all([
+fetchJSON('/monitor/api/usage?'+q),
+fetchJSON('/monitor/api/relay'),
+fetchJSON('/monitor/api/props'),
+fetchJSON('/monitor/api/usage/history?'+q),
+]);
+lastRefreshTime=Date.now();
+if(!u&&!r&&!c&&!h)return;
+bucketsCache=(h&&h.buckets)||[];
+document.getElementById('subtitle').textContent=(c?'Model: '+c.model+' | v'+c.version:'Loading...');
+if(u)renderStats(u,r,null);
+if(r)renderRelayContent(r);
+if(u)renderModelTable(u);
+if(c)renderConfig(c);
+if(c)renderCapabilities(c);
+if(c)renderEndpoints(c);
+buildTokenChart(bucketsCache);
+buildReqChart(bucketsCache);
+if(zooming)renderZoom(zooming);
+}finally{refreshing=false}
+}
+
+document.getElementById('autoText').addEventListener('click',function(){
+autoRefresh=!autoRefresh;
+this.textContent=autoRefresh?'Auto refresh every 30s':'Auto refresh off';
+if(autoRefresh){autoTimer=setInterval(refresh,30000)}
+else{clearInterval(autoTimer);autoTimer=null}
+});
+
+let logSource=null,logLatestId=0,logPaused=false,logAutoScroll=true,logShown=0;
+const LOG_MAX_DOM=500;
+function escLog(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function setLogStatus(state,text){const el=document.getElementById('logStatus');el.className='log-status'+(state?' '+state:'');document.getElementById('logStatusText').textContent=text}
+function appendLog(e){
+if(logPaused)return;
+const box=document.getElementById('logBox');
+if(logShown===0)box.innerHTML='';
+const div=document.createElement('div');
+div.className='log-line';
+div.innerHTML='<span class="ts">'+escLog(e.ts)+'</span><span class="log-lv '+escLog(e.level)+'">'+escLog(e.level)+'</span><span>'+escLog(e.msg)+'</span>';
+box.appendChild(div);
+logShown++;
+while(box.children.length>LOG_MAX_DOM)box.removeChild(box.firstChild);
+document.getElementById('logCount').textContent=FORMATTER.format(logShown);
+if(logAutoScroll)box.scrollTop=box.scrollHeight;
+}
+async function logCatchup(){
+const lvl=document.getElementById('logLevel').value;
+const d=await fetchJSON('/monitor/api/logs?since='+logLatestId+'&level='+encodeURIComponent(lvl)+'&limit=200');
+if(d&&d.logs){d.logs.forEach(e=>{appendLog(e);if(e.id>logLatestId)logLatestId=e.id});if(d.latest_id>logLatestId)logLatestId=d.latest_id}
+}
+function connectLogs(){
+if(logSource){try{logSource.close()}catch{}}
+const lvl=document.getElementById('logLevel').value;
+logCatchup();
+const url='/monitor/api/logs/stream?since='+logLatestId+'&level='+encodeURIComponent(lvl);
+try{logSource=new EventSource(url)}catch{setLogStatus('off','SSE unsupported, polling');setInterval(logCatchup,2000);return}
+setLogStatus('','connecting...');
+logSource.onopen=function(){setLogStatus('','live')};
+logSource.onmessage=function(ev){
+try{const e=JSON.parse(ev.data);appendLog(e);if(e.id>logLatestId)logLatestId=e.id}catch{}
+};
+logSource.onerror=function(){
+setLogStatus('off','reconnecting...');
+try{logSource.close()}catch{}
+setTimeout(function(){if(!logPaused)connectLogs()},3000);
+};
+}
+document.getElementById('logLevel').addEventListener('change',function(){
+document.getElementById('logBox').innerHTML='';logShown=0;logLatestId=0;
+document.getElementById('logCount').textContent='0';connectLogs();
+});
+document.getElementById('logPauseBtn').addEventListener('click',function(){
+logPaused=!logPaused;
+this.textContent=logPaused?'Resume':'Pause';
+this.classList.toggle('on',logPaused);
+setLogStatus(logPaused?'paused':(logSource?'':'off'),logPaused?'paused':(logSource?'live':'reconnecting...'));
+if(!logPaused)connectLogs();else if(logSource){try{logSource.close()}catch{}}
+});
+document.getElementById('logScrollBtn').addEventListener('click',function(){
+logAutoScroll=!logAutoScroll;
+this.textContent=logAutoScroll?'Auto-scroll ON':'Auto-scroll OFF';
+this.classList.toggle('on',logAutoScroll);
+});
+document.getElementById('logClearBtn').addEventListener('click',async function(){
+await fetch('/monitor/api/logs/clear',{method:'POST',credentials:'same-origin'});
+document.getElementById('logBox').innerHTML='';logShown=0;
+document.getElementById('logCount').textContent='0';
+});
+document.getElementById('relayResetBtn').addEventListener('click',async function(){
+const btn=this;btn.disabled=true;btn.textContent='...';
+try{
+const r=await fetch('/monitor/api/relays/reset',{method:'POST',credentials:'same-origin'});
+const d=r.ok?await r.json():null;
+btn.textContent=d&&d.reset?'Done':'Fail';
+setTimeout(function(){btn.textContent='Reset';btn.disabled=false},2000);
+refresh();
+}catch{btn.textContent='Fail';setTimeout(function(){btn.textContent='Reset';btn.disabled=false},2000)}
+});
+
+refresh();
+connectLogs();
+</script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# Runtime & secrets: jangan ikut ke git.
+usage.db
+usage.db-shm
+usage.db-wal
+*.db
+.env
+OPENCODE_API_KEY*
+
+# Log & debug lokal.
+*.log
+logs/
+
+# Python cache.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
