@@ -277,6 +277,181 @@ def _f2():
         r._relay_stream_broken.clear()
 
 
+@case("G1 image_url dict -> input_image + detail diteruskan")
+def _g1():
+    from app.services.responses_bridge import _chat_messages_to_responses_input
+    out = _chat_messages_to_responses_input([{
+        "role": "user", "content": [
+            {"type": "text", "text": "apa isi gambar?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA", "detail": "high"}},
+        ]}])
+    assert out[0]["role"] == "user"
+    kinds = [p["type"] for p in out[0]["content"]]
+    assert kinds == ["input_text", "input_image"], kinds
+    img = out[0]["content"][1]
+    assert img["image_url"] == "data:image/png;base64,AAA" and img["detail"] == "high"
+
+
+@case("G2 image_url string -> detail auto; teks saja tak berubah")
+def _g2():
+    from app.services.responses_bridge import _chat_messages_to_responses_input
+    out = _chat_messages_to_responses_input([{
+        "role": "user", "content": [
+            {"type": "image_url", "image_url": "https://x.example/a.png"},
+        ]}])
+    assert out[0]["content"][1] == {
+        "type": "input_image", "image_url": "https://x.example/a.png", "detail": "auto"}
+    plain = _chat_messages_to_responses_input([{"role": "user", "content": "halo"}])
+    assert plain == [{"role": "user",
+                      "content": [{"type": "input_text", "text": "halo"}]}]
+
+
+@case("G3 bukan-list / tanpa gambar -> [] tanpa crash")
+def _g3():
+    from app.services.responses_bridge import _chat_image_contents
+    assert _chat_image_contents("string") == []
+    assert _chat_image_contents(None) == []
+    assert _chat_image_contents([{"type": "text", "text": "x"}]) == []
+
+
+@case("G4 total gambar raksasa -> HTTP 400 jelas (bukan 413 relay)")
+def _g4():
+    from fastapi import HTTPException
+    from app.services.responses_bridge import _chat_messages_to_responses_input
+    big = "data:image/png;base64," + "A" * 4_500_000  # ~3.3MB
+    try:
+        _chat_messages_to_responses_input([
+            {"role": "user", "content": [{"type": "image_url",
+                                          "image_url": {"url": big}}]}])
+    except HTTPException as e:
+        assert e.status_code == 400, e.status_code
+    else:
+        raise AssertionError("gambar raksasa lolos tanpa 400")
+
+
+@case("H1 part file PDF -> input_file + filename dipertahankan")
+def _h1():
+    from app.services.responses_bridge import _chat_messages_to_responses_input
+    out = _chat_messages_to_responses_input([{
+        "role": "user", "content": [
+            {"type": "text", "text": "baca pdf ini"},
+            {"type": "file", "file": {
+                "filename": "doc.pdf",
+                "file_data": "data:application/pdf;base64,AAA"}},
+        ]}])
+    kinds = [p["type"] for p in out[0]["content"]]
+    assert kinds == ["input_text", "input_file"], kinds
+    f = out[0]["content"][1]
+    assert f["filename"] == "doc.pdf"
+    assert f["file_data"] == "data:application/pdf;base64,AAA"
+
+
+@case("H2 file_id diteruskan; tanpa filename ditebak dari mime")
+def _h2():
+    from app.services.responses_bridge import _chat_messages_to_responses_input
+    out = _chat_messages_to_responses_input([{
+        "role": "user", "content": [
+            {"type": "file", "file": {"file_id": "file-abc123"}},
+            {"type": "file", "file": {"file_data": "data:application/pdf;base64,AAA"}},
+        ]}])
+    assert out[0]["content"][1] == {"type": "input_file", "file_id": "file-abc123"}
+    assert out[0]["content"][2]["filename"] == "file.pdf"
+
+
+@case("H3 budget gambar+file dipakai bersama -> kombinasi raksasa 400")
+def _h3():
+    from fastapi import HTTPException
+    from app.services.responses_bridge import _chat_messages_to_responses_input
+    img = "data:image/png;base64," + "A" * 2_500_000   # ~1.9MB
+    pdf = "data:application/pdf;base64," + "B" * 2_500_000  # ~1.9MB
+    try:
+        _chat_messages_to_responses_input([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": img}},
+            {"type": "file", "file": {"filename": "d.pdf", "file_data": pdf}},
+        ]}])
+    except HTTPException as e:
+        assert e.status_code == 400, e.status_code
+    else:
+        raise AssertionError("gambar raksasa lolos tanpa 400")
+
+
+@case("J1 _payload_has_media: struktural, bukan substring")
+def _j1():
+    from app.services.relay import _payload_has_media as m
+    assert m({"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:x"}}]}]}) is True
+    assert m({"messages": [{"role": "user", "content": [
+        {"type": "file", "file": {"filename": "a.pdf"}}]}]}) is True
+    assert m({"input": [{"role": "user", "content": [
+        {"type": "input_image", "image_url": "u"}]}]}) is True
+    assert m({"input": [{"role": "user", "content": [
+        {"type": "input_file", "file_id": "f"}]}]}) is True
+    # Teks biasa yang menyebut kata image_url TIDAK boleh kena.
+    assert m({"messages": [{"role": "user",
+                            "content": "jelaskan image_url biasa"}]}) is False
+    assert m({"messages": [{"role": "user", "content": "halo"}]}) is False
+    assert m({"model": "m"}) is False
+    assert m({}) is False
+    assert m(None) is False
+
+
+@case("J2 guard vision-429 ada di 3 generator stream + direct-first non-stream")
+def _j2():
+    import inspect
+    import app.services.streaming as s
+    import app.services.responses_bridge as b
+    import app.services.upstream as u
+    for fn in (s.stream_generator, b.responses_stream_generator,
+               b.responses_to_chat_stream_generator):
+        src = inspect.getsource(fn)
+        assert "vision_direct_first" in src, fn.__name__
+        assert "relay khusus 429" in src or "khusus 429" in src, fn.__name__
+    assert "vision_direct_first" in inspect.getsource(u.call_upstream)
+
+
+@case("H1 part file file_data+filename -> input_file utuh")
+def _h1():
+    from app.services.responses_bridge import _chat_messages_to_responses_input
+    out = _chat_messages_to_responses_input([{
+        "role": "user", "content": [
+            {"type": "text", "text": "baca pdf ini"},
+            {"type": "file", "file": {"filename": "doc.pdf",
+                                      "file_data": "data:application/pdf;base64,AAA"}},
+        ]}])
+    kinds = [p["type"] for p in out[0]["content"]]
+    assert kinds == ["input_text", "input_file"], kinds
+    f = out[0]["content"][1]
+    assert f["filename"] == "doc.pdf" and f["file_data"] == "data:application/pdf;base64,AAA"
+
+
+@case("H2 file_id -> input_file by id; tanpa filename ditebak dari mime")
+def _h2():
+    from app.services.responses_bridge import _chat_media_contents
+    got = _chat_media_contents([
+        {"type": "file", "file": {"file_id": "file-abc123"}},
+        {"type": "file", "file": {"file_data": "data:application/pdf;base64,AAA"}},
+    ])
+    assert got[0] == {"type": "input_file", "file_id": "file-abc123"}, got[0]
+    assert got[1]["filename"] == "file.pdf", got[1]
+
+
+@case("H3 gambar + file sejalan, budget dipakai bersama")
+def _h3():
+    from fastapi import HTTPException
+    from app.services.responses_bridge import _chat_media_contents
+    img = "data:image/png;base64," + "A" * 2_100_000  # ~1.57MB
+    pdf = "data:application/pdf;base64," + "B" * 2_100_000  # total ~3.15MB > 3MB
+    try:
+        _chat_media_contents([
+            {"type": "image_url", "image_url": {"url": img}},
+            {"type": "file", "file": {"filename": "d.pdf", "file_data": pdf}},
+        ])
+    except HTTPException as e:
+        assert e.status_code == 400, e.status_code
+    else:
+        raise AssertionError("kombinasi >3MB lolos tanpa 400")
+
+
 def main() -> int:
     print(f"menjalankan {len(_results)} case...")
     print("=" * 70)

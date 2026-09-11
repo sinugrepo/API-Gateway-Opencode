@@ -7,7 +7,7 @@ from contextlib import suppress
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 import httpx
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 
 from app.core.config import (
@@ -34,6 +34,7 @@ from app.services.relay import (
     _limit_stream_targets,
     _mark_relay_rate_limited,
     _mark_relay_stream_broken,
+    _payload_has_media,
     _relay_batch_for_request,
     _should_mark_stream_broken,
     _stream_request_headers,
@@ -100,6 +101,135 @@ def _chat_text_content(content: Any) -> str:
     return str(content)
 
 
+# Batas total byte media (gambar + file) per request bridge.
+# Relay menolak body >4.5MB; gagal-cepat 400 yang jelas lebih baik daripada
+# 413/504 misterius, dan biner raksasa hanya membakar kuota giant-payload.
+MAX_BRIDGE_IMAGE_BYTES = 3_000_000
+MAX_BRIDGE_MEDIA_BYTES = MAX_BRIDGE_IMAGE_BYTES
+
+
+def _image_byte_size(url: str) -> int:
+    """Estimasi byte gambar dari data-URL base64; 0 untuk URL biasa."""
+    try:
+        head, _, b64 = url.partition(",")
+        if b64 and ";base64" in head:
+            return len(b64) * 3 // 4
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return 0
+
+
+def _media_byte_size(url_or_data: str) -> int:
+    """Estimasi byte media dari data-URL base64; 0 untuk URL/file_id biasa."""
+    try:
+        head, _, b64 = url_or_data.partition(",")
+        if b64 and ";base64" in head:
+            return len(b64) * 3 // 4
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return 0
+
+
+def _image_byte_size(url: str) -> int:
+    """Estimasi byte gambar (alias kompatibel dari penghitung media)."""
+    return _media_byte_size(url)
+
+
+def _guess_media_ext(data_url: str, default: str) -> str:
+    """Tebak ekstensi dari mime data-URL untuk filename cadangan."""
+    try:
+        head = data_url.split(",", 1)[0].lower()
+        if "application/pdf" in head:
+            return ".pdf"
+        if "image/png" in head:
+            return ".png"
+        if "image/jpeg" in head or "image/jpg" in head:
+            return ".jpg"
+        if "image/webp" in head:
+            return ".webp"
+        if "image/gif" in head:
+            return ".gif"
+        if "text/plain" in head:
+            return ".txt"
+    except (TypeError, AttributeError, IndexError):
+        pass
+    return default
+
+
+def _chat_media_contents(content: Any) -> List[Dict[str, Any]]:
+    """Ekstrak SEMUA part media gaya chat menjadi part Responses.
+
+    - `{"type": "image_url", ...}` -> `{"type": "input_image", ...}`
+    - `{"type": "file", "file": {"file_data", "filename"}}` (PDF/dokumen)
+      -> `{"type": "input_file", ...}`
+    - `{"type": "file", "file": {"file_id": ...}}` -> `input_file` by id.
+    Budget byte (base64) dipakai BERSAMA gambar+file; lewat batas -> HTTP 400.
+    """
+    media: List[Dict[str, Any]] = []
+    if not isinstance(content, list):
+        return media
+    total = 0
+
+    def _charge(nbytes: int) -> None:
+        nonlocal total
+        total += nbytes
+        if total > MAX_BRIDGE_MEDIA_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Total media ~{total // 1024}KB melebihi batas "
+                f"{MAX_BRIDGE_MEDIA_BYTES // 1000}KB per request "
+                f"(relay menolak body >4.5MB; kecilkan/kompres file)",
+            )
+
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "image_url":
+            ref = part.get("image_url")
+            url, detail = None, "auto"
+            if isinstance(ref, dict):
+                url = ref.get("url")
+                if ref.get("detail") in ("auto", "low", "high"):
+                    detail = ref["detail"]
+            elif isinstance(ref, str):
+                url = ref
+            if not url or not isinstance(url, str):
+                continue
+            _charge(_media_byte_size(url))
+            media.append({"type": "input_image", "image_url": url, "detail": detail})
+        elif ptype == "file":
+            ref = part.get("file")
+            if not isinstance(ref, dict):
+                continue
+            if ref.get("file_id") and isinstance(ref["file_id"], str):
+                media.append({"type": "input_file", "file_id": ref["file_id"]})
+                continue
+            data = ref.get("file_data")
+            if not data or not isinstance(data, str):
+                continue
+            _charge(_media_byte_size(data))
+            filename = ref.get("filename")
+            if not filename or not isinstance(filename, str):
+                filename = "file" + _guess_media_ext(data, ".bin")
+            media.append({"type": "input_file", "filename": filename,
+                          "file_data": data})
+        elif isinstance(part.get("image_url"), (str, dict)):
+            # Toleransi: part gambar tanpa type eksplisit.
+            ref = part["image_url"]
+            url = ref.get("url") if isinstance(ref, dict) else ref
+            if not url or not isinstance(url, str):
+                continue
+            _charge(_media_byte_size(url))
+            media.append({"type": "input_image", "image_url": url, "detail": "auto"})
+    return media
+
+
+def _chat_image_contents(content: Any) -> List[Dict[str, Any]]:
+    """Hanya part gambar (subset _chat_media_contents; budget tetap berbagi)."""
+    return [p for p in _chat_media_contents(content) if p.get("type") == "input_image"]
+
+
 def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -110,6 +240,7 @@ def _chat_messages_to_responses_input(
             continue
         role = message.get("role", "user")
         text = _chat_text_content(message.get("content"))
+        media = _chat_media_contents(message.get("content"))
         if role == "tool":
             items.append(
                 {
@@ -125,7 +256,7 @@ def _chat_messages_to_responses_input(
                 items.append(
                     {
                         "role": "assistant",
-                        "content": [{"type": "output_text", "text": text}],
+                        "content": [{"type": "output_text", "text": text}, *media],
                     }
                 )
             for call in tool_calls:
@@ -150,14 +281,14 @@ def _chat_messages_to_responses_input(
             continue
         if role == "system":
             items.append(
-                {"role": "system", "content": [{"type": "input_text", "text": text}]}
+                {"role": "system", "content": [{"type": "input_text", "text": text}, *media]}
             )
             continue
         if role not in ("user", "assistant", "developer"):
             role = "user"
         part_type = "output_text" if role == "assistant" else "input_text"
         items.append(
-            {"role": role, "content": [{"type": part_type, "text": text}]}
+            {"role": role, "content": [{"type": part_type, "text": text}, *media]}
         )
     return items
 
@@ -391,6 +522,14 @@ async def responses_stream_generator(
     else:
         targets.append((OPENCODE_RESPONSES_URL, dict(base_headers)))
     targets = _limit_stream_targets(targets)
+    vision_direct_first = use_relay and RELAY_FALLBACK and _payload_has_media(payload)
+    if vision_direct_first:
+        # Vision: direct DULU; relay HANYA fallback bila direct 429
+        # (lihat guard di loop). Biner base64 rawan 413/504 relay.
+        direct = [t for t in targets if "x-relay-target" not in t[1]]
+        relays = [t for t in targets if "x-relay-target" in t[1]]
+        targets = direct + relays
+        _log("RESP", "VISION: direct dulu, relay khusus 429")
 
     last_error: Optional[str] = None
     last_rate_limited = False
@@ -404,6 +543,10 @@ async def responses_stream_generator(
         while target_index < len(targets):
             target_url, headers = targets[target_index]
             is_relay = "x-relay-target" in headers
+            if vision_direct_first and is_relay and not last_rate_limited:
+                # Relay vision hanya untuk 429 direct; kegagalan lain
+                # selesai di direct (last_error sudah terisi).
+                break
             _log(
                 "RESP",
                 f"ATTEMPT {target_index + 1}/{len(targets)} "
@@ -809,6 +952,14 @@ async def responses_to_chat_stream_generator(
     else:
         targets.append((OPENCODE_RESPONSES_URL, dict(base_headers)))
     targets = _limit_stream_targets(targets)
+    vision_direct_first = use_relay and RELAY_FALLBACK and _payload_has_media(payload)
+    if vision_direct_first:
+        # Vision: direct DULU; relay HANYA fallback bila direct 429
+        # (lihat guard di loop). Biner base64 rawan 413/504 relay.
+        direct = [t for t in targets if "x-relay-target" not in t[1]]
+        relays = [t for t in targets if "x-relay-target" in t[1]]
+        targets = direct + relays
+        _log("RESP", "VISION: direct dulu, relay khusus 429")
 
     last_error: Optional[str] = None
     last_rate_limited = False
@@ -823,6 +974,10 @@ async def responses_to_chat_stream_generator(
         while target_index < len(targets):
             target_url, headers = targets[target_index]
             is_relay = "x-relay-target" in headers
+            if vision_direct_first and is_relay and not last_rate_limited:
+                # Relay vision hanya untuk 429 direct; kegagalan lain
+                # selesai di direct (last_error sudah terisi).
+                break
             _log(
                 "RESP",
                 f"ATTEMPT {target_index + 1}/{len(targets)} "

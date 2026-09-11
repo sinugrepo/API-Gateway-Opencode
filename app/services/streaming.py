@@ -37,6 +37,7 @@ from app.services.relay import (
     _limit_stream_targets,
     _mark_relay_rate_limited,
     _mark_relay_stream_broken,
+    _payload_has_media,
     _relay_batch_for_request,
     _relay_stream_headers,
     _should_mark_stream_broken,
@@ -209,6 +210,14 @@ async def stream_generator(
     else:
         targets.append((OPENCODE_URL, dict(base_headers)))
     targets = _limit_stream_targets(targets)
+    vision_direct_first = use_relay and RELAY_FALLBACK and _payload_has_media(payload)
+    if vision_direct_first:
+        # Vision: direct DULU; relay HANYA fallback bila direct 429
+        # (lihat guard di loop). Biner base64 rawan 413/504 relay.
+        direct = [t for t in targets if "x-relay-target" not in t[1]]
+        relays = [t for t in targets if "x-relay-target" in t[1]]
+        targets = direct + relays
+        _log("STREAM", f"VISION model={client_model}: direct dulu, relay khusus 429")
 
     last_error: Optional[str] = None
     last_rate_limited = False  # True bila kegagalan terakhir adalah 429
@@ -227,6 +236,10 @@ async def stream_generator(
         while target_index < len(targets):
             target_url, headers = targets[target_index]
             is_relay = "x-relay-target" in headers
+            if vision_direct_first and is_relay and not last_rate_limited:
+                # Relay vision hanya untuk 429 direct; kegagalan lain
+                # selesai di direct (last_error sudah terisi).
+                break
             _log("STREAM",
                 f"ATTEMPT {target_index + 1}/{len(targets)} "
                 f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}"

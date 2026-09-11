@@ -1,0 +1,7 @@
+# API Gateway — hanya dependensi langsung yang diimpor kode.
+# Teruji pada Python 3.14. Jalankan:  pip install -r requirements.txt
+# Starlette ikut via fastapi; uvicorn polos (tanpa [standard]) agar aman di Windows.
+fastapi>=0.139.2
+httpx>=0.28.1
+pydantic>=2.13.4
+uvicorn>=0.51.0

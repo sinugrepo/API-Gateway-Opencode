@@ -33,6 +33,7 @@ from app.services.relay import (
     _is_giant_payload,
     _is_relay_timeout,
     _mark_relay_rate_limited,
+    _payload_has_media,
     _relay_batch_for_request,
     _stream_request_headers,
 )
@@ -352,6 +353,55 @@ async def call_upstream(
     # Konteks raksasa: tiap relay Edge mati 25s (first-byte rule) sebelum
     # byte pertama keluar. Menyapu 11 relay = ~275s hang sebelum direct.
     # Batasi seperti streaming (0 = langsung direct).
+    # Vision: direct DULU (biner base64 rawan 413/504 relay); relay HANYA
+    # bila direct 429 (satu retry same-route dulu untuk spurious-429).
+    vision_direct_first = (
+        use_relay and RELAY_FALLBACK and _payload_has_media(payload)
+    )
+    if vision_direct_first:
+        try:
+            resp, used = await direct_request()
+        except httpx.TimeoutException as exc:
+            raise TimeoutError_("Upstream request timed out") from exc
+        except httpx.ConnectError as exc:
+            raise UpstreamError(
+                f"Cannot connect to upstream: {exc}",
+                status_code=HTTP_503_SERVICE_UNAVAILABLE,
+            ) from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(
+                f"Request failed: {exc}",
+                status_code=HTTP_502_BAD_GATEWAY,
+            ) from exc
+        if resp.status_code != 429:
+            _log("RELAY", f"DIRECT vision {used}")
+            return resp, used
+        delay = _retry_after_seconds(resp, RATE_LIMIT_BACKOFF)
+        _log(
+            "RELAY",
+            f"RATE-LIMITED DIRECT vision, same-route retry in {delay:.1f}s "
+            f"lalu fallback relay",
+        )
+        await asyncio.sleep(delay)
+        try:
+            resp, used = await direct_request()
+        except httpx.TimeoutException as exc:
+            raise TimeoutError_("Upstream request timed out") from exc
+        except httpx.ConnectError as exc:
+            raise UpstreamError(
+                f"Cannot connect to upstream: {exc}",
+                status_code=HTTP_503_SERVICE_UNAVAILABLE,
+            ) from exc
+        except httpx.RequestError as exc:
+            raise UpstreamError(
+                f"Request failed: {exc}",
+                status_code=HTTP_502_BAD_GATEWAY,
+            ) from exc
+        if resp.status_code != 429:
+            _log("RELAY", f"DIRECT vision retry OK {used}")
+            return resp, used
+        _log("RELAY", "DIRECT vision masih 429 -> fallback relay")
+        # Jatuh ke relay loop di bawah (diakhiri direct fallback ber-retry).
     relay_batch = _relay_batch_for_request()
     if _is_giant_payload(payload) and MAX_RELAY_STREAM_ATTEMPTS >= 0:
         _log(

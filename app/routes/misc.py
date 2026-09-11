@@ -131,6 +131,11 @@ async def get_props():
                 description="OpenAI tools/tool_choice with DSML fallback parsing.",
             ),
             PropsCapability(
+                name="vision",
+                supported=True,
+                description="Chat image_url/file parts converted to Responses input_image/input_file (muse-spark).",
+            ),
+            PropsCapability(
                 name="parallel_tool_calls",
                 supported=True,
                 description="Forwarded when supplied by the client.",

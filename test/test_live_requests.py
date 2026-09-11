@@ -340,6 +340,94 @@ async def _f1(client):
     print(f"      [F1 events={len(events)} content={has_content} clean_error={has_clean_error}]")
 
 
+def _tiny_png_data_url():
+    """PNG 8x8 merah valid, dibuat dari stdlib (tanpa file/PIL)."""
+    import base64
+    import struct
+    import zlib
+    w = h = 8
+    raw = b"".join(b"\x00" + b"\xff\x00\x00" * w for _ in range(h))
+
+    def chunk(ctype, data):
+        c = struct.pack(">I", len(data)) + ctype + data
+        return c + struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw))
+           + chunk(b"IEND", b""))
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+@case("U8 vision: gambar via bridge spark -> diterima upstream (bentuk valid)")
+async def _u8(client):
+    r = await client.post("/v1/chat/completions", json={
+        "model": SPARK, "max_tokens": 2048,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "apa warna kotak pada gambar? jawab singkat"},
+            {"type": "image_url", "image_url": {"url": _tiny_png_data_url()}},
+        ]}]}, headers=_session_headers())
+    if r.status_code == 200:
+        body = r.json()
+        content = body["choices"][0]["message"].get("content") or ""
+        print(f"      [U8 outcome=ok-200 content_chars={len(content)} "
+              f"preview={content[:120]!r}]")
+    elif r.status_code == 429:
+        assert r.headers.get("Retry-After") is not None
+        print("      [U8 outcome=ok-429]")
+    else:
+        _fail_if_crash(r.text, "U8")
+        raise AssertionError(f"U8: status {r.status_code}: {r.text[:300]!r}")
+
+
+def _tiny_pdf_data_url():
+    """PDF 1 halaman valid (teks HELLOPDF), xref dihitung programatik."""
+    import base64
+    stream = b"BT /F1 24 Tf 50 150 Td (HELLOPDF) Tj ET"
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+         b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>"),
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    for o in offsets:
+        out += b"%010d 00000 n \n" % o
+    out += (b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF"
+            % (len(objs) + 1, xref))
+    return "data:application/pdf;base64," + base64.b64encode(out).decode()
+
+
+@case("U9 vision PDF: dokumen via bridge spark -> dibaca upstream")
+async def _u9(client):
+    r = await client.post("/v1/chat/completions", json={
+        "model": SPARK, "max_tokens": 2048,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "tulis teks dalam pdf, jawab singkat"},
+            {"type": "file", "file": {"filename": "hello.pdf",
+                                      "file_data": _tiny_pdf_data_url()}},
+        ]}]}, headers=_session_headers())
+    if r.status_code == 200:
+        body = r.json()
+        content = body["choices"][0]["message"].get("content") or ""
+        print(f"      [U9 outcome=ok-200 content_chars={len(content)} "
+              f"preview={content[:120]!r}]")
+    elif r.status_code == 429:
+        assert r.headers.get("Retry-After") is not None
+        print("      [U9 outcome=ok-429]")
+    else:
+        _fail_if_crash(r.text, "U9")
+        raise AssertionError(f"U9: status {r.status_code}: {r.text[:300]!r}")
+
+
 async def _run_one(name, fn, client, inference):
     # Anti-loop: tiap case dibatasi 280 dtk (di bawah timeout runner).
     # Lapisan: httpx timeout 300s + wait_for ini + timeout tool bash.
