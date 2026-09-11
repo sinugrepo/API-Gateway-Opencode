@@ -21,8 +21,8 @@ _shared_http_closed = threading.Event()
 
 
 _HTTP_LIMITS = httpx.Limits(
-    max_keepalive_connections=20,
-    max_connections=100,
+    max_keepalive_connections=50,
+    max_connections=200,
     keepalive_expiry=30.0,
 )
 

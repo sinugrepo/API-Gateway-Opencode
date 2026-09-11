@@ -15,6 +15,7 @@ from app.core.error_handlers import register_error_handlers
 from app.core.http_client import _close_http, _get_http
 from app.core.logging_utils import _log
 from app.security.scan_guard import ScanGuardMiddleware
+from app.security.body_limit import BodyLimitMiddleware
 from app.services.usage import _get_usage_db
 from app.core.config import USAGE_DB_PATH
 
@@ -52,6 +53,9 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     application.add_middleware(ScanGuardMiddleware)
+    # BodyLimit paling luar (dieksekusi pertama): tolak body raksasa via
+    # Content-Length sebelum request menyentuh route/CORS apa pun.
+    application.add_middleware(BodyLimitMiddleware)
     register_error_handlers(application)
 
     from .routes import chat, misc, monitor, responses_api, usage_routes

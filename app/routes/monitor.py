@@ -21,7 +21,7 @@ from app.core import logging_utils as _logging_utils
 from app.security.monitor_auth import _check_monitor, _make_monitor_token
 from app.services.relay import _relay_penalty, _relay_penalty_lock, _relay_stream_broken, _relay_stream_broken_lock, test_relay_connection
 from app.security.scan_guard import _banned_ips, _scan_guard_lock, _scan_guard_prune, _scan_hits
-from app.services.usage import _query_usage_history, _resolve_period
+from app.services.usage import _query_recent_requests, _query_usage_history, _resolve_period
 from app.routes.misc import get_props, health
 from app.routes.usage_routes import get_usage
 
@@ -54,28 +54,54 @@ async def monitor_login(request: Request, password: str = Form(...)):
     if password != MONITOR_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid password")
     token = _make_monitor_token()
-    redirect = RedirectResponse(url="/monitor", status_code=302)
+    # Ikuti `next` bila diberikan login page (hindari open-redirect).
+    nxt = (request.query_params.get("next") or "").strip()
+    target = "/monitor"
+    if nxt.startswith("/monitor"):
+        target = nxt
+    redirect = RedirectResponse(url=target, status_code=302)
+    # Secure hanya bila dilewati HTTPS (hormati reverse proxy).
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    is_secure = request.url.scheme == "https" or forwarded_proto == "https"
     redirect.set_cookie(
         key=MONITOR_COOKIE_NAME,
         value=token,
         max_age=MONITOR_TOKEN_TTL,
         httponly=True,
         samesite="lax",
+        secure=is_secure,
+        path="/",
     )
     return redirect
+
+
+@router.get("/monitor/api/session")
+async def monitor_api_session(request: Request):
+    """Sisa TTL sesi monitor (untuk countdown di header dashboard)."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    token = request.cookies.get(MONITOR_COOKIE_NAME, "")
+    ttl = MONITOR_TOKEN_TTL
+    try:
+        expiry = int(token.split(":")[0])
+        import time as _t
+        ttl = max(0, int(expiry - _t.time()))
+    except (IndexError, ValueError):
+        pass
+    return {"ttl_seconds": ttl, "max_age": MONITOR_TOKEN_TTL}
 
 
 @router.get("/monitor/logout")
 async def monitor_logout():
     redirect = RedirectResponse(url="/monitor/login", status_code=302)
-    redirect.delete_cookie(MONITOR_COOKIE_NAME)
+    redirect.delete_cookie(MONITOR_COOKIE_NAME, path="/")
     return redirect
 
 
 @router.get("/monitor", response_class=HTMLResponse)
 async def monitor_dashboard(request: Request):
     if not _check_monitor(request):
-        return RedirectResponse(url="/monitor/login", status_code=302)
+        return RedirectResponse(url="/monitor/login?expired=1", status_code=302)
     return HTMLResponse(_MONITOR_DASHBOARD_PAGE)
 
 
@@ -106,6 +132,19 @@ async def monitor_api_usage_history(
     _, start_time, end_time = _resolve_period(period, datetime.now(), start, end)
     buckets = await asyncio.to_thread(_query_usage_history, start_time, end_time)
     return {"period": period, "buckets": buckets}
+
+
+@router.get("/monitor/api/requests/recent")
+async def monitor_api_recent_requests(request: Request, limit: int = 20):
+    """Daftar request terakhir: model + token in/out + timestamp.
+
+    Dipakai panel Recent Requests di dashboard. Tidak ada filter period —
+    selalu N terakhir agar operator melihat aktivitas terkini.
+    """
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    rows = await asyncio.to_thread(_query_recent_requests, limit)
+    return {"requests": rows, "count": len(rows)}
 
 
 @router.get("/monitor/api/relay")

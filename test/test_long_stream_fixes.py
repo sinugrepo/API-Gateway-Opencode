@@ -452,6 +452,53 @@ def _h3():
         raise AssertionError("kombinasi >3MB lolos tanpa 400")
 
 
+def _asgi_request(app, headers):
+    """Jalankan satu request ASGI tiruan; return (status, body, app_called)."""
+    import asyncio as _aio
+    called = []
+
+    async def inner(scope, receive, send):
+        called.append(True)
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"OK"})
+
+    from app.security.body_limit import BodyLimitMiddleware
+    wrapped = BodyLimitMiddleware(inner)
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def receive():
+        return {"type": "http.request", "body": b""}
+
+    async def run():
+        await wrapped({"type": "http", "headers": headers}, receive, send)
+    _aio.run(run())
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    body = next(m for m in sent if m["type"] == "http.response.body")
+    return start["status"], body["body"], bool(called)
+
+
+@case("K1 body >8MB -> 413 tanpa sentuh app")
+def _k1():
+    from app.core.config import MAX_REQUEST_BYTES
+    status, body, called = _asgi_request(
+        None, [(b"content-length", str(MAX_REQUEST_BYTES + 1).encode())])
+    assert status == 413, status
+    assert b"BODY_TOO_LARGE" in body, body
+    assert called is False, "app tidak boleh tersentuh"
+
+
+@case("K2 body normal + tanpa content-length -> lolos")
+def _k2():
+    status, body, called = _asgi_request(None, [(b"content-length", b"123")])
+    assert (status, body, called) == (200, b"OK", True)
+    status, body, called = _asgi_request(None, [])
+    assert (status, body, called) == (200, b"OK", True)
+
+
 def main() -> int:
     print(f"menjalankan {len(_results)} case...")
     print("=" * 70)

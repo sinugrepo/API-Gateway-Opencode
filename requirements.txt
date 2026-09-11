@@ -5,3 +5,5 @@ fastapi>=0.139.2
 httpx>=0.28.1
 pydantic>=2.13.4
 uvicorn>=0.51.0
+# Event loop cepat untuk VPS Linux (guarded di main.py; Windows otomatis skip).
+uvloop>=0.21.0; sys_platform != "win32"

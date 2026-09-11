@@ -314,3 +314,11 @@ SCAN_GUARD_TRUST_PROXY = os.getenv("SCAN_GUARD_TRUST_PROXY", "false").lower() ==
 
 # Batas memori: jumlah IP maksimum yang dilacak (terlama dibuang duluan).
 SCAN_GUARD_MAX_IPS = int(os.getenv("SCAN_GUARD_MAX_IPS", "20000"))
+
+
+# Batas ukuran body request (byte). Tanpa ini FastAPI mem-buffer body
+# sembarang besar ke memori (DoS OOM via base64 raksasa). Dicek dari header
+# Content-Length SEBELUM app tersentuh -> 413 cepat, streaming-safe.
+# 8MB menutupi vision maksimal (3MB media + overhead JSON/tools) dengan
+# headroom, namun jauh di bawah zona bahaya OOM.
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(8 * 1024 * 1024)))

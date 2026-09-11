@@ -215,6 +215,47 @@ def _query_usage_history(start_time: float, end_time: float) -> List[Dict[str, A
     return buckets
 
 
+def _query_recent_requests(limit: int = 20) -> List[Dict[str, Any]]:
+    """Ambil N request terakhir untuk panel Recent Requests.
+
+    Ringan: satu SELECT dengan ORDER BY timestamp DESC + LIMIT, tanpa
+    agregasi. Dipakai dashboard agar operator melihat model + token
+    in/out + kapan (timestamp epoch untuk time-ago di frontend).
+    """
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = 20
+    n = max(1, min(n, 100))
+    with _usage_db_lock:
+        conn = _get_usage_db_unlocked()
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT request_id, model, prompt_tokens, completion_tokens,
+                       total_tokens, timestamp
+                FROM token_usage
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (n,),
+            ).fetchall()
+            return [
+                {
+                    "request_id": r["request_id"],
+                    "model": r["model"],
+                    "prompt_tokens": int(r["prompt_tokens"] or 0),
+                    "completion_tokens": int(r["completion_tokens"] or 0),
+                    "total_tokens": int(r["total_tokens"] or 0),
+                    "timestamp": float(r["timestamp"]),
+                }
+                for r in rows
+            ]
+        finally:
+            conn.row_factory = None
+
+
 def _safe_record(
     *,
     request_id: str,

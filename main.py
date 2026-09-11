@@ -40,9 +40,15 @@ def __getattr__(name: str):
 
 
 if __name__ == "__main__":
+    import importlib.util
     import os
 
     import uvicorn
 
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    # Reload hanya untuk dev (watcher boros CPU + double-start di produksi).
+    reload = os.getenv("RELOAD", "false").lower() == "true"
+    # uvloop di Linux bila terpasang (VPS): throughput concurrent jauh di
+    # atas asyncio bawaan; absen di Windows -> jatuh ke asyncio otomatis.
+    loop = "uvloop" if importlib.util.find_spec("uvloop") else "asyncio"
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=reload, loop=loop)

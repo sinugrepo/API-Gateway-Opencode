@@ -10,6 +10,9 @@ OPENCODE_API_KEY*
 *.log
 logs/
 
+# Planning docs lokal (tidak ikut ke git).
+plans/
+
 # Python cache.
 __pycache__/
 *.py[cod]

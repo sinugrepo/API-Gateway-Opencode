@@ -4,7 +4,7 @@ import json
 import secrets
 import time
 from contextlib import suppress
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import httpx
 from fastapi import BackgroundTasks, HTTPException

@@ -1,52 +1,89 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="id">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Backend Monitor - Login</title>
+<meta name="color-scheme" content="dark">
+<title>Hermes Gateway — Monitor Login</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap');
+:root{--bg:#111217;--panel:#1b1c21;--border:#2c2d33;--text:#d8d9da;--muted:#9a9ca3;--accent:#5794f2;--accent-hover:#4a85e0;--red:#f2495c;--green:#7dce9a;--font:system-ui,-apple-system,'Segoe UI',Inter,Roboto,sans-serif}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Inter',-apple-system,sans-serif;background:#111217;color:#d8d9da;display:flex;align-items:center;justify-content:center;min-height:100vh;-webkit-font-smoothing:antialiased}
-.login-card{background:#1b1c21;border:1px solid #2c2d33;border-radius:8px;padding:48px 40px;width:100%;max-width:380px}
-.login-card .logo{width:40px;height:40px;background:linear-gradient(135deg,#5794f2,#3d71d9);border-radius:4px;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:18px;font-weight:700;color:#fff}
-.login-card h1{font-size:20px;font-weight:600;margin-bottom:4px;color:#f0f1f2;text-align:center;letter-spacing:-.2px}
-.login-card .subtitle{font-size:13px;color:#6e7079;text-align:center;margin-bottom:32px}
-.form-group{margin-bottom:20px}
-.form-group label{display:block;font-size:12px;font-weight:600;margin-bottom:6px;color:#9a9ca3;text-transform:uppercase;letter-spacing:.5px}
-.form-group input{width:100%;padding:10px 12px;border:1px solid #2c2d33;border-radius:4px;background:#111217;color:#d8d9da;font-size:14px;font-family:inherit;outline:none;transition:border-color .2s}
-.form-group input:focus{border-color:#5794f2}
-.form-group input::placeholder{color:#55565e}
-.btn{width:100%;padding:10px 14px;border:none;border-radius:4px;background:#5794f2;color:#fff;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;transition:background .2s}
-.btn:hover{background:#4a85e0}
-.btn:active{opacity:.9}
-.error{background:#3d1214;border:1px solid #f2495c;border-radius:4px;padding:10px;margin-bottom:20px;font-size:12px;color:#f2495c;display:none;line-height:1.4}
+body{font-family:var(--font);background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px;-webkit-font-smoothing:antialiased}
+.login-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:36px 32px;width:100%;max-width:380px}
+.logo{width:44px;height:44px;background:linear-gradient(135deg,#5794f2,#3d71d9);border-radius:8px;display:flex;align-items:center;justify-content:center;margin:0 auto 16px;font-size:16px;font-weight:700;color:#fff;letter-spacing:.5px}
+h1{font-size:19px;font-weight:650;margin-bottom:4px;color:#f0f1f2;text-align:center;letter-spacing:-.2px}
+.subtitle{font-size:13px;color:var(--muted);text-align:center;margin-bottom:24px}
+.notice{background:rgba(87,148,242,.1);border:1px solid rgba(87,148,242,.4);border-radius:6px;padding:10px 12px;margin-bottom:16px;font-size:12px;color:var(--accent);display:none;line-height:1.5}
+.error{background:#3d1214;border:1px solid var(--red);border-radius:6px;padding:10px 12px;margin-bottom:16px;font-size:12px;color:var(--red);display:none;line-height:1.5}
+.error.show,.notice.show{display:block}
+.shake{animation:shake .3s}
+@keyframes shake{25%{transform:translateX(-4px)}50%{transform:translateX(4px)}75%{transform:translateX(-2px)}}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;font-size:11px;font-weight:650;margin-bottom:6px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.pwd-wrap{position:relative}
+.pwd-wrap input{width:100%;padding:10px 44px 10px 12px;border:1px solid var(--border);border-radius:6px;background:#111217;color:var(--text);font-size:14px;font-family:inherit;outline:none}
+.pwd-wrap input:focus{border-color:var(--accent)}
+.pwd-toggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;padding:6px 8px;border-radius:4px}
+.pwd-toggle:hover{color:var(--text)}
+.pwd-toggle:focus-visible,.btn:focus-visible,.pwd-wrap input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.caps{font-size:11px;color:#f8d16c;margin-top:6px;display:none}
+.btn{width:100%;padding:11px 14px;border:none;border-radius:6px;background:var(--accent);color:#fff;font-size:14px;font-weight:650;font-family:inherit;cursor:pointer}
+.btn:hover:not(:disabled){background:var(--accent-hover)}
+.btn:disabled{opacity:.6;cursor:wait}
+.hint{margin-top:16px;font-size:11px;color:var(--muted);text-align:center;line-height:1.5}
+@media(prefers-reduced-motion:reduce){.shake{animation:none}}
 </style>
 </head>
 <body>
-<div class="login-card">
-<div class="logo">M</div>
-<h1>Backend Monitor</h1>
-<p class="subtitle">Sign in to continue</p>
-<div class="error" id="error"></div>
-<form id="loginForm" method="post" action="/monitor/login">
+<main class="login-card" aria-labelledby="title">
+<div class="logo" aria-hidden="true">HG</div>
+<h1 id="title">Hermes Gateway</h1>
+<p class="subtitle">Monitor operasional &bull; masuk untuk lanjut</p>
+<div class="notice" id="expired" role="status">Sesi berakhir, silakan masuk kembali.</div>
+<div class="error" id="error" role="alert"></div>
+<form id="loginForm" method="post" action="/monitor/login" novalidate>
 <div class="form-group">
 <label for="password">Password</label>
-<input type="password" id="password" name="password" placeholder="Enter password" autofocus required>
+<div class="pwd-wrap">
+<input type="password" id="password" name="password" placeholder="Enter password" autofocus required autocomplete="current-password" aria-describedby="caps">
+<button type="button" class="pwd-toggle" id="toggle" aria-label="Tampilkan password">Show</button>
 </div>
-<button type="submit" class="btn">Sign In</button>
+<div class="caps" id="caps">Caps Lock aktif</div>
+</div>
+<button type="submit" class="btn" id="submit">Sign In</button>
 </form>
-</div>
+<p class="hint">Cookie sesi 24 jam &bull; HttpOnly &bull; tidak dibagikan</p>
+</main>
 <script>
-document.getElementById('loginForm').addEventListener('submit',async function(e){
-e.preventDefault();
-const pwd=document.getElementById('password').value;
+(function(){
+var form=document.getElementById('loginForm'),pwd=document.getElementById('password'),
+err=document.getElementById('error'),btn=document.getElementById('submit'),
+toggle=document.getElementById('toggle'),caps=document.getElementById('caps'),
+card=document.querySelector('.login-card');
+if(new URLSearchParams(location.search).get('expired')==='1'){
+document.getElementById('expired').classList.add('show');}
+function showError(m){err.textContent=m;err.classList.add('show');
+card.classList.remove('shake');void card.offsetWidth;card.classList.add('shake');}
+toggle.addEventListener('click',function(){
+var show=pwd.type==='password';pwd.type=show?'text':'password';
+toggle.textContent=show?'Hide':'Show';toggle.setAttribute('aria-label',show?'Sembunyikan password':'Tampilkan password');pwd.focus();});
+pwd.addEventListener('keyup',function(e){
+caps.style.display=(e.getModifierState&&e.getModifierState('CapsLock'))?'block':'none';});
+form.addEventListener('submit',async function(e){
+e.preventDefault();err.classList.remove('show');
+var v=pwd.value;if(!v){showError('Password wajib diisi.');pwd.focus();return;}
+btn.disabled=true;btn.textContent='Signing in...';
 try{
-const r=await fetch('/monitor/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'password='+encodeURIComponent(pwd)});
-if(r.redirected)window.location.href=r.url;
-else{const d=await r.json();document.getElementById('error').style.display='block';document.getElementById('error').textContent=d.detail||'Login failed'}
-}catch(ex){document.getElementById('error').style.display='block';document.getElementById('error').textContent='Network error'}
-});
+var next=new URLSearchParams(location.search).get('next')||'';
+var url='/monitor/login'+(next.indexOf('/monitor')===0?'?next='+encodeURIComponent(next):'');
+var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'password='+encodeURIComponent(v),credentials:'same-origin'});
+if(r.redirected){window.location.href=r.url;return;}
+if(r.ok){window.location.href=next.indexOf('/monitor')===0?next:'/monitor';return;}
+var d=null;try{d=await r.json();}catch(_){}
+showError((d&&d.detail)||('Login gagal (HTTP '+r.status+')'));
+}catch(ex){showError('Network error, coba lagi.');}
+finally{btn.disabled=false;btn.textContent='Sign In';}});
+})();
 </script>
 </body>
 </html>
