@@ -16,9 +16,15 @@ from starlette.status import (
     HTTP_504_GATEWAY_TIMEOUT,
 )
 from app.core.config import API_KEY, MODEL, OPENCODE_RESPONSES_URL, RATE_LIMIT_BACKOFF, STREAM_BYPASS_RELAY, USE_RELAY
+from app.core.logging_utils import _log
 from app.core.errors import UpstreamError
 from app.services.opencode import _resolve_opencode_headers, _stable_opencode_session
-from app.services.responses_bridge import _extract_responses_usage, responses_stream_generator
+from app.services.responses_bridge import (
+    _extract_responses_usage,
+    _is_encrypted_content_rejection,
+    _strip_replayed_reasoning,
+    responses_stream_generator,
+)
 from app.services.upstream import _retry_after_seconds, call_upstream
 from app.services.usage import _safe_record
 
@@ -102,6 +108,27 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
         target_url=OPENCODE_RESPONSES_URL,
         extra_headers=oc_headers,
     )
+
+    # AUTO-HEAL (non-stream): penolakan replay encrypted_content tidak
+    # sembuh dengan rotasi target; buang reasoning replay lalu coba SEKALI.
+    if (
+        response.status_code == 400
+        and _is_encrypted_content_rejection(response.text[:500])
+    ):
+        healed_body, removed = _strip_replayed_reasoning(body)
+        if removed:
+            _log(
+                "RESP",
+                f"HEAL non-stream | encrypted_content ditolak -> buang "
+                f"{removed} item reasoning replay, retry 1x",
+            )
+            response, _ = await call_upstream(
+                healed_body,
+                stream=False,
+                use_relay=bool(stream_use_relay),
+                target_url=OPENCODE_RESPONSES_URL,
+                extra_headers=oc_headers,
+            )
 
     if response.status_code != 200:
         detail = response.text[:500]

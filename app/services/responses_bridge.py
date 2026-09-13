@@ -478,6 +478,77 @@ def _extract_responses_reasoning_text(output: Any) -> str:
         return ""
 
 
+def _payload_has_replay_reasoning(payload: Any) -> bool:
+    """True bila payload input membawa item reasoning ber-encrypted_content."""
+    try:
+        if not isinstance(payload, dict):
+            return False
+        items = payload.get("input")
+        if not isinstance(items, list):
+            return False
+        return any(
+            isinstance(item, dict)
+            and item.get("type") == "reasoning"
+            and isinstance(item.get("encrypted_content"), str)
+            and item["encrypted_content"]
+            for item in items
+        )
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _is_encrypted_content_rejection(detail: str) -> bool:
+    """True bila detail error upstream = penolakan replay encrypted_content.
+
+    Pesan persis: "reasoning `encrypted_content` was not issued to this
+    caller". Konten terenkripsi di-issuance ke caller identity turn
+    pertama; bila identitas berubah (atau percakapan dimulai sebelum fix
+    sesi-stabil), SEMUA target menolak dengan 400 yang sama.
+    """
+    if not detail:
+        return False
+    lowered = detail.lower()
+    return "encrypted_content" in lowered and (
+        "not issued to this caller" in lowered or "was not issued" in lowered
+    )
+
+
+def _strip_replayed_reasoning(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+    """Buang item reasoning yang membawa encrypted_content dari payload input.
+
+    Responses stateless (store:false + include reasoning.encrypted_content)
+    mereplay item reasoning turn sebelumnya di `input`. Bila caller identity
+    sudah tidak cocok, upstream menolak SELURUH request. Menghapus item
+    reasoning itu membuat request diterima lagi (model kehilangan konten
+    thinking lama, tapi teks/tool-call history tetap utuh).
+
+    Return (payload_bersama, jumlah_item_dibuang). Payload asli TIDAK
+    dimutasi (salinan dangkal + salinan daftar input).
+    """
+    if not isinstance(payload, dict):
+        return payload, 0
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return payload, 0
+    kept: List[Dict[str, Any]] = []
+    removed = 0
+    for item in items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "reasoning"
+            and isinstance(item.get("encrypted_content"), str)
+            and item["encrypted_content"]
+        ):
+            removed += 1
+            continue
+        kept.append(item)
+    if not removed:
+        return payload, 0
+    healed = dict(payload)
+    healed["input"] = kept
+    return healed, removed
+
+
 async def responses_stream_generator(
     payload: Dict[str, Any],
     *,
@@ -536,6 +607,9 @@ async def responses_stream_generator(
     last_retry_after: Optional[float] = None
     # Bug spam-429 opencode khusus muse-spark: 1x same-route retry per target.
     spurious_429_retried: set = set()
+    # AUTO-HEAL encrypted_content: sekali per request, kembali ke target 0.
+    healed_once = False
+    heal_restart = False
     _log("RESP", f"REQ model={client_model} stream_keys={sorted(payload.keys())} {_oc_session_tag(opencode_headers)}")
 
     try:
@@ -563,6 +637,31 @@ async def responses_stream_generator(
                             detail = body.decode("utf-8", errors="replace")[:500]
                         except Exception:  # noqa: BLE001
                             detail = ""
+                        # AUTO-HEAL: penolakan replay encrypted_content tidak
+                        # akan sembuh dengan rotasi target (payload sama, semua
+                        # target menolak). Buang item reasoning replay lalu
+                        # mulai lagi dari target pertama, SEKALI per request.
+                        if (
+                            response.status_code == 400
+                            and not sent_first_byte
+                            and not healed_once
+                            and _is_encrypted_content_rejection(detail)
+                            and _payload_has_replay_reasoning(payload)
+                        ):
+                            payload, removed = _strip_replayed_reasoning(payload)
+                            if removed:
+                                healed_once = True
+                                last_error = (
+                                    f"Upstream responded with {response.status_code}: {detail}"
+                                )
+                                _log(
+                                    "RESP",
+                                    f"HEAL {target_url} | encrypted_content ditolak "
+                                    f"-> buang {removed} item reasoning replay, "
+                                    f"retry dari target pertama",
+                                )
+                                target_index = 0
+                                continue
                         if is_relay and _is_relay_timeout(response):
                             # Konteks raksasa -> 504 Edge wajar (TTFB>25s),
                             # jangan tandai relay sehat sebagai broken.
@@ -700,14 +799,37 @@ async def responses_stream_generator(
                                     else:
                                         last_rate_limited = _relay_status == 429
                                     last_error = f"Relay error {_relay_status}: {_relay_body}"
-                                    relay_target_failed = True
-                                    _log(
-                                        "RESP",
-                                        f"RELAY-ERROR {target_url} | status="
-                                        f"{_relay_status} detail={_relay_body!r} "
-                                        f"-> target berikutnya",
-                                    )
-                                    break
+                                    # AUTO-HEAL encrypted_content lewat relay
+                                    # early-SSE (HTTP 200 + event relay.error):
+                                    # buang reasoning replay, mulai dari target 0.
+                                if (
+                                    _relay_status == 400
+                                    and not healed_once
+                                    and _is_encrypted_content_rejection(_relay_body)
+                                    and _payload_has_replay_reasoning(payload)
+                                ):
+                                    _stripped, removed = _strip_replayed_reasoning(payload)
+                                    if removed:
+                                        payload = _stripped
+                                        healed_once = True
+                                        heal_restart = True
+                                        relay_target_failed = True
+                                        _log(
+                                            "RESP",
+                                            f"HEAL {target_url} | encrypted_content "
+                                            f"ditolak (relay.error) -> buang {removed} "
+                                            f"item reasoning replay, retry dari target "
+                                            f"pertama",
+                                        )
+                                        break
+                                relay_target_failed = True
+                                _log(
+                                    "RESP",
+                                    f"RELAY-ERROR {target_url} | status="
+                                    f"{_relay_status} detail={_relay_body!r} "
+                                    f"-> target berikutnya",
+                                )
+                                break
                             sent_first_byte = True
                             # Best-effort: intip usage tanpa mengganggu aliran.
                             if '"usage"' in data:
@@ -745,7 +867,13 @@ async def responses_stream_generator(
                                 await pending_line_task
 
                 if relay_target_failed:
-                    target_index += 1
+                    if heal_restart:
+                        # Auto-heal: ulangi dari target pertama dengan payload
+                        # yang sudah dibersihkan (bukan maju ke target berikut).
+                        heal_restart = False
+                        target_index = 0
+                    else:
+                        target_index += 1
                     continue
 
                 stream_completed = True
@@ -966,6 +1094,9 @@ async def responses_to_chat_stream_generator(
     last_retry_after: Optional[float] = None
     # Bug spam-429 opencode khusus muse-spark: 1x same-route retry per target.
     spurious_429_retried: set = set()
+    # AUTO-HEAL encrypted_content: sekali per request, kembali ke target 0.
+    healed_once = False
+    heal_restart = False
     _log("RESP", f"CHAT-BRIDGE-STREAM model={client_model} keys={sorted(payload.keys())} {_oc_session_tag(opencode_headers)}")
 
 
@@ -1226,6 +1357,28 @@ async def responses_to_chat_stream_generator(
                                 else:
                                     last_rate_limited = _relay_status == 429
                                 last_error = f"Relay error {_relay_status}: {_relay_body}"
+                                # AUTO-HEAL encrypted_content lewat relay
+                                # early-SSE (HTTP 200 + event relay.error).
+                                if (
+                                    _relay_status == 400
+                                    and not healed_once
+                                    and _is_encrypted_content_rejection(_relay_body)
+                                    and _payload_has_replay_reasoning(payload)
+                                ):
+                                    _stripped, removed = _strip_replayed_reasoning(payload)
+                                    if removed:
+                                        payload = _stripped
+                                        healed_once = True
+                                        heal_restart = True
+                                        relay_target_failed = True
+                                        _log(
+                                            "RESP",
+                                            f"HEAL {target_url} | encrypted_content "
+                                            f"ditolak (relay.error bridge) -> buang "
+                                            f"{removed} item reasoning replay, retry "
+                                            f"dari target pertama",
+                                        )
+                                        break
                                 relay_target_failed = True
                                 _log(
                                     "RESP",
@@ -1443,7 +1596,13 @@ async def responses_to_chat_stream_generator(
                                 await pending_line_task
 
                 if relay_target_failed:
-                    target_index += 1
+                    if heal_restart:
+                        # Auto-heal: ulangi dari target pertama dengan payload
+                        # yang sudah dibersihkan (bukan maju ke target berikut).
+                        heal_restart = False
+                        target_index = 0
+                    else:
+                        target_index += 1
                     continue
 
                 stream_completed = True
