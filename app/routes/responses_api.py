@@ -17,7 +17,7 @@ from starlette.status import (
 )
 from app.core.config import API_KEY, MODEL, OPENCODE_RESPONSES_URL, RATE_LIMIT_BACKOFF, STREAM_BYPASS_RELAY, USE_RELAY
 from app.core.errors import UpstreamError
-from app.services.opencode import _resolve_opencode_headers
+from app.services.opencode import _resolve_opencode_headers, _stable_opencode_session
 from app.services.responses_bridge import _extract_responses_usage, responses_stream_generator
 from app.services.upstream import _retry_after_seconds, call_upstream
 from app.services.usage import _safe_record
@@ -59,7 +59,19 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
         stream_use_relay = False
     stream = bool(body.get("stream", False))
     # Identitas CLI untuk free tier (dibagi ke semua upstream attempt).
+    # Sesi dibuat STABIL per-percakapan (bukan acak per-request): konten
+    # reasoning `encrypted_content` yang direplay klien stateless di-turn
+    # berikutnya di-issuance ke caller identity turn pertama. Sesi acak baru
+    # tiap request membuat upstream menolaknya (400 "encrypted_content was
+    # not issued to this caller") dan percakapan brick permanen.
     oc_headers = _resolve_opencode_headers(request.headers)
+    # _resolve_opencode_headers mengisi sesi acak bila klien tidak mengirim
+    # x-opencode-session; ganti dengan sesi stabil per-percakapan.
+    client_sent_session = bool(
+        (request.headers.get("x-opencode-session") or "").strip()
+    )
+    if not client_sent_session:
+        oc_headers["x-opencode-session"] = _stable_opencode_session(body)
 
     if stream:
         if not API_KEY:

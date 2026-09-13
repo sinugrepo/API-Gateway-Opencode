@@ -18,7 +18,7 @@ from starlette.status import (
 from app.core.config import API_KEY, OPENCODE_RESPONSES_URL, RATE_LIMIT_BACKOFF, STREAM_BYPASS_RELAY, USE_RELAY, _is_responses_only_model
 from app.core.errors import UpstreamError
 from app.core.logging_utils import _log
-from app.services.opencode import _resolve_opencode_headers
+from app.services.opencode import _resolve_opencode_headers, _stable_opencode_session
 from app.services.responses_bridge import _extract_responses_usage, _responses_output_to_chat, build_responses_payload_from_chat, responses_to_chat_stream_generator
 from app.core.schemas import ChatCompletionRequest
 from app.services.streaming import stream_generator
@@ -171,6 +171,16 @@ async def chat_completions(
     # Model Responses-only (muse-spark): klien chat-only seperti Hermes tidak
     # bisa diarahkan ke /v1/responses — jembatani otomatis di sini.
     if _is_responses_only_model(client_model):
+        # Sesi STABIL per-percakapan bila klien tidak mengirim sendiri
+        # x-opencode-session: konten reasoning `encrypted_content` yang
+        # direplay di turn berikutnya di-issuance ke caller identity turn
+        # pertama; sesi acak per-request membuat upstream menolaknya (400
+        # "encrypted_content was not issued to this caller").
+        if not (request.headers.get("x-opencode-session") or "").strip():
+            oc_headers = dict(oc_headers)
+            oc_headers["x-opencode-session"] = _stable_opencode_session(
+                {"messages": [message.to_upstream() for message in req.messages]}
+            )
         return await chat_completions_via_responses(
             req, client_model, background_tasks, oc_headers
         )
