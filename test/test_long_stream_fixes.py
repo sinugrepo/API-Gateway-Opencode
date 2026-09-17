@@ -238,7 +238,11 @@ def _e1():
     from app.services.relay import _stream_request_headers
     oc = _resolve_opencode_headers(None)
     assert oc["x-opencode-session"].startswith("ses_") and len(oc["x-opencode-session"]) == 30
-    assert oc["x-opencode-request"].startswith("msg_") and len(oc["x-opencode-request"]) == 28
+    assert oc["x-opencode-request"].startswith("msg_") and len(oc["x-opencode-request"]) == 30
+    # Format spec opencode-session.md §4: 12 hex + 14 base62.
+    from app.services.opencode import _is_valid_opencode_id
+    assert _is_valid_opencode_id(oc["x-opencode-session"], "ses_"), oc["x-opencode-session"]
+    assert _is_valid_opencode_id(oc["x-opencode-request"], "msg_"), oc["x-opencode-request"]
     h = _stream_request_headers(oc)
     assert h["Accept-Encoding"] == "identity", "kompresi harus mati agar SSE tidak di-buffer"
     assert h["Accept"] == "text/event-stream"

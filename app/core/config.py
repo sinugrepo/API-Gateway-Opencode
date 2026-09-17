@@ -48,11 +48,13 @@ def _is_responses_only_model(model: str) -> bool:
 
 
 # Free tier upstream WAJIB menerima header sesi ala CLI, kalau tidak request
-# ditolak: MissingSessionID ("free tier can only be used in OpenCode").
+# ditolak: FreeTierError ("free tier can only be used in OpenCode").
 # Hermes lama tidak mengirimnya (baru ada di build pasca PR NousResearch
 # #101864), jadi proxy menyuntikkannya agar terlihat seperti opencode CLI:
 #   x-opencode-client: cli | x-opencode-project: global
-#   x-opencode-session: ses_<26 alfanumerik> | x-opencode-request: msg_<24>
+#   x-opencode-session: ses_<12 hex timestamp + 14 base62> (stabil 1/conversation)
+#   x-opencode-request: msg_<12 hex timestamp + 14 base62> (unik per POST)
+# Format persis mengikuti `opencode-session.md` §4 (Go createID).
 # Satu sesi dipakai bersama untuk semua upstream attempt dalam SATU request
 # klien (relay + fallback direct). Bila klien sudah mengirim header tersebut,
 # nilai klien dihormati (diutamakan) agar sesi per-percakapan tetap stabil.

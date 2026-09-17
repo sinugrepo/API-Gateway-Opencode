@@ -196,19 +196,21 @@ async def chat_completions(
     # getattr agar tahan Request/Headers/dict/None.
     oc_headers = _resolve_opencode_headers(getattr(request, "headers", request))
 
+    # Sesi STABIL per-percakapan bila klien tidak mengirim sendiri
+    # x-opencode-session (`opencode-session.md` §7: 1 ID per conversation
+    # untuk cache affinity; request ID tetap unik per POST dari resolver).
+    # Berlaku untuk SEMUA model chat (bukan cuma bridge): sesi acak
+    # per-request memutus affinity cache + membuat replay
+    # `reasoning.encrypted_content` ditolak upstream pada turn berikutnya.
+    if not (request.headers.get("x-opencode-session") or "").strip():
+        oc_headers = dict(oc_headers)
+        oc_headers["x-opencode-session"] = _stable_opencode_session(
+            {"messages": [message.to_upstream() for message in req.messages]}
+        )
+
     # Model Responses-only (muse-spark): klien chat-only seperti Hermes tidak
     # bisa diarahkan ke /v1/responses — jembatani otomatis di sini.
     if _is_responses_only_model(client_model):
-        # Sesi STABIL per-percakapan bila klien tidak mengirim sendiri
-        # x-opencode-session: konten reasoning `encrypted_content` yang
-        # direplay di turn berikutnya di-issuance ke caller identity turn
-        # pertama; sesi acak per-request membuat upstream menolaknya (400
-        # "encrypted_content was not issued to this caller").
-        if not (request.headers.get("x-opencode-session") or "").strip():
-            oc_headers = dict(oc_headers)
-            oc_headers["x-opencode-session"] = _stable_opencode_session(
-                {"messages": [message.to_upstream() for message in req.messages]}
-            )
         return await chat_completions_via_responses(
             req, client_model, background_tasks, oc_headers
         )

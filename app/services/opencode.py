@@ -1,34 +1,57 @@
-"""OpenCode CLI identity headers (free-tier session)."""
+"""OpenCode CLI identity headers (free-tier session).
+
+Format ID mengikuti reverse-engineer `kode-ai/providers/opencode/headers.go`
+(lihat `opencode-session.md` §4):
+  suffix 26 char = 12 hex (timestamp ms*0x1000+counter, big-endian [2:],
+  descending=bitwise-NOT untuk session) + 14 base62 acak (`0-9A-Za-z`).
+  Session: `ses_` + suffix(descending=True)
+  Request: `msg_` + suffix(descending=False, unik per POST)
+
+Aturan pakai (§7): session STABIL 1 ID per conversation (cache affinity),
+request UNIK per message, project=global, client=cli.
+"""
 import hashlib
 import os
 import secrets
-import string
+import struct
+import time
 from typing import Any, Dict, List, Optional
 
 from app.core.config import OPENCODE_CLIENT_NAME, OPENCODE_PROJECT, OPENCODE_SESSION_ID
 
 
-_OPENCODE_ID_ALPHABET = string.ascii_letters + string.digits
+_BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-# User-Agent persis CLI opencode asli (dari capture request nyata).
+# User-Agent persis CLI opencode asli (dari capture request nyata + doc §5).
 # Bisa dioverride via env bila CLI upstream diupdate.
 OPENCODE_USER_AGENT = os.getenv(
     "OPENCODE_USER_AGENT",
-    "opencode/1.18.29 ai-sdk/provider-utils/4.0.38 runtime/bun/1.3.14",
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
 )
 
 
-def _new_opencode_id(prefix: str, length: int) -> str:
-    """ID opaque gaya CLI: prefix + alfanumerik acak (tidak ada info user)."""
-    return prefix + "".join(secrets.choice(_OPENCODE_ID_ALPHABET) for _ in range(length))
+def _random_base62(n: int) -> str:
+    """N char base62 acak (`0-9A-Za-z`), urutan alfabet sesuai Go spec."""
+    token = secrets.token_bytes(n)
+    return "".join(_BASE62_ALPHABET[b % 62] for b in token)
+
+
+def _create_id(descending: bool, t: Optional[float] = None, counter: int = 1) -> str:
+    """Suffix 26 char: 12 hex timestamp + 14 base62 acak (ekuivalen Go createID)."""
+    ms = int((t if t is not None else time.time()) * 1000)
+    now = ((ms * 0x1000 + counter) & ((1 << 64) - 1))
+    if descending:
+        now = (~now) & ((1 << 64) - 1)
+    timestamp_hex = struct.pack(">Q", now)[2:].hex()
+    return timestamp_hex + _random_base62(14)
 
 
 def _new_opencode_session_id() -> str:
-    return _new_opencode_id("ses_", 26)
+    return "ses_" + _create_id(True)
 
 
 def _new_opencode_request_id() -> str:
-    return _new_opencode_id("msg_", 24)
+    return "msg_" + _create_id(False)
 
 
 def _opencode_cli_headers(
@@ -38,10 +61,10 @@ def _opencode_cli_headers(
 ) -> Dict[str, str]:
     """Bangun header identitas CLI + User-Agent ala CLI asli.
 
-    User-Agent disamakan dengan CLI opencode asli (referensi request nyata:
-    `opencode/1.18.29 ai-sdk/provider-utils/4.0.38 runtime/bun/1.3.14`) agar
-    fingerprint caller upstream konsisten — UA python-httpx bawaan justru
-    menandai request ini BUKAN CLI (rawan ditolak free tier).
+    User-Agent disamakan dengan CLI opencode asli (`opencode-session.md` §5:
+    `opencode/1.18.31 ...`) agar fingerprint caller upstream konsisten — UA
+    python-httpx bawaan justru menandai request ini BUKAN CLI (rawan
+    ditolak free tier dengan FreeTierError).
     """
     return {
         "x-opencode-client": OPENCODE_CLIENT_NAME,
@@ -52,9 +75,25 @@ def _opencode_cli_headers(
     }
 
 
-_SESSION_ALPHABET = string.ascii_letters + string.digits  # ala CLI asli: ses_ + 26 alfanumerik
+def _is_valid_opencode_suffix(suffix: str) -> bool:
+    """True bila suffix 26 char = 12 hex + 14 base62 (spec §4)."""
+    if not isinstance(suffix, str) or len(suffix) != 26:
+        return False
+    hex_part, b62_part = suffix[:12], suffix[12:]
+    if any(c not in "0123456789abcdefABCDEF" for c in hex_part):
+        return False
+    return all(c in _BASE62_ALPHABET for c in b62_part)
 
-_STABLE_SESSION_FALLBACK = "ses_" + "0" * 26  # dipakai bila payload tak bisa di-fingerprint
+
+def _is_valid_opencode_id(value: str, prefix: str) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and _is_valid_opencode_suffix(value[len(prefix):])
+    )
+
+
+_STABLE_SESSION_FALLBACK = "ses_" + "0" * 12 + "0" * 14  # format-valid bila tak ada sinyal
 
 
 def _conversation_fingerprint(payload: Any) -> str:
@@ -123,6 +162,12 @@ def _stable_opencode_session(payload: Any = None) -> str:
     ("encrypted_content was not issued to this caller") karena konten
     terenkripsi di-issuance ke session ID yang sudah hilang.
 
+    Format HASIL mengikuti spec `opencode-session.md` §4 agar lolos
+    validasi free-tier (bukan sekadar alfanumerik acak):
+      `ses_` + 12 hex + 14 base62.
+    Deterministik dari fingerprint sehingga stabil antar-turn DAN antar
+    restart (cache in-memory hilang saat restart, tapi hash sama -> ID sama).
+
     Prioritas:
     1. OPENCODE_SESSION_ID env (statis global, opsional).
     2. Fingerprint percakapan (prompt_cache_key / system+first user msg) ->
@@ -133,16 +178,17 @@ def _stable_opencode_session(payload: Any = None) -> str:
         return OPENCODE_SESSION_ID
     fingerprint = _conversation_fingerprint(payload)
     if fingerprint:
-        # Petakan hash deterministik ke karakter alfanumerik agar bentuknya
-        # identik dengan sesi CLI asli (mis. ses_f663b1124ffer0M79j4R6q4Agi):
-        # ses_ + 26 alfanumerik, huruf besar-kecil campur. Dua percakapan
-        # berbeda hampir pasti menghasilkan sesi berbeda (36^26 ruang).
-        digest_int = int(fingerprint, 16)
-        chars = []
-        for i in range(26):
-            digest_int, rem = divmod(digest_int, 62)
-            chars.append(_SESSION_ALPHABET[rem])
-        return "ses_" + "".join(chars)
+        # 12 hex pertama fingerprint = prefix hex valid (lowercase sha256).
+        # 14 base62 sisanya dipetakan deterministik dari sisa hash agar
+        # suffix penuh 26 char valid + stabil (dua percakapan berbeda hampir
+        # pasti beda: ruang 16^12 * 62^14).
+        hex_prefix = fingerprint[:12].lower()
+        remainder_int = int(fingerprint[12:], 16)
+        chars: List[str] = []
+        for _ in range(14):
+            remainder_int, rem = divmod(remainder_int, 62)
+            chars.append(_BASE62_ALPHABET[rem])
+        return "ses_" + hex_prefix + "".join(chars)
     return _STABLE_SESSION_FALLBACK
 
 
