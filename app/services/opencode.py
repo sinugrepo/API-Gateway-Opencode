@@ -126,7 +126,10 @@ def _conversation_fingerprint(payload: Any) -> str:
     items: Any = payload.get("input")
     if items is None:
         items = payload.get("messages")
-    if isinstance(items, list):
+    if isinstance(items, str):
+        if items.strip():
+            texts.append(items)
+    elif isinstance(items, list):
         for item in items:
             if isinstance(item, str):
                 texts.append(item)
@@ -244,3 +247,103 @@ def _oc_session_tag(headers: Optional[Dict[str, str]]) -> str:
     except (AttributeError, TypeError):
         session = ""
     return f"ses={session[:14]}" if session else "ses=-"
+
+
+# ── Free-tier client fingerprint gates ( diverifikasi live 2026-09-18 ) ──
+# Upstream Zen menolak request free-tier dengan 403 FreeTierError bila salah
+# satu gate tidak terpenuhi (lihat `fix opencode.ts`):
+#   1. stream:true (stream:false / hilang -> 403, chat MAUPUN responses).
+#   2. Kuartet tools bawaan OpenCode [bash, glob, grep, read] hadir di body.
+# Bentuk tools berbeda per API: chat memakai bungkus
+# {"type":"function","function":{...}}, responses memakai flat
+# {"type":"function","name":...}. Klien (Hermes dsb.) jarang mengirim tools
+# ini, jadi proxy menyuntikkannya agar terlihat seperti OpenCode CLI.
+OPENCODE_FINGERPRINT_TOOLS = ("bash", "glob", "grep", "read")
+
+# Model yang HANYA dilayani lewat Responses API (substring, lowercase).
+OPENCODE_RESPONSES_MODELS = frozenset({
+    "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor-free",
+})
+
+
+def _tool_name_of(tool: Any) -> str:
+    """Ambil nama tool dari bentuk chat maupun responses (toleran)."""
+    if not isinstance(tool, dict):
+        return ""
+    name = tool.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    function = tool.get("function")
+    if isinstance(function, dict):
+        fname = function.get("name")
+        if isinstance(fname, str) and fname.strip():
+            return fname.strip()
+    return ""
+
+
+def ensure_chat_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Suntik kuartet tools fingerprint bentuk chat bila belum ada."""
+    if not isinstance(payload, dict):
+        return payload
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+        payload["tools"] = tools
+    present = {_tool_name_of(t) for t in tools}
+    for name in OPENCODE_FINGERPRINT_TOOLS:
+        if name in present:
+            continue
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": f"OpenCode built-in {name} tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        })
+    return payload
+
+
+def ensure_responses_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Suntik kuartet tools fingerprint bentuk responses bila belum ada."""
+    if not isinstance(payload, dict):
+        return payload
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+        payload["tools"] = tools
+    present = {_tool_name_of(t) for t in tools}
+    for name in OPENCODE_FINGERPRINT_TOOLS:
+        if name in present:
+            continue
+        tools.append({
+            "type": "function",
+            "name": name,
+            "description": f"OpenCode built-in {name} tool",
+            "parameters": {"type": "object", "properties": {}},
+        })
+    return payload
+
+
+def ensure_responses_wire_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalisasi field Responses API ala CLI sebelum dikirim upstream.
+
+    - max_tokens / max_completion_tokens (gaya chat) dipetakan ke
+      max_output_tokens bila yang terakhir belum ada.
+    - store=false (stateless; thinking tidak dipertahankan server).
+    - Kuartet tools fingerprint disuntik.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if payload.get("max_output_tokens") is None:
+        for key in ("max_completion_tokens", "max_tokens"):
+            value = payload.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                payload["max_output_tokens"] = int(value)
+                break
+    payload.pop("max_tokens", None)
+    payload.pop("max_completion_tokens", None)
+    payload["store"] = False
+    ensure_responses_fingerprint_tools(payload)
+    return payload

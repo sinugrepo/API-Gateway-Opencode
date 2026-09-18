@@ -101,6 +101,14 @@ def build_upstream_payload(req: ChatCompletionRequest) -> Dict[str, Any]:
         stream_opts["include_usage"] = True
         payload["stream_options"] = stream_opts
 
+    # Free-tier fingerprint gate (403 bila hilang): kuartet tools bawaan
+    # OpenCode wajib hadir di body chat (diverifikasi live 2026-09-18).
+    try:
+        from app.services.opencode import ensure_chat_fingerprint_tools
+        ensure_chat_fingerprint_tools(payload)
+    except (ImportError, AttributeError, TypeError):
+        pass
+
     return payload
 
 

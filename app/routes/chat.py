@@ -15,23 +15,18 @@ from starlette.status import (
     HTTP_503_SERVICE_UNAVAILABLE,
     HTTP_504_GATEWAY_TIMEOUT,
 )
-from app.core.config import API_KEY, OPENCODE_RESPONSES_URL, RATE_LIMIT_BACKOFF, STREAM_BYPASS_RELAY, USE_RELAY, _is_responses_only_model
-from app.core.errors import UpstreamError
+from app.core.config import API_KEY, OPENCODE_RESPONSES_URL, STREAM_BYPASS_RELAY, USE_RELAY, _is_responses_only_model
+from app.core.errors import UpstreamEmptyResponse, UpstreamError
 from app.core.logging_utils import _log
+from app.services.collect import collect_chat_completion
 from app.services.opencode import _resolve_opencode_headers, _stable_opencode_session
 from app.services.responses_bridge import (
-    _extract_responses_usage,
-    _is_encrypted_content_rejection,
-    _responses_output_to_chat,
-    _strip_replayed_reasoning,
     build_responses_payload_from_chat,
     responses_to_chat_stream_generator,
 )
 from app.core.schemas import ChatCompletionRequest
 from app.services.streaming import stream_generator
-from app.services.tools_dsml import extract_response_content
-from app.services.upstream import _resolve_request_model, _retry_after_seconds, build_upstream_payload, call_upstream
-from app.services.usage import _safe_record
+from app.services.upstream import _resolve_request_model, build_upstream_payload
 
 router = APIRouter()
 
@@ -43,8 +38,10 @@ async def chat_completions_via_responses(
 ):
     """Layani chat request untuk model Responses-only via Responses API.
 
-    Non-stream: panggil Responses upstream, konversi hasilnya ke chat
-    completion. Stream: terjemahkan SSE Responses ke SSE chat.
+    Non-stream: Responses upstream HANYA menerima `stream:true` (free-tier
+    gate, 403 bila tidak) sehingga generator bridge dijalankan internal
+    dengan wire `stream:true` lalu hasilnya di-buffer menjadi satu
+    chat completion. Stream: terjemahkan SSE Responses ke SSE chat.
     """
     use_relay = req.use_relay if req.use_relay is not None else USE_RELAY
     responses_payload = build_responses_payload_from_chat(req)
@@ -84,86 +81,32 @@ async def chat_completions_via_responses(
             },
         )
 
-    response, _ = await call_upstream(
-        responses_payload,
-        stream=False,
-        use_relay=bool(use_relay),
-        target_url=OPENCODE_RESPONSES_URL,
-        extra_headers=opencode_headers,
-    )
-
-    # AUTO-HEAL (bridge non-stream): penolakan replay encrypted_content
-    # tidak sembuh dengan rotasi target; buang reasoning replay lalu SEKALI.
-    if (
-        response.status_code == 400
-        and _is_encrypted_content_rejection(response.text[:500])
-    ):
-        healed_payload, removed = _strip_replayed_reasoning(responses_payload)
-        if removed:
-            _log(
-                "RESP",
-                f"HEAL bridge non-stream | encrypted_content ditolak -> buang "
-                f"{removed} item reasoning replay, retry 1x",
-            )
-            response, _ = await call_upstream(
-                healed_payload,
-                stream=False,
-                use_relay=bool(use_relay),
-                target_url=OPENCODE_RESPONSES_URL,
-                extra_headers=opencode_headers,
-            )
-
-    if response.status_code != 200:
-        detail = response.text[:500]
-        if response.status_code == 429:
-            raise UpstreamError(
-                f"Upstream rate limited (429): {detail}",
-                status_code=HTTP_429_TOO_MANY_REQUESTS,
-                upstream_status=429,
-                retry_after=_retry_after_seconds(response, RATE_LIMIT_BACKOFF),
-            )
-        raise UpstreamError(
-            f"Upstream responded with {response.status_code}: {detail}",
-            status_code=HTTP_502_BAD_GATEWAY,
-            upstream_status=response.status_code,
-        )
-
+    wire_payload = dict(responses_payload)
+    wire_payload["stream"] = True
     try:
-        result = response.json()
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise UpstreamError(
-            f"Invalid JSON from upstream: {exc}",
-            status_code=HTTP_502_BAD_GATEWAY,
-        ) from exc
-
-    if not isinstance(result, dict):
-        raise UpstreamError(
-            "Invalid Responses object from upstream",
-            status_code=HTTP_502_BAD_GATEWAY,
+        content, tool_calls, _finish, usage = await collect_chat_completion(
+            lambda: responses_to_chat_stream_generator(
+                wire_payload,
+                client_model=client_model,
+                include_usage_requested=True,
+                background_tasks=background_tasks,
+                use_relay=bool(use_relay),
+                opencode_headers=opencode_headers,
+            ),
+            client_model=client_model,
         )
-
-    content, tool_calls = _responses_output_to_chat(result.get("output"))
-    usage = _extract_responses_usage(result) or {
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
-    }
-
-    background_tasks.add_task(
-        _safe_record,
-        request_id=str(result.get("id", f"chatcmpl-{secrets.token_hex(16)}")),
-        model=client_model,
-        prompt_tokens=usage.get("prompt_tokens", 0),
-        completion_tokens=usage.get("completion_tokens", 0),
-        total_tokens=usage.get("total_tokens", 0),
-    )
+    except UpstreamEmptyResponse:
+        # Kontrak lama bridge non-stream: upstream kosong tetap 200 dengan
+        # content "" (bukan 502) agar klien bisa retry/fallback sendiri.
+        content, tool_calls = "", []
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     message: Dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         message["tool_calls"] = tool_calls
 
     return {
-        "id": result.get("id", f"chatcmpl-{secrets.token_hex(16)}"),
+        "id": f"chatcmpl-{secrets.token_hex(16)}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": client_model,
@@ -252,63 +195,34 @@ async def chat_completions(
         )
 
     use_relay = req.use_relay if req.use_relay is not None else USE_RELAY
-    response, _ = await call_upstream(
-        payload, stream=False, use_relay=use_relay, extra_headers=oc_headers
+    # Free-tier gate: upstream HANYA menerima stream:true (403 bila tidak).
+    # Jalankan generator streaming internal dengan wire stream:true lalu
+    # buffer menjadi satu chat completion untuk klien non-stream.
+    wire_payload = dict(payload)
+    wire_payload["stream"] = True
+    wire_stream_opts = wire_payload.get("stream_options")
+    if not isinstance(wire_stream_opts, dict):
+        wire_stream_opts = {}
+    wire_stream_opts["include_usage"] = True
+    wire_payload["stream_options"] = wire_stream_opts
+    content, tool_calls, finish_reason, usage = await collect_chat_completion(
+        lambda: stream_generator(
+            wire_payload,
+            client_model=client_model,
+            include_usage_requested=True,
+            background_tasks=background_tasks,
+            use_relay=use_relay,
+            opencode_headers=oc_headers,
+        ),
+        client_model=client_model,
     )
-
-    if response.status_code != 200:
-        # Keep only a bounded diagnostic. Do not expose keys or full HTML.
-        detail = response.text[:500]
-        if response.status_code == 429:
-            # Jaring pengaman: call_upstream biasanya sudah melempar 429 yang
-            # bersih. Kalau response 429 lolos sampai sini, jangan samarkan
-            # menjadi 502 — teruskan 429 + Retry-After ke klien.
-            raise UpstreamError(
-                f"Upstream rate limited (429): {detail}",
-                status_code=HTTP_429_TOO_MANY_REQUESTS,
-                upstream_status=429,
-                retry_after=_retry_after_seconds(response, RATE_LIMIT_BACKOFF),
-            )
-        raise UpstreamError(
-            f"Upstream responded with {response.status_code}: {detail}",
-            status_code=HTTP_502_BAD_GATEWAY,
-            upstream_status=response.status_code,
-        )
-
-    try:
-        result = response.json()
-    except json.JSONDecodeError as exc:
-        raise UpstreamError(
-            f"Invalid JSON from upstream: {exc}",
-            status_code=HTTP_502_BAD_GATEWAY,
-        ) from exc
-
-    content, tool_calls, finish_reason = extract_response_content(result)
 
     message: Dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         message["tool_calls"] = tool_calls
 
-    usage = result.get("usage", {}) or {}
-
-    # Record usage as a fire-and-forget task via FastAPI BackgroundTasks so
-    # the insert runs after the response is sent. This survives across
-    # requests instead of being lost when the wrapper task is finalised
-    # before the thread worker dispatches. Streaming requests are
-    # intentionally not tracked here: their `usage` payload is consumed by
-    # the browser/agent and only includes token counts when the client
-    # forwards `stream_options.include_usage`, which this proxy does not.
-    background_tasks.add_task(
-        _safe_record,
-        request_id=result.get("id", f"chatcmpl-{secrets.token_hex(16)}"),
-        model=client_model,
-        prompt_tokens=usage.get("prompt_tokens", 0),
-        completion_tokens=usage.get("completion_tokens", 0),
-        total_tokens=usage.get("total_tokens", 0),
-    )
-
     return {
-        "id": result.get("id", f"chatcmpl-{secrets.token_hex(16)}"),
+        "id": f"chatcmpl-{secrets.token_hex(16)}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": client_model,
@@ -320,5 +234,4 @@ async def chat_completions(
             }
         ],
         "usage": usage,
-        "system_fingerprint": result.get("system_fingerprint"),
     }

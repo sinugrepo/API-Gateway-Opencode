@@ -15,17 +15,19 @@ from starlette.status import (
     HTTP_503_SERVICE_UNAVAILABLE,
     HTTP_504_GATEWAY_TIMEOUT,
 )
-from app.core.config import API_KEY, MODEL, OPENCODE_RESPONSES_URL, RATE_LIMIT_BACKOFF, STREAM_BYPASS_RELAY, USE_RELAY
+from app.core.config import API_KEY, MODEL, OPENCODE_RESPONSES_URL, STREAM_BYPASS_RELAY, USE_RELAY
 from app.core.logging_utils import _log
 from app.core.errors import UpstreamError
-from app.services.opencode import _resolve_opencode_headers, _stable_opencode_session
+from app.services.collect import collect_responses_object
+from app.services.opencode import (
+    _resolve_opencode_headers,
+    _stable_opencode_session,
+    ensure_responses_wire_fields,
+)
 from app.services.responses_bridge import (
     _extract_responses_usage,
-    _is_encrypted_content_rejection,
-    _strip_replayed_reasoning,
     responses_stream_generator,
 )
-from app.services.upstream import _retry_after_seconds, call_upstream
 from app.services.usage import _safe_record
 
 router = APIRouter()
@@ -63,6 +65,10 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
     stream_use_relay = use_relay_req if use_relay_req is not None else USE_RELAY
     if STREAM_BYPASS_RELAY:
         stream_use_relay = False
+    # Free-tier fingerprint gate (403 bila hilang, diverifikasi live
+    # 2026-09-18): kuartet tools + store=false + max_output_tokens.
+    # Berlaku untuk stream MAUPUN non-stream.
+    ensure_responses_wire_fields(body)
     stream = bool(body.get("stream", False))
     # Identitas CLI untuk free tier (dibagi ke semua upstream attempt).
     # Sesi dibuat STABIL per-percakapan (bukan acak per-request): konten
@@ -101,58 +107,22 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
             },
         )
 
-    response, _ = await call_upstream(
-        body,
-        stream=False,
-        use_relay=bool(stream_use_relay),
-        target_url=OPENCODE_RESPONSES_URL,
-        extra_headers=oc_headers,
+    # Non-stream via buffered stream: upstream free tier HANYA menerima
+    # stream:true (403 bila tidak). Generator pass-through dijalankan
+    # internal dengan wire stream:true (rotasi relay + auto-heal tetap
+    # jalan) lalu event response.completed di-buffer menjadi satu objek.
+    wire_body = dict(body)
+    wire_body["stream"] = True
+    result = await collect_responses_object(
+        lambda: responses_stream_generator(
+            wire_body,
+            client_model=client_model,
+            background_tasks=background_tasks,
+            use_relay=bool(stream_use_relay),
+            opencode_headers=oc_headers,
+        ),
+        client_model=client_model,
     )
-
-    # AUTO-HEAL (non-stream): penolakan replay encrypted_content tidak
-    # sembuh dengan rotasi target; buang reasoning replay lalu coba SEKALI.
-    if (
-        response.status_code == 400
-        and _is_encrypted_content_rejection(response.text[:500])
-    ):
-        healed_body, removed = _strip_replayed_reasoning(body)
-        if removed:
-            _log(
-                "RESP",
-                f"HEAL non-stream | encrypted_content ditolak -> buang "
-                f"{removed} item reasoning replay, retry 1x",
-            )
-            response, _ = await call_upstream(
-                healed_body,
-                stream=False,
-                use_relay=bool(stream_use_relay),
-                target_url=OPENCODE_RESPONSES_URL,
-                extra_headers=oc_headers,
-            )
-
-    if response.status_code != 200:
-        detail = response.text[:500]
-        if response.status_code == 429:
-            raise UpstreamError(
-                f"Upstream rate limited (429): {detail}",
-                status_code=HTTP_429_TOO_MANY_REQUESTS,
-                upstream_status=429,
-                retry_after=_retry_after_seconds(response, RATE_LIMIT_BACKOFF),
-            )
-        raise UpstreamError(
-            f"Upstream responded with {response.status_code}: {detail}",
-            status_code=HTTP_502_BAD_GATEWAY,
-            upstream_status=response.status_code,
-        )
-
-    try:
-        result = response.json()
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return Response(
-            content=response.content,
-            media_type="application/json",
-            status_code=200,
-        )
 
     if isinstance(result, dict):
         usage = _extract_responses_usage(result)
@@ -166,8 +136,7 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
                 total_tokens=usage.get("total_tokens", 0),
             )
         return JSONResponse(content=result, status_code=200)
-    return Response(
-        content=response.content,
-        media_type="application/json",
-        status_code=200,
+    raise UpstreamError(
+        "Invalid Responses object from upstream",
+        status_code=HTTP_502_BAD_GATEWAY,
     )

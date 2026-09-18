@@ -187,17 +187,23 @@ def _d1():
 
     captured = {}
 
-    async def fake_call_upstream(body, **kw):
-        captured["headers"] = kw.get("extra_headers")
-        resp = type("R", (), {"status_code": 200, "text": "{}", "content": b"{}",
-                              "json": lambda self: {"id": "x"}})()
-        return resp, "direct"
+    async def fake_collect(stream_factory, **kw):
+        # Drive factory nol-event agar generator asli tidak tersentuh, tapi
+        # tangkap headers yang di-wire ke generator (closure oc_headers).
+        gen = stream_factory()
+        frame = getattr(gen, "ag_frame", None) or getattr(gen, "gi_frame", None)
+        captured["headers"] = getattr(frame, "f_locals", {}).get("opencode_headers")
+        try:
+            await gen.aclose()
+        except (RuntimeError, AttributeError):
+            pass
+        return {"id": "x"}
 
-    orig_call = responses_api.call_upstream
+    orig_collect = responses_api.collect_responses_object
     orig_stable = oc.OPENCODE_SESSION_ID
     try:
         oc.OPENCODE_SESSION_ID = ""
-        responses_api.call_upstream = fake_call_upstream
+        responses_api.collect_responses_object = fake_collect
         req = type("Req", (), {"headers": _Hdrs({"content-type": "application/json"}),
                                "json": None})()
 
@@ -217,7 +223,7 @@ def _d1():
         import string as _st
         assert len(s) == 30 and all(c in _st.ascii_letters + _st.digits for c in s[4:]), s
     finally:
-        responses_api.call_upstream = orig_call
+        responses_api.collect_responses_object = orig_collect
         oc.OPENCODE_SESSION_ID = orig_stable
 
 

@@ -369,6 +369,14 @@ def build_responses_payload_from_chat(req: ChatCompletionRequest) -> Dict[str, A
         payload["tool_choice"] = responses_choice
     if req.reasoning_effort:
         payload["reasoning"] = {"effort": req.reasoning_effort}
+    # Free-tier fingerprint gate (403 bila hilang, diverifikasi live
+    # 2026-09-18): kuartet tools + store=false + max_output_tokens.
+    payload["store"] = False
+    try:
+        from app.services.opencode import ensure_responses_fingerprint_tools
+        ensure_responses_fingerprint_tools(payload)
+    except (ImportError, AttributeError, TypeError):
+        pass
     return payload
 
 
