@@ -126,6 +126,10 @@ async def stream_generator(
             # Jangan biarkan ValueError di sini membunuh stream; skip pencatatan.
             _log("USAGE", f"Skipping usage record with invalid values: {last_usage!r}")
             return
+        try:
+            duration_ms = int((time.time() - stream_start) * 1000)
+        except (TypeError, ValueError):
+            duration_ms = 0
         background_tasks.add_task(
             _safe_record,
             request_id=stream_id,
@@ -133,6 +137,7 @@ async def stream_generator(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            duration_ms=max(0, duration_ms),
         )
 
     def chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:

@@ -340,6 +340,35 @@ def ensure_responses_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any
     return payload
 
 
+SPARK_REASONING_EFFORT = "xhigh"
+
+
+def ensure_spark_reasoning_xhigh(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Paksa reasoning effort xhigh untuk model muse-spark (Responses-only).
+
+    Berlaku untuk SEMUA jalur (/v1/responses langsung maupun chat bridge):
+    nilai klien (low/medium/high/hilang) selalu di-override. Model lain
+    tidak disentuh.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    try:
+        from app.core.config import _is_responses_only_model
+        is_spark = _is_responses_only_model(str(payload.get("model") or ""))
+    except (ImportError, AttributeError, TypeError, ValueError):
+        is_spark = False
+    if not is_spark:
+        return payload
+    existing = payload.get("reasoning")
+    if isinstance(existing, dict):
+        existing = dict(existing)
+        existing["effort"] = SPARK_REASONING_EFFORT
+        payload["reasoning"] = existing
+    else:
+        payload["reasoning"] = {"effort": SPARK_REASONING_EFFORT}
+    return payload
+
+
 def ensure_responses_wire_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Normalisasi field Responses API ala CLI sebelum dikirim upstream.
 
@@ -347,6 +376,7 @@ def ensure_responses_wire_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
       max_output_tokens bila yang terakhir belum ada.
     - store=false (stateless; thinking tidak dipertahankan server).
     - Kuartet tools fingerprint disuntik.
+    - muse-spark: reasoning effort selalu xhigh (override klien).
     """
     if not isinstance(payload, dict):
         return payload
@@ -360,4 +390,5 @@ def ensure_responses_wire_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload.pop("max_completion_tokens", None)
     payload["store"] = False
     ensure_responses_fingerprint_tools(payload)
+    ensure_spark_reasoning_xhigh(payload)
     return payload

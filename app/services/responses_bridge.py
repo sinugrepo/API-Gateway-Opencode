@@ -357,6 +357,7 @@ def build_responses_payload_from_chat(req: ChatCompletionRequest) -> Dict[str, A
     - store:false + kuartet tools fingerprint + max_output_tokens WAJIB.
     - tool_choice:"auto" + prompt_cache_key stabil disintesis bila klien
       chat tidak mengirimnya (klien Responses seperti Kilo selalu kirim).
+    - muse-spark: reasoning effort SELALU xhigh (override klien).
     """
     messages = [message.to_upstream() for message in req.messages]
     if HERMES_COMPAT and req.tools:
@@ -392,8 +393,13 @@ def build_responses_payload_from_chat(req: ChatCompletionRequest) -> Dict[str, A
     payload["stream"] = True
     payload["store"] = False
     try:
-        from app.services.opencode import ensure_responses_fingerprint_tools
+        from app.services.opencode import (
+            ensure_responses_fingerprint_tools,
+            ensure_spark_reasoning_xhigh,
+        )
         ensure_responses_fingerprint_tools(payload)
+        # muse-spark: reasoning effort SELALU xhigh (override nilai klien).
+        ensure_spark_reasoning_xhigh(payload)
     except (ImportError, AttributeError, TypeError):
         pass
     # tool_choice default "auto" bila tools ada (samakan dengan klien
@@ -949,6 +955,10 @@ async def responses_stream_generator(
                 _log("RESP", f"FAIL {target_url} ({type(exc).__name__})")
                 if sent_first_byte:
                     if last_usage:
+                        try:
+                            _lost_duration = int((time.time() - stream_start) * 1000)
+                        except (TypeError, ValueError):
+                            _lost_duration = 0
                         background_tasks.add_task(
                             _safe_record,
                             request_id=str(response_id),
@@ -956,6 +966,7 @@ async def responses_stream_generator(
                             prompt_tokens=last_usage.get("prompt_tokens", 0),
                             completion_tokens=last_usage.get("completion_tokens", 0),
                             total_tokens=last_usage.get("total_tokens", 0),
+                            duration_ms=max(0, _lost_duration),
                         )
                     log_summary("lost")
                     try:
@@ -1002,6 +1013,10 @@ async def responses_stream_generator(
             return
 
         if last_usage:
+            try:
+                _done_duration = int((time.time() - stream_start) * 1000)
+            except (TypeError, ValueError):
+                _done_duration = 0
             background_tasks.add_task(
                 _safe_record,
                 request_id=str(response_id),
@@ -1009,6 +1024,7 @@ async def responses_stream_generator(
                 prompt_tokens=last_usage.get("prompt_tokens", 0),
                 completion_tokens=last_usage.get("completion_tokens", 0),
                 total_tokens=last_usage.get("total_tokens", 0),
+                duration_ms=max(0, _done_duration),
             )
         log_summary("done")
         yield "data: [DONE]\n\n"
@@ -1121,6 +1137,10 @@ async def responses_to_chat_stream_generator(
             total_tokens = int(last_usage.get("total_tokens", 0) or 0)
         except (TypeError, ValueError):
             return
+        try:
+            _bridge_duration = int((time.time() - stream_start) * 1000)
+        except (TypeError, ValueError):
+            _bridge_duration = 0
         background_tasks.add_task(
             _safe_record,
             request_id=stream_id,
@@ -1128,6 +1148,7 @@ async def responses_to_chat_stream_generator(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            duration_ms=max(0, _bridge_duration),
         )
 
     base_headers = _stream_request_headers(opencode_headers)

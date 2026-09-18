@@ -48,6 +48,20 @@ def _get_usage_db_unlocked() -> sqlite3.Connection:
             """
         )
         _usage_db.commit()
+    # Migrasi ringan untuk DB lama (dibuat sebelum kolom TPS ada):
+    # tambah duration_ms bila belum ada. Idempoten, murah (PRAGMA).
+    try:
+        cols = [r[1] for r in _usage_db.execute("PRAGMA table_info(token_usage)").fetchall()]
+        if "duration_ms" not in cols:
+            _usage_db.execute(
+                "ALTER TABLE token_usage ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0"
+            )
+            _usage_db.commit()
+    except Exception:
+        try:
+            _usage_db.rollback()
+        except Exception:
+            pass
     else:
         try:
             _usage_db.execute("SELECT 1")
@@ -64,6 +78,22 @@ def _get_usage_db() -> sqlite3.Connection:
         return _get_usage_db_unlocked()
 
 
+def _tps(completion_tokens: int, duration_ms: int) -> float:
+    """Hitung tokens-per-second (completion tok / detik wall-time).
+
+    0.0 bila durasi/completion tak valid — tidak pernah melempar.
+    Dibulatkan 1 desimal agar stabil di tabel monitoring.
+    """
+    try:
+        completion = int(completion_tokens or 0)
+        duration = int(duration_ms or 0)
+        if completion <= 0 or duration <= 0:
+            return 0.0
+        return round(completion / (duration / 1000.0), 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
 def _record_usage(
     *,
     request_id: str,
@@ -71,17 +101,25 @@ def _record_usage(
     prompt_tokens: int,
     completion_tokens: int,
     total_tokens: int,
+    duration_ms: int = 0,
 ) -> None:
     """Persist token usage from a successful chat completion response."""
     with _usage_db_lock:
         conn = _get_usage_db_unlocked()
         try:
+            try:
+                duration_value = int(duration_ms or 0)
+            except (TypeError, ValueError):
+                duration_value = 0
+            if duration_value < 0:
+                duration_value = 0
             conn.execute(
                 """
                 INSERT INTO token_usage
                     (timestamp, request_id, model,
-                     prompt_tokens, completion_tokens, total_tokens)
-                VALUES (?, ?, ?, ?, ?, ?)
+                      prompt_tokens, completion_tokens, total_tokens,
+                      duration_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     time.time(),
@@ -90,6 +128,7 @@ def _record_usage(
                     int(prompt_tokens or 0),
                     int(completion_tokens or 0),
                     int(total_tokens or 0),
+                    duration_value,
                 ),
             )
             conn.commit()
@@ -220,7 +259,9 @@ def _query_recent_requests(limit: int = 20) -> List[Dict[str, Any]]:
 
     Ringan: satu SELECT dengan ORDER BY timestamp DESC + LIMIT, tanpa
     agregasi. Dipakai dashboard agar operator melihat model + token
-    in/out + kapan (timestamp epoch untuk time-ago di frontend).
+    in/out + TPS + kapan (timestamp epoch untuk time-ago di frontend).
+    TPS = completion_tokens / detik wall-time (0.0 bila durasi tak ada,
+    mis. baris lama sebelum migrasi duration_ms).
     """
     try:
         n = int(limit)
@@ -231,27 +272,49 @@ def _query_recent_requests(limit: int = 20) -> List[Dict[str, Any]]:
         conn = _get_usage_db_unlocked()
         conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute(
-                """
-                SELECT request_id, model, prompt_tokens, completion_tokens,
-                       total_tokens, timestamp
-                FROM token_usage
-                ORDER BY timestamp DESC
-                LIMIT ?
-                """,
-                (n,),
-            ).fetchall()
-            return [
-                {
-                    "request_id": r["request_id"],
-                    "model": r["model"],
-                    "prompt_tokens": int(r["prompt_tokens"] or 0),
-                    "completion_tokens": int(r["completion_tokens"] or 0),
-                    "total_tokens": int(r["total_tokens"] or 0),
-                    "timestamp": float(r["timestamp"]),
-                }
-                for r in rows
-            ]
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT request_id, model, prompt_tokens, completion_tokens,
+                           total_tokens, timestamp, duration_ms
+                    FROM token_usage
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                    """,
+                    (n,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                # DB lama sebelum migrasi: fallback tanpa duration_ms.
+                rows = conn.execute(
+                    """
+                    SELECT request_id, model, prompt_tokens, completion_tokens,
+                           total_tokens, timestamp
+                    FROM token_usage
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                    """,
+                    (n,),
+                ).fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                try:
+                    duration_ms = int(r["duration_ms"] or 0)
+                except (KeyError, IndexError, TypeError, ValueError):
+                    duration_ms = 0
+                completion = int(r["completion_tokens"] or 0)
+                out.append(
+                    {
+                        "request_id": r["request_id"],
+                        "model": r["model"],
+                        "prompt_tokens": int(r["prompt_tokens"] or 0),
+                        "completion_tokens": completion,
+                        "total_tokens": int(r["total_tokens"] or 0),
+                        "timestamp": float(r["timestamp"]),
+                        "duration_ms": duration_ms,
+                        "tps": _tps(completion, duration_ms),
+                    }
+                )
+            return out
         finally:
             conn.row_factory = None
 
@@ -263,6 +326,7 @@ def _safe_record(
     prompt_tokens: int,
     completion_tokens: int,
     total_tokens: int,
+    duration_ms: int = 0,
 ) -> None:
     """Wrapper that logs recording failures without raising."""
     try:
@@ -272,6 +336,7 @@ def _safe_record(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            duration_ms=duration_ms,
         )
     except Exception as exc:  # noqa: BLE001 - never crash the request path
         _log("USAGE", f"Failed to record usage: {exc}")

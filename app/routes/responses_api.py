@@ -47,6 +47,7 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
     dengan model Responses-only. Di sini selalu responses_stream_generator
     (pass-through mentah, termasuk event reasoning apa adanya).
     """
+    route_start = time.time()
     try:
         body = await request.json()
     except (ValueError, TypeError, json.JSONDecodeError):
@@ -127,6 +128,10 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
     if isinstance(result, dict):
         usage = _extract_responses_usage(result)
         if usage:
+            try:
+                route_duration_ms = int((time.time() - route_start) * 1000)
+            except (TypeError, ValueError):
+                route_duration_ms = 0
             background_tasks.add_task(
                 _safe_record,
                 request_id=str(result.get("id", f"resp-{secrets.token_hex(8)}")),
@@ -134,6 +139,7 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
                 total_tokens=usage.get("total_tokens", 0),
+                duration_ms=max(0, route_duration_ms),
             )
         return JSONResponse(content=result, status_code=200)
     raise UpstreamError(
