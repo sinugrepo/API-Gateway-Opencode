@@ -346,7 +346,18 @@ def _chat_tool_choice_to_responses(
 
 
 def build_responses_payload_from_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
-    """Bangun body Responses API dari request chat (untuk model bridge)."""
+    """Bangun body Responses API dari request chat (untuk model bridge).
+
+    Diselaraskan dengan wire /v1/responses yang terbukti lolos free-tier
+    (log 2026-09-18 14:00:45: keys input/max_output_tokens/model/
+    prompt_cache_key/store/stream/tool_choice/tools -> 200 OK 18s):
+
+    - stream:true WAJIB (gate 403; jalur bridge-streaming lama tidak
+      mengirimnya sehingga Hermes/Kilo via /chat selalu 403 relay+direct).
+    - store:false + kuartet tools fingerprint + max_output_tokens WAJIB.
+    - tool_choice:"auto" + prompt_cache_key stabil disintesis bila klien
+      chat tidak mengirimnya (klien Responses seperti Kilo selalu kirim).
+    """
     messages = [message.to_upstream() for message in req.messages]
     if HERMES_COMPAT and req.tools:
         messages = [
@@ -363,6 +374,10 @@ def build_responses_payload_from_chat(req: ChatCompletionRequest) -> Dict[str, A
         payload["top_p"] = req.top_p
     if req.max_tokens is not None:
         payload["max_output_tokens"] = req.max_tokens
+    else:
+        # Klien chat boleh mengirim max_tokens:null; upstream 403 bila
+        # max_output_tokens hilang (bagian dari fingerprint gate).
+        payload["max_output_tokens"] = 65536
     responses_tools = _chat_tools_to_responses_tools(req.tools)
     if responses_tools is not None:
         payload["tools"] = responses_tools
@@ -372,13 +387,29 @@ def build_responses_payload_from_chat(req: ChatCompletionRequest) -> Dict[str, A
     if req.reasoning_effort:
         payload["reasoning"] = {"effort": req.reasoning_effort}
     # Free-tier fingerprint gate (403 bila hilang, diverifikasi live
-    # 2026-09-18): kuartet tools + store=false + max_output_tokens.
+    # 2026-09-18): stream:true + kuartet tools + store=false +
+    # max_output_tokens + tool_choice + prompt_cache_key.
+    payload["stream"] = True
     payload["store"] = False
     try:
         from app.services.opencode import ensure_responses_fingerprint_tools
         ensure_responses_fingerprint_tools(payload)
     except (ImportError, AttributeError, TypeError):
         pass
+    # tool_choice default "auto" bila tools ada (samakan dengan klien
+    # Responses yang selalu mengirimnya; tanpanya upstream 403).
+    if payload.get("tool_choice") is None and payload.get("tools"):
+        payload["tool_choice"] = "auto"
+    # prompt_cache_key stabil per-percakapan (samakan dengan sukses direct).
+    # Dipetakan dari fingerprint percakapan agar stabil antar-turn/restart.
+    if not payload.get("prompt_cache_key"):
+        try:
+            from app.services.opencode import _conversation_fingerprint
+            fingerprint = _conversation_fingerprint({"messages": messages})
+            if fingerprint:
+                payload["prompt_cache_key"] = fingerprint[:32]
+        except (ImportError, AttributeError, TypeError, ValueError):
+            pass
     return payload
 
 
