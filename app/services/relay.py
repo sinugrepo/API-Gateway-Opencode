@@ -51,6 +51,17 @@ def _mark_relay_rate_limited(url: str, until: float) -> None:
         _relay_penalty[url] = until
 
 
+def _mark_relay_forbidden(url: str, until: float) -> None:
+    """Tandai relay kena 403 FreeTierError; disusulkan ke akhir rotasi.
+
+    403 upstream lewat relay berarti egress IP relay itu sedang di-flag
+    (bukan salah fingerprint — request identik lewat relay lain lolos).
+    Memakai penalti yang sama dengan 429: relay tetap jadi cadangan bila
+    semua yang sehat gagal, tapi request berikutnya mulai dari yang sehat.
+    """
+    _mark_relay_rate_limited(url, until)
+
+
 def _is_relay_penalized(url: str) -> bool:
     with _relay_penalty_lock:
         return time.time() < _relay_penalty.get(url, 0.0)

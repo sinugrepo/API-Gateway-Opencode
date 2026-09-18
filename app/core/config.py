@@ -260,6 +260,14 @@ LIVE_LOG_MAXLEN = int(os.getenv("LIVE_LOG_MAXLEN", "500"))
 MODELS_CACHE_TTL_SECONDS = int(os.getenv("MODELS_CACHE_TTL_SECONDS", "300"))
 
 
+# Berapa lama relay yang kena 403 FreeTierError di-skip dari rotasi.
+# Berbeda dari 429 (kuota per-IP yang pulih cepat), 403 menandakan egress IP
+# relay sedang di-flag upstream — flag semacam ini jarang pulih dalam
+# hitungan detik. Relay yang "terlarang" disusulkan ke akhir urutan (tetap
+# jadi cadangan), sehingga request berikutnya langsung memakai relay sehat.
+RELAY_403_COOLDOWN = float(os.getenv("RELAY_403_COOLDOWN", "300"))
+
+
 # Berapa lama relay yang timeout di-skip untuk request streaming.
 # Default 30 menit: timeout platform Vercel bukan kondisi transien (limit
 # eksekusi ~25 dtk tidak pulih sendiri), jadi menandai ulang tiap 5 menit

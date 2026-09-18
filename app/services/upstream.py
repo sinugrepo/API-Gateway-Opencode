@@ -28,7 +28,7 @@ from app.core.config import (
 )
 from app.core.errors import TimeoutError_, UpstreamError
 from app.core.logging_utils import _log
-from app.services.opencode import _oc_session_tag
+from app.services.opencode import _fresh_request_headers, _oc_session_tag
 from app.services.relay import (
     _is_giant_payload,
     _is_relay_timeout,
@@ -283,7 +283,8 @@ async def call_upstream(
 
     async def direct_request() -> Tuple[httpx.Response, str]:
         client = _get_http()
-        r = await client.post(upstream_url, headers=headers, json=payload)
+        # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
+        r = await client.post(upstream_url, headers=_fresh_request_headers(headers), json=payload)
         await r.aread()
         return r, upstream_url
 
@@ -296,7 +297,7 @@ async def call_upstream(
         relay_headers = {
             "x-relay-target": base,
             "x-relay-path": path,
-            **headers,
+            **_fresh_request_headers(headers),
         }
         client = _get_http()
         r = await client.post(url, headers=relay_headers, json=payload)

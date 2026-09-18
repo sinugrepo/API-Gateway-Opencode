@@ -20,6 +20,7 @@ from app.core.config import (
     RATE_LIMIT_BACKOFF,
     RATE_LIMIT_COOLDOWN,
     REASONING_FORWARD,
+    RELAY_403_COOLDOWN,
     RELAY_FALLBACK,
     RELAY_STREAM_BROKEN_COOLDOWN,
     SSE_KEEPALIVE_INTERVAL,
@@ -28,10 +29,11 @@ from app.core.config import (
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
 from app.core.http_client import _get_http
 from app.core.logging_utils import _log
-from app.services.opencode import _oc_session_tag
+from app.services.opencode import _fresh_request_headers, _oc_session_tag
 from app.services.relay import (
     _is_relay_timeout,
     _limit_stream_targets,
+    _mark_relay_forbidden,
     _mark_relay_rate_limited,
     _mark_relay_stream_broken,
     _payload_has_media,
@@ -629,6 +631,8 @@ async def responses_stream_generator(
                 # Relay vision hanya untuk 429 direct; kegagalan lain
                 # selesai di direct (last_error sudah terisi).
                 break
+            # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
+            headers = _fresh_request_headers(headers)
             _log(
                 "RESP",
                 f"ATTEMPT {target_index + 1}/{len(targets)} "
@@ -722,6 +726,17 @@ async def responses_stream_generator(
                             f"Upstream responded with {response.status_code}: {detail}"
                         )
                         last_rate_limited = response.status_code == 429
+                        if response.status_code == 403 and is_relay and not sent_first_byte:
+                            _mark_relay_forbidden(
+                                target_url,
+                                time.time() + RELAY_403_COOLDOWN,
+                            )
+                            _log(
+                                "RESP",
+                                f"FORBIDDEN {target_url} | upstream 403 "
+                                f"(IP relay di-flag, bukan salah fingerprint) "
+                                f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s",
+                            )
                         target_index += 1
                         _log(
                             "RESP",
@@ -803,6 +818,12 @@ async def responses_stream_generator(
                                         _mark_relay_rate_limited(
                                             target_url,
                                             time.time() + RATE_LIMIT_COOLDOWN,
+                                        )
+                                    elif _relay_status == 403:
+                                        last_rate_limited = False
+                                        _mark_relay_forbidden(
+                                            target_url,
+                                            time.time() + RELAY_403_COOLDOWN,
                                         )
                                     else:
                                         last_rate_limited = _relay_status == 429
@@ -1117,6 +1138,8 @@ async def responses_to_chat_stream_generator(
                 # Relay vision hanya untuk 429 direct; kegagalan lain
                 # selesai di direct (last_error sudah terisi).
                 break
+            # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
+            headers = _fresh_request_headers(headers)
             _log(
                 "RESP",
                 f"ATTEMPT {target_index + 1}/{len(targets)} "
@@ -1198,6 +1221,17 @@ async def responses_to_chat_stream_generator(
                             f"Upstream responded with {response.status_code}: {detail}"
                         )
                         last_rate_limited = response.status_code == 429
+                        if response.status_code == 403 and is_relay and not sent_payload:
+                            _mark_relay_forbidden(
+                                target_url,
+                                time.time() + RELAY_403_COOLDOWN,
+                            )
+                            _log(
+                                "RESP",
+                                f"FORBIDDEN {target_url} | upstream 403 "
+                                f"(IP relay di-flag, bukan salah fingerprint) "
+                                f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s",
+                            )
                         target_index += 1
                         _log(
                             "RESP",
@@ -1361,6 +1395,12 @@ async def responses_to_chat_stream_generator(
                                     _mark_relay_rate_limited(
                                         target_url,
                                         time.time() + RATE_LIMIT_COOLDOWN,
+                                    )
+                                elif _relay_status == 403:
+                                    last_rate_limited = False
+                                    _mark_relay_forbidden(
+                                        target_url,
+                                        time.time() + RELAY_403_COOLDOWN,
                                     )
                                 else:
                                     last_rate_limited = _relay_status == 429

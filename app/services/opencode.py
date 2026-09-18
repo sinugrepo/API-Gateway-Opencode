@@ -249,6 +249,20 @@ def _oc_session_tag(headers: Optional[Dict[str, str]]) -> str:
     return f"ses={session[:14]}" if session else "ses=-"
 
 
+def _fresh_request_headers(base: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Salinan headers dengan `x-opencode-request` baru yang unik.
+
+    Dipakai per upstream attempt (tiap rotasi relay + fallback direct):
+    CLI asli mengirim `msg_...` unik per POST, dan memakai ulang satu
+    request ID di semua attempt terlihat seperti replay di sisi upstream.
+    Sesi (`x-opencode-session`) sengaja TIDAK diubah agar affinity cache
+    + issuance encrypted_content tetap stabil dalam satu request klien.
+    """
+    headers = dict(base or {})
+    headers["x-opencode-request"] = _new_opencode_request_id()
+    return headers
+
+
 # ── Free-tier client fingerprint gates ( diverifikasi live 2026-09-18 ) ──
 # Upstream Zen menolak request free-tier dengan 403 FreeTierError bila salah
 # satu gate tidak terpenuhi (lihat `fix opencode.ts`):
