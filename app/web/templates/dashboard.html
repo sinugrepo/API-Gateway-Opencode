@@ -111,7 +111,20 @@ table.mini tr:last-child td{border-bottom:none}
 .toast{background:var(--panel-2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;max-width:320px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
 .toast.err{border-color:var(--red);color:var(--red)}
 .toast.ok{border-color:var(--green)}
-@media(max-width:1000px){.ops,.ops-wide,.models-panel,.side-note,.recent-panel,.logs-panel{grid-column:span 12}.kpi{grid-template-columns:repeat(2,1fr)}}
+.modeltest-panel{grid-column:span 12}
+.mt-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px}
+.mt-field{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)}
+.mt-field select,.mt-field input,.mt-field textarea{background:var(--panel-2);border:1px solid var(--border);color:var(--text);font-size:12px;font-family:inherit;border-radius:6px;padding:6px 8px;outline:none}
+.mt-field select{max-width:280px}
+.mt-field textarea{min-width:220px;min-height:34px;resize:vertical}
+.mt-result{background:#0d0e11;border:1px solid var(--border-soft);border-radius:6px;padding:10px 12px;font-size:12px;margin-bottom:10px;white-space:pre-wrap;word-break:break-word}
+.mt-result .mono{font-size:11px}
+.mt-out{color:#f0f1f2;margin-top:6px}
+.mt-meta{color:var(--muted);font-size:11px;margin-top:6px}
+.mt-test-btn{background:none;border:1px solid var(--border);color:var(--accent);font-size:11px;border-radius:4px;padding:2px 8px;cursor:pointer;font-family:inherit;font-weight:650}
+.mt-test-btn:hover{border-color:var(--accent)}
+.mt-test-btn:disabled{opacity:.55;cursor:wait}
+@media(max-width:1000px){.ops,.ops-wide,.models-panel,.side-note,.recent-panel,.logs-panel,.modeltest-panel{grid-column:span 12}.kpi{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:560px){.kpi{grid-template-columns:1fr}.brand .sub{display:none}.content{padding:12px 12px 24px}.chart-wrap{height:220px}}
 @media(prefers-reduced-motion:reduce){.spinner{animation:none}}
 </style>
@@ -202,6 +215,19 @@ table.mini tr:last-child td{border-bottom:none}
 <div class="panel-head"><h3>ScanGuard</h3><span class="badge" id="secBadge">–</span></div>
 <div class="panel-body" id="secBody"><div class="loading"><span class="spinner"></span>Memuat security…</div></div>
 </section>
+<section class="panel modeltest-panel" aria-label="Model test">
+<div class="panel-head"><h3>Model test</h3><span style="display:flex;gap:6px;align-items:center"><button class="btn" id="mtRefreshBtn">Models</button><button class="btn primary" id="mtTestAllBtn">Test All</button><span class="badge" id="mtBadge">–</span></span></div>
+<div class="panel-body">
+<div class="mt-controls">
+<label class="mt-field">Model<select id="mtModel" aria-label="Model"></select></label>
+<label class="mt-field">Prompt<textarea id="mtPrompt" rows="2">jawab tepat satu kata: pong</textarea></label>
+<label class="mt-field">Max tokens<input id="mtMax" type="number" value="128" min="1" max="512" style="width:90px"></label>
+<button class="btn primary" id="mtTestBtn">Test</button>
+</div>
+<div class="mt-result" id="mtResult">Pilih model lalu tekan Test. Naikkan max tokens bila output kosong (reasoning memakan token).</div>
+<div style="overflow-x:auto"><table class="mini"><thead><tr><th>Model</th><th style="text-align:right">Context</th><th style="text-align:right">Status</th><th style="text-align:right">Latency</th><th>Output</th><th style="text-align:right">Aksi</th></tr></thead><tbody id="mtBody"><tr><td colspan="6" class="loading"><span class="spinner"></span>Memuat model…</td></tr></tbody></table></div>
+</div>
+</section>
 <div class="footer"><a href="/health">/health</a><a href="/v1/props">/v1/props</a><a href="/v1/usage?period=today">/v1/usage</a><a href="/relay/status">/relay/status</a><span id="ver">Sinug Gateway Monitor</span></div>
 </main>
 <div id="toast" aria-live="polite"></div>
@@ -265,8 +291,22 @@ async function logCatchupKeep(keep){var lvl=$('logLevel').value;var d=await fetc
 $('logPauseBtn').addEventListener('click',function(){logPaused=!logPaused;this.textContent=logPaused?'Resume':'Pause';this.classList.toggle('on',logPaused);if(logPaused){closeLogs();setLogStatus('paused','paused');}else{connectLogs();}});
 $('logScrollBtn').addEventListener('click',function(){logAutoScroll=!logAutoScroll;this.textContent=logAutoScroll?'Auto-scroll ON':'Auto-scroll OFF';this.classList.toggle('on',logAutoScroll);});
 $('logClearBtn').addEventListener('click',async function(){try{var r=await fetch('/monitor/api/logs/clear',{method:'POST',credentials:'same-origin'});if(r.status===401){toLogin();return;}var d=r.ok?await r.json():null;if(d&&d.latest_id!=null)logLatestId=d.latest_id;}catch(e){}$('logBox').innerHTML='';logShown=0;$('logCount').textContent='0';});
+/* ---- model test: uji tiap model satu-per-satu dari web ---- */
+var mtModels=[],mtTesting=false,mtStopReq=false,mtResults={};
+function mtCtx(m){var v=m.context_length||m.context_window||m.max_input_tokens||0;return v;}
+function mtFmtCtx(v){if(!v)return'–';if(v>=1048576)return(Math.round(v/1048576*100)/100)+'M';if(v>=1000)return(Math.round(v/1000*10)/10)+'K';return String(v);}
+function mtRenderTable(){var tb=$('mtBody');if(!mtModels.length){tb.innerHTML='<tr><td colspan="6" class="loading">Belum ada model — tekan Models</td></tr>';return;}var html='';mtModels.forEach(function(m){var r=mtResults[m.id];var st=r?(r.ok?'<span class="tag ok">OK '+r.status+'</span>':'<span class="tag fail">'+esc(r.status)+' '+(r.status===429?'LIMIT':'FAIL')+'</span>'):'<span class="badge">–</span>';var lat=r?FMT.format(r.latency_ms)+' ms':'–';var out=r?(r.ok?esc(String(r.output||'').slice(0,120)):esc(String(r.error||'').slice(0,120))):'<span style="color:var(--muted)">belum dites</span>';var dis=mtTesting?' disabled':'';html+='<tr><td class="mono" title="'+esc(m.id)+'">'+esc(m.id)+'</td><td style="text-align:right" class="mono" title="'+FMT.format(mtCtx(m))+' tokens">'+esc(mtFmtCtx(mtCtx(m)))+'</td><td style="text-align:right">'+st+'</td><td style="text-align:right" class="mono">'+lat+'</td><td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(r?esc(String(r.ok?(r.output||''):(r.error||''))):'')+'">'+out+'</td><td style="text-align:right"><button class="mt-test-btn" data-model="'+esc(m.id)+'"'+dis+'>Test</button></td></tr>';});tb.innerHTML=html;tb.querySelectorAll('.mt-test-btn').forEach(function(b){b.addEventListener('click',function(){if(b.disabled)return;mtTestOne(b.dataset.model,b);});});}
+async function refreshMtModels(){var d=await fetchJSON('/monitor/api/models');if(!d||!d.models){$('mtBody').innerHTML='<tr><td colspan="6" class="loading">Gagal memuat model (upstream/network) — tekan Models untuk coba lagi</td></tr>';$('mtBadge').textContent='ERR';return;}mtModels=d.models.slice().sort(function(a,b){return String(a.id).localeCompare(String(b.id));});var sel=$('mtModel');var keep=sel.value;sel.innerHTML=mtModels.map(function(m){return '<option value="'+esc(m.id)+'">'+esc(m.id)+' ('+esc(mtFmtCtx(mtCtx(m)))+')</option>';}).join('');if(keep)sel.value=keep;$('mtBadge').textContent=mtModels.length+' model';mtRenderTable();}
+async function mtPostTest(model,prompt,maxTokens){var r=await fetch('/monitor/api/models/test',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:model,prompt:prompt,max_tokens:maxTokens})});if(r.status===401){toLogin();return null;}try{return await r.json();}catch(e){return {model:model,ok:false,status:502,latency_ms:0,output:'',usage:null,error:'Invalid JSON response'};}}
+function mtShowSingle(r){var box=$('mtResult');if(!r){box.textContent='Test gagal (network).';return;}if(r.ok){var u=r.usage||{};box.innerHTML='<span class="tag ok">OK '+esc(r.status)+'</span> <span class="mono">'+esc(r.model)+'</span><div class="mt-out">'+esc(r.output||'(kosong — naikkan max tokens)')+'</div><div class="mt-meta">latency '+FMT.format(r.latency_ms)+' ms • in '+(u.prompt_tokens!=null?FMT.format(u.prompt_tokens):'–')+' / out '+(u.completion_tokens!=null?FMT.format(u.completion_tokens):'–')+' / total '+(u.total_tokens!=null?FMT.format(u.total_tokens):'–')+'</div>';}else{box.innerHTML='<span class="tag fail">'+esc(r.status)+' FAIL</span> <span class="mono">'+esc(r.model)+'</span><div class="mt-out">'+esc(r.error||'unknown error')+'</div><div class="mt-meta">latency '+FMT.format(r.latency_ms)+' ms'+(r.status===429?' • rate-limited, tunggu lalu ulangi':'')+'</div>';}}
+function mtReadInputs(){return {prompt:$('mtPrompt').value||'jawab tepat satu kata: pong',maxT:Math.max(1,Math.min(512,parseInt($('mtMax').value||'128',10)||128))};}
+async function mtTestOne(model,btn){if(mtTesting){toast('Test All sedang berjalan — hentikan dulu','err');return;}var inp=mtReadInputs();var singleBtn=$('mtTestBtn');if(!btn){singleBtn.disabled=true;singleBtn.textContent='…';}else{btn.disabled=true;btn.textContent='…';}$('mtResult').innerHTML='<span class="spinner"></span>Menguji <span class="mono">'+esc(model)+'</span>…';try{var r=await mtPostTest(model,inp.prompt,inp.maxT);if(!r)return;mtResults[model]=r;if(!btn||$('mtModel').value===model)mtShowSingle(r);mtRenderTable();}finally{if(!btn){singleBtn.disabled=false;singleBtn.textContent='Test';}else{var fresh=document.querySelector('.mt-test-btn[data-model="'+model.replace(/"/g,'')+'"]');if(fresh){fresh.disabled=false;fresh.textContent='Test';}}}}
+async function mtTestAll(){if(mtTesting){mtStopReq=true;return;}if(!mtModels.length)await refreshMtModels();if(!mtModels.length){toast('Tidak ada model','err');return;}mtTesting=true;mtStopReq=false;var b=$('mtTestAllBtn');b.disabled=false;b.textContent='Stop';$('mtTestBtn').disabled=true;mtRenderTable();var okN=0,stopped=false;for(var i=0;i<mtModels.length;i++){if(mtStopReq){stopped=true;break;}var m=mtModels[i];b.textContent='Stop '+(i+1)+'/'+mtModels.length;$('mtResult').innerHTML='<span class="spinner"></span>Menguji <span class="mono">'+esc(m.id)+'</span> ('+(i+1)+'/'+mtModels.length+')…';try{var inp=mtReadInputs();var r=await mtPostTest(m.id,inp.prompt,inp.maxT);if(!r){stopped=true;break;}mtResults[m.id]=r;if(r.ok)okN++;mtShowSingle(r);mtRenderTable();}catch(e){mtResults[m.id]={model:m.id,ok:false,status:502,latency_ms:0,output:'',usage:null,error:'Network error'};mtRenderTable();}await new Promise(function(res){setTimeout(res,400);});}b.textContent='Test All';mtTesting=false;mtStopReq=false;$('mtTestBtn').disabled=false;mtRenderTable();toast(stopped?'Dihentikan: '+okN+'/'+mtModels.length+' OK':'Test All selesai: '+okN+'/'+mtModels.length+' OK',okN===mtModels.length?'ok':'');refreshRecent();refreshUsage();}
+$('mtRefreshBtn').addEventListener('click',refreshMtModels);
+$('mtTestBtn').addEventListener('click',function(){var m=$('mtModel').value;if(!m){toast('Pilih model dulu','err');return;}mtTestOne(m,null);});
+$('mtTestAllBtn').addEventListener('click',mtTestAll);
 /* ---- boot: decoupled agar usage cepat, relay tidak memblokir ---- */
-refreshUsage();refreshRecent();refreshMeta();refreshInfra();refreshSession();connectLogs();
+refreshUsage();refreshRecent();refreshMeta();refreshInfra();refreshSession();connectLogs();refreshMtModels();
 setInterval(refreshMeta,300000);setInterval(refreshSession,60000);
 </script>
 </body>

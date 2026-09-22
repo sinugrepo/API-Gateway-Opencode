@@ -102,6 +102,10 @@ Monitor (cookie `monitor_token`, 24 jam):
   `POST /monitor/api/security/unban`, `/monitor/api/logs`,
   `POST /monitor/api/logs/clear`, `POST /monitor/api/relays/reset`,
   `/monitor/api/logs/stream` (SSE)
+- Model Test (panel dashboard): `GET /monitor/api/models` (daftar free +
+  context window), `POST /monitor/api/models/test`
+  (`{model, prompt, max_tokens}` → `{ok, status, latency_ms, output, usage, error}`;
+  selalu 200 agar Test-All tidak berhenti di 429 pertama)
 
 Dashboard memisahkan jalur cepat (usage/history) dari jalur lambat
 (relay probe ~8 dtk) agar ganti period tidak memblokir.

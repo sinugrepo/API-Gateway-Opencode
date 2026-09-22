@@ -16,6 +16,7 @@ from starlette.status import (
     HTTP_504_GATEWAY_TIMEOUT,
 )
 from app.core.config import LIVE_LOG_MAXLEN, MAX_RELAY_STREAM_ATTEMPTS, MODELS_CACHE_TTL_SECONDS, MONITOR_COOKIE_NAME, MONITOR_PASSWORD, MONITOR_TOKEN_TTL, RELAY_STREAM_BROKEN_COOLDOWN, SCAN_GUARD_BAN_SECONDS, SCAN_GUARD_ENABLED, SCAN_GUARD_THRESHOLD, SCAN_GUARD_TRUST_PROXY, SCAN_GUARD_WINDOW
+from app.core.errors import UpstreamEmptyResponse, UpstreamError
 from app.core.logging_utils import _get_live_logs, _live_log_lock, _live_logs, _log
 from app.core import logging_utils as _logging_utils
 from app.security.monitor_auth import _check_monitor, _make_monitor_token
@@ -140,9 +141,11 @@ async def monitor_api_recent_requests(request: Request, limit: int = 20):
 
     Dipakai panel Recent Requests di dashboard. Tidak ada filter period —
     selalu N terakhir agar operator melihat aktivitas terkini.
+    `limit` dijepit 1..100 agar satu request tak bisa menarik seluruh tabel.
     """
     if not _check_monitor(request):
         raise HTTPException(status_code=401)
+    limit = max(1, min(limit, 100))
     rows = await asyncio.to_thread(_query_recent_requests, limit)
     return {"requests": rows, "count": len(rows)}
 
@@ -316,3 +319,145 @@ async def monitor_api_logs_stream(request: Request, since: int = 0, level: str =
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ==================== MODEL TEST (dashboard) ====================
+# Uji tiap model satu-per-satu dari web tanpa curl: kirim prompt mungil
+# via pipeline chat yang sama (bridge otomatis untuk Responses-only),
+# non-stream, lalu kembalikan output + latency + usage.
+# Dijalankan sekuensial dari UI (Test All loop satu-per-satu) agar tidak
+# membombardir upstream dan memicu 429 massal.
+
+_MODEL_TEST_DEFAULT_PROMPT = "jawab tepat satu kata: pong"
+_MODEL_TEST_MAX_PROMPT_CHARS = 2000
+_MODEL_TEST_MAX_TOKENS_LIMIT = 512
+_MODEL_TEST_TIMEOUT_SECONDS = 180.0
+
+
+@router.get("/monitor/api/models")
+async def monitor_api_models(request: Request):
+    """Daftar model free + context window untuk dropdown/tabel Model Test."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        from app.services.models_cache import _fetch_opencode_free_models
+        models = await _fetch_opencode_free_models()
+        data = [m.model_dump() for m in models]
+    except UpstreamError as exc:
+        raise HTTPException(exc.status_code, str(exc.message))
+    return {"models": data, "count": len(data)}
+
+
+@router.post("/monitor/api/models/test")
+async def monitor_api_model_test(request: Request):
+    """Uji satu model dengan prompt mungil (non-stream).
+
+    Body: {"model": "...", "prompt": "...", "max_tokens": 128}.
+    Return: {model, ok, status, latency_ms, output, usage, error}.
+    Selalu 200 di sisi monitor (ok=false bila upstream gagal) agar UI
+    Test-All tidak berhenti di model pertama yang 429.
+    """
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    model = str(body.get("model") or "").strip()
+    prompt = body.get("prompt", _MODEL_TEST_DEFAULT_PROMPT)
+    prompt = prompt if isinstance(prompt, str) else str(prompt)
+    try:
+        max_tokens = int(body.get("max_tokens", 128))
+    except (TypeError, ValueError):
+        max_tokens = 128
+    if not model:
+        return {"model": "", "ok": False, "status": 400,
+                "latency_ms": 0, "output": "", "usage": None,
+                "error": "Field 'model' is required"}
+    prompt = prompt.strip()[:_MODEL_TEST_MAX_PROMPT_CHARS] or _MODEL_TEST_DEFAULT_PROMPT
+    max_tokens = max(1, min(max_tokens, _MODEL_TEST_MAX_TOKENS_LIMIT))
+
+    from types import SimpleNamespace
+    from fastapi import BackgroundTasks as _BT
+    from app.core.schemas import ChatCompletionRequest, ChatMessage
+    from app.routes.chat import chat_completions
+
+    req = ChatCompletionRequest(
+        model=model,
+        messages=[ChatMessage(role="user", content=prompt)],
+        max_tokens=max_tokens,
+        stream=False,
+    )
+    fake_request = SimpleNamespace(headers={})
+    background = _BT()
+    started = time.time()
+    try:
+        result = await asyncio.wait_for(
+            chat_completions(req, background, fake_request),
+            timeout=_MODEL_TEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {"model": model, "ok": False, "status": 504,
+                "latency_ms": int((time.time() - started) * 1000),
+                "output": "", "usage": None,
+                "error": f"Timeout after {int(_MODEL_TEST_TIMEOUT_SECONDS)}s"}
+    except UpstreamEmptyResponse:
+        # Upstream hidup tapi nol konten (mis. max_tokens habis untuk
+        # reasoning): model OK, output kosong — samakan kontrak bridge
+        # non-stream chat (200 + content "").
+        try:
+            await background()
+        except Exception:
+            pass
+        return {"model": model, "ok": True, "status": 200,
+                "latency_ms": int((time.time() - started) * 1000),
+                "output": "", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "error": None}
+    except UpstreamError as exc:
+        return {"model": model, "ok": False,
+                "status": exc.upstream_status or exc.status_code,
+                "latency_ms": int((time.time() - started) * 1000),
+                "output": "", "usage": None, "error": exc.message[:500]}
+    except HTTPException as exc:
+        return {"model": model, "ok": False, "status": exc.status_code,
+                "latency_ms": int((time.time() - started) * 1000),
+                "output": "", "usage": None,
+                "error": str(exc.detail)[:500]}
+    except Exception as exc:  # noqa: BLE001 — tampilkan ke UI, jangan 500
+        return {"model": model, "ok": False, "status": 502,
+                "latency_ms": int((time.time() - started) * 1000),
+                "output": "", "usage": None, "error": f"{type(exc).__name__}: {exc}"[:500]}
+
+    latency_ms = int((time.time() - started) * 1000)
+    # StreamingResponse tak diharapkan (req.stream=False), tangani defensif.
+    if not isinstance(result, dict):
+        return {"model": model, "ok": False, "status": 502,
+                "latency_ms": latency_ms, "output": "", "usage": None,
+                "error": f"Unexpected result type {type(result).__name__}"}
+    # Jalankan background tasks pipeline (pencatatan usage SQLite) yang
+    # normalnya dieksekusi FastAPI setelah respons — bila dilewati, traffic
+    # uji tak tercatat di statistik. Kegagalan catat tak boleh merusak hasil.
+    try:
+        await background()
+    except Exception:
+        pass
+    try:
+        choice = (result.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        output = message.get("content")
+        if isinstance(output, list):  # parts -> gabung teks
+            texts = []
+            for part in output:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+                elif isinstance(part, str):
+                    texts.append(part)
+            output = "".join(texts)
+        output = output if isinstance(output, str) else json.dumps(output or "", ensure_ascii=False)
+    except (AttributeError, TypeError, ValueError):
+        output = ""
+    return {"model": model, "ok": True, "status": 200,
+            "latency_ms": latency_ms, "output": output[:2000],
+            "usage": result.get("usage"), "error": None}
