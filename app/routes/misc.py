@@ -22,6 +22,29 @@ from app.core.schemas import HealthResponse, ModelList, PropsCapability, PropsDe
 
 router = APIRouter()
 
+# Favicon SG (sama dengan <link rel="icon"> inline di template): disajikan
+# via /favicon.ico agar request otomatis browser tidak 404 dan tidak
+# mengotori log. SVG modern didukung semua browser terkini sebagai favicon.
+_FAVICON_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+    "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
+    "<stop offset='0' stop-color='#5794f2'/>"
+    "<stop offset='1' stop-color='#3d71d9'/>"
+    "</linearGradient></defs>"
+    "<rect width='64' height='64' rx='14' fill='url(#g)'/>"
+    "<text x='32' y='43' font-family='system-ui,sans-serif' font-size='26' "
+    "font-weight='700' fill='white' text-anchor='middle'>SG</text></svg>"
+)
+
+
+@router.get("/favicon.ico")
+async def favicon():
+    return Response(
+        content=_FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
 @router.get("/health", response_model=HealthResponse)
 async def health():
     return HealthResponse(

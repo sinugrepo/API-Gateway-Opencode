@@ -2,6 +2,7 @@
 import asyncio
 import json
 import secrets
+import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -333,6 +334,18 @@ _MODEL_TEST_MAX_PROMPT_CHARS = 2000
 _MODEL_TEST_MAX_TOKENS_LIMIT = 512
 _MODEL_TEST_TIMEOUT_SECONDS = 180.0
 
+# Rate-limit khusus endpoint uji manual: Test All (9 model) yang diklik
+# dua kali dalam 5 menit = 18 hit. Batas 30 hit / 300 dtk meloloskan
+# pemakaian wajar tapi menghentikan loop tak disengaja / script nyasar
+# yang menembak endpoint ini berkala (kasus: batch uji misterius tiap
+# ~15 menit di Recent Requests). Jendela geser in-memory per-proses.
+_MODEL_TEST_RATE_LIMIT = 30
+_MODEL_TEST_RATE_WINDOW_SECONDS = 300.0
+_model_test_hits: List[float] = []
+_model_test_hits_lock = threading.Lock()
+# NOTE: batas per-proses; untuk deploy workers>1 tiap worker punya
+# jendela sendiri — dokumentasikan, bukan bug untuk deploy default.
+
 
 @router.get("/monitor/api/models")
 async def monitor_api_models(request: Request):
@@ -379,6 +392,31 @@ async def monitor_api_model_test(request: Request):
     prompt = prompt.strip()[:_MODEL_TEST_MAX_PROMPT_CHARS] or _MODEL_TEST_DEFAULT_PROMPT
     max_tokens = max(1, min(max_tokens, _MODEL_TEST_MAX_TOKENS_LIMIT))
 
+    # Rate-limit manual-test: tolak loop tak disengaja sebelum menyentuh
+    # upstream. Selalu 200 + ok=false agar Test-All UI menandai LIMIT
+    # per-baris, bukan crash.
+    now = time.time()
+    with _model_test_hits_lock:
+        _model_test_hits[:] = [
+            t for t in _model_test_hits
+            if now - t < _MODEL_TEST_RATE_WINDOW_SECONDS
+        ]
+        if len(_model_test_hits) >= _MODEL_TEST_RATE_LIMIT:
+            oldest = min(_model_test_hits)
+            retry_after = max(1, int(_MODEL_TEST_RATE_WINDOW_SECONDS - (now - oldest)))
+        else:
+            retry_after = 0
+            _model_test_hits.append(now)
+    if retry_after:
+        try:
+            client_ip = request.client.host if request.client else "?"
+        except Exception:
+            client_ip = "?"
+        _log("MODELS", f"model-test RATE-LIMITED model={model} ip={client_ip} retry_after={retry_after}s")
+        return {"model": model, "ok": False, "status": 429,
+                "latency_ms": 0, "output": "", "usage": None,
+                "error": f"Too many manual tests, retry after {retry_after}s"}
+
     from types import SimpleNamespace
     from fastapi import BackgroundTasks as _BT
     from app.core.schemas import ChatCompletionRequest, ChatMessage
@@ -392,6 +430,10 @@ async def monitor_api_model_test(request: Request):
     )
     fake_request = SimpleNamespace(headers={})
     background = _BT()
+    try:
+        client_ip = request.client.host if request.client else "?"
+    except Exception:
+        client_ip = "?"
     started = time.time()
     try:
         result = await asyncio.wait_for(
@@ -399,6 +441,7 @@ async def monitor_api_model_test(request: Request):
             timeout=_MODEL_TEST_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
+        _log("MODELS", f"model-test TIMEOUT model={model} ip={client_ip}")
         return {"model": model, "ok": False, "status": 504,
                 "latency_ms": int((time.time() - started) * 1000),
                 "output": "", "usage": None,
@@ -416,6 +459,7 @@ async def monitor_api_model_test(request: Request):
                 "output": "", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 "error": None}
     except UpstreamError as exc:
+        _log("MODELS", f"model-test FAIL model={model} ip={client_ip} status={exc.upstream_status or exc.status_code} err={exc.message[:120]}")
         return {"model": model, "ok": False,
                 "status": exc.upstream_status or exc.status_code,
                 "latency_ms": int((time.time() - started) * 1000),
@@ -458,6 +502,7 @@ async def monitor_api_model_test(request: Request):
         output = output if isinstance(output, str) else json.dumps(output or "", ensure_ascii=False)
     except (AttributeError, TypeError, ValueError):
         output = ""
+    _log("MODELS", f"model-test OK model={model} ip={client_ip} latency={latency_ms}ms")
     return {"model": model, "ok": True, "status": 200,
             "latency_ms": latency_ms, "output": output[:2000],
             "usage": result.get("usage"), "error": None}

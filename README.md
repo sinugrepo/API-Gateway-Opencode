@@ -102,10 +102,15 @@ Monitor (cookie `monitor_token`, 24 jam):
   `POST /monitor/api/security/unban`, `/monitor/api/logs`,
   `POST /monitor/api/logs/clear`, `POST /monitor/api/relays/reset`,
   `/monitor/api/logs/stream` (SSE)
-- Model Test (panel dashboard): `GET /monitor/api/models` (daftar free +
-  context window), `POST /monitor/api/models/test`
+- Model Test (panel dashboard, manual saja — tidak ada auto-test):
+  `GET /monitor/api/models` (daftar free + context window),
+  `POST /monitor/api/models/test`
   (`{model, prompt, max_tokens}` → `{ok, status, latency_ms, output, usage, error}`;
-  selalu 200 agar Test-All tidak berhenti di 429 pertama)
+  selalu 200 agar Test-All tidak berhenti di 429 pertama).
+  Test All meminta konfirmasi browser dulu; endpoint dibatasi 30 hit / 5 mnt
+  (429 + `retry_after` bila lewat) dan setiap uji dicatat di live-log
+  (`model-test OK/FAIL/RATE-LIMITED` + IP pemanggil) agar batch misterius
+  bisa ditelusuri. Tidak ada timer/refresh yang memicu inferensi.
 
 Dashboard memisahkan jalur cepat (usage/history) dari jalur lambat
 (relay probe ~8 dtk) agar ganti period tidak memblokir.
