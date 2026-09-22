@@ -10,6 +10,29 @@ from app.core.http_client import _get_http
 from app.core.config import MODELS_CACHE_TTL_SECONDS, OPENCODE_MODELS_URL
 from app.core.errors import UpstreamError
 from app.core.schemas import ModelInfo
+from app.services.model_context import get_model_context_window
+from starlette.status import (
+    HTTP_502_BAD_GATEWAY,
+    HTTP_503_SERVICE_UNAVAILABLE,
+    HTTP_504_GATEWAY_TIMEOUT,
+)
+
+
+def _enrich_model(model_id: str, **fields) -> ModelInfo:
+    """Build ModelInfo with canonical context window aliases.
+
+    All four aliases (context_length / context_window / max_input_tokens /
+    max_context_length) carry the same value so OpenRouter-style,
+    LiteLLM-style, and generic OpenAI clients all read the right number.
+    """
+    ctx = get_model_context_window(model_id)
+    return ModelInfo(
+        context_length=ctx,
+        context_window=ctx,
+        max_input_tokens=ctx,
+        max_context_length=ctx,
+        **fields,
+    )
 
 
 _models_cache: Optional[Tuple[float, List[ModelInfo]]] = None
@@ -90,7 +113,8 @@ async def _fetch_opencode_free_models() -> List[ModelInfo]:
         except (TypeError, ValueError):
             created = int(time.time())
         free_models.append(
-            ModelInfo(
+            _enrich_model(
+                model_id,
                 id=model_id,
                 object=item.get("object", "model"),
                 created=created,

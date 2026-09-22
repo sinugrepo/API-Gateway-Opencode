@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>Hermes Gateway — Monitor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%235794f2'/%3E%3Cstop offset='1' stop-color='%233d71d9'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Ctext x='32' y='43' font-family='system-ui,sans-serif' font-size='26' font-weight='700' fill='white' text-anchor='middle'%3ESG%3C/text%3E%3C/svg%3E">
+<title>Sinug Gateway — Monitor</title>
 <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
 :root{--bg:#111217;--panel:#1b1c21;--panel-2:#212226;--border:#2c2d33;--border-soft:#28292f;--text:#d8d9da;--muted:#9a9ca3;--accent:#5794f2;--accent-hover:#4a85e0;--accent-bg:rgba(87,148,242,.15);--green:#7dce9a;--yellow:#f8d16c;--red:#f2495c;--purple:#c38dd4;--cyan:#7ad7f0;--font:system-ui,-apple-system,'Segoe UI',Inter,Roboto,sans-serif;--mono:ui-monospace,'JetBrains Mono',Consolas,monospace}
@@ -117,7 +118,7 @@ table.mini tr:last-child td{border-bottom:none}
 </head>
 <body>
 <header class="topbar">
-<div class="brand"><div class="logo">HG</div><h1>Hermes Gateway</h1><span class="sub" id="subtitle">Memuat…</span></div>
+<div class="brand"><div class="logo">SG</div><h1>Sinug Gateway</h1><span class="sub" id="subtitle">Memuat…</span></div>
 <div class="top-right">
 <span class="pill bad" id="healthPill"><span class="dot"></span><span id="healthText">Menghubungkan…</span></span>
 <span class="pill info" id="relayPill"><span class="dot"></span><span id="relayText">Relay: …</span></span>
@@ -201,7 +202,7 @@ table.mini tr:last-child td{border-bottom:none}
 <div class="panel-head"><h3>ScanGuard</h3><span class="badge" id="secBadge">–</span></div>
 <div class="panel-body" id="secBody"><div class="loading"><span class="spinner"></span>Memuat security…</div></div>
 </section>
-<div class="footer"><a href="/health">/health</a><a href="/v1/props">/v1/props</a><a href="/v1/usage?period=today">/v1/usage</a><a href="/relay/status">/relay/status</a><span id="ver">Hermes Gateway Monitor</span></div>
+<div class="footer"><a href="/health">/health</a><a href="/v1/props">/v1/props</a><a href="/v1/usage?period=today">/v1/usage</a><a href="/relay/status">/relay/status</a><span id="ver">Sinug Gateway Monitor</span></div>
 </main>
 <div id="toast" aria-live="polite"></div>
 <script>

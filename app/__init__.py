@@ -1,4 +1,4 @@
-"""OpenAI-compatible Hermes backend (modular package).
+"""OpenAI-compatible Sinug Gateway backend (modular package).
 
 Original monolith `main.py` (dulunya `backend_api.py`, 6045 lines) split into:
 - `app/config.py`, `app/logging_utils.py`, `app/monitor_auth.py`, ...
@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     application = FastAPI(
-        title="OpenAI-compatible Hermes Backend",
+        title="OpenAI-compatible Sinug Gateway Backend",
         version=APP_VERSION,
         lifespan=lifespan,
     )

@@ -1,4 +1,4 @@
-# Hermes Gateway — OpenAI-Compatible API Gateway
+# Sinug Gateway — OpenAI-Compatible API Gateway
 
 Proxy FastAPI yang kompatibel OpenAI untuk upstream `opencode.ai/zen/v1`, dengan
 relay round-robin Vercel (masking IP), bridge Chat → Responses untuk model
@@ -72,6 +72,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `SCAN_GUARD_*` | `true/8/120/3600/false` | `TRUST_PROXY=true` wajib bila di belakang proxy |
 | `MAX_REQUEST_BYTES` | `8388608` | 413 cepat sebelum buffer OOM |
 | `LIVE_LOG_MAXLEN` | `500` | Ring buffer live-log |
+| `MODEL_CONTEXT_OVERRIDES_JSON` | `` (kosong) | Override window konteks, cth. `'{"my-model": 500000, "qwen*": 1000000}'` (exact + `prefix*`, case-insensitive) |
 | `PORT` / `RELOAD` | `8000` / `false` | Server |
 
 ## Endpoint
@@ -81,7 +82,11 @@ Inferensi:
 - `POST /v1/chat/completions` — OpenAI chat (bridge otomatis bila Responses-only)
 - `POST /v1/responses`, `POST /responses` — Responses pass-through
 - `GET /v1/models`, `GET /models`, `GET /v1/models/{id}`, `GET /api/tags`,
-  `GET /api/v1/models`, `POST /api/show` — discovery (Ollama-compatible stub)
+  `GET /api/v1/models`, `POST /api/show` — discovery (Ollama-compatible stub).
+  Setiap entri OpenAI diperkaya `context_length` / `context_window` /
+  `max_input_tokens` / `max_context_length` dari tabel kanonis
+  (`app/services/model_context.py`; muse-spark = 1.048.576 terverifikasi
+  https://dev.meta.ai/docs/models).
 - `GET /health`, `GET /version`, `GET /v1/props`, `GET /relay/status`
 - `GET /v1/usage?period=today|3h|6h|1d|7d|30d` atau `?start=YYYY-MM-DD&end=YYYY-MM-DD`,
   `GET /v1/usage/periods`

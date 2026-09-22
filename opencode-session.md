@@ -148,6 +148,9 @@ Hasil test: `200 OK` tapi `content:""` — router memotong reasoning internal.
 
 ### 5.2 Zen Responses API (pembanding, berhasil)
 
+> Payload minimal lama (`input` + `max_output_tokens` saja) sekarang **403
+> FreeTierError**. Lihat §8: upstream mewajibkan fingerprint penuh.
+
 ```bash
 curl -i https://opencode.ai/zen/v1/responses \
   -H "Content-Type: application/json" \
@@ -157,7 +160,7 @@ curl -i https://opencode.ai/zen/v1/responses \
   -H "x-opencode-project: global" \
   -H "x-opencode-client: cli" \
   -H "User-Agent: opencode/1.18.31" \
-  -d '{"model":"muse-spark-1.3-contributor-free","input":"tes 1 2 3, balas dengan OK saja","max_output_tokens":500}'
+  -d '{"model":"muse-spark-1.3-contributor-free","input":"tes 1 2 3, balas dengan OK saja","max_output_tokens":500,"stream":true,"store":false,"tool_choice":"auto","prompt_cache_key":"tes-1-2-3","reasoning":{"effort":"xhigh"},"tools":[{"type":"function","name":"bash","description":"OpenCode built-in bash tool","parameters":{"type":"object","properties":{}}},{"type":"function","name":"glob","description":"OpenCode built-in glob tool","parameters":{"type":"object","properties":{}}},{"type":"function","name":"grep","description":"OpenCode built-in grep tool","parameters":{"type":"object","properties":{}}},{"type":"function","name":"read","description":"OpenCode built-in read tool","parameters":{"type":"object","properties":{}}}]}'
 ```
 
 Hasil test:
@@ -195,11 +198,13 @@ headers={
  "x-opencode-client":"cli",
  "User-Agent":"opencode/1.18.31",
 }
+# URL gateway (proxy menyuntik fingerprint §8 otomatis → payload minimal OK).
+# URL direct ke opencode.ai WAJIB payload penuh §5.2 (minimal → 403).
 for url, payload in [
  ("http://43.156.122.11:8000/v1/chat/completions",
   {"model":"muse-spark-1.3-contributor-free","messages":[{"role":"user","content":"tes 1 2 3"}],"max_tokens":200}),
  ("https://opencode.ai/zen/v1/responses",
-  {"model":"muse-spark-1.3-contributor-free","input":"tes 1 2 3","max_output_tokens":500}),
+  {"model":"muse-spark-1.3-contributor-free","input":"tes 1 2 3","max_output_tokens":500,"stream":True,"store":False,"tool_choice":"auto","prompt_cache_key":"tes-1-2-3","reasoning":{"effort":"xhigh"},"tools":[{"type":"function","name":n,"description":"OpenCode built-in "+n+" tool","parameters":{"type":"object","properties":{}}} for n in ("bash","glob","grep","read")]}),
 ]:
     req=urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=90) as r:
@@ -222,3 +227,44 @@ curl localhost:4096/session
 * `x-opencode-request` harus **unik per message** (`msg_...` baru tiap POST).
 * `x-opencode-project` = `global` jika di luar git, atau hash root commit + cache di `.git/opencode` jika di dalam repo.
 * Sejak pengumuman 3 Sep 2026, request tanpa `x-opencode-session` bisa ditolak / kehilangan optimasi cache.
+* `prompt_cache_key` (body Responses) harus **stabil per conversation** sama
+  seperti session: proxy memetakannya dari fingerprint percakapan
+  (`prompt_cache_key` eksplisit klien diutamakan, lalu system/first-user
+  message). Tanpa ini upstream 403 walau header benar.
+* `muse-spark-*`: `reasoning.effort` **selalu `xhigh`** di proxy
+  (`ensure_spark_reasoning_xhigh`) — nilai klien (`low`/`medium`/hilang)
+  di-override di SEMUA jalur. Model non-spark tidak disentuh.
+
+## 8. Free-tier fingerprint gate (403) — diverifikasi live 2026-09-18
+
+Upstream Zen menolak request free-tier dengan `403 FreeTierError`
+("free tier can only be used in OpenCode") bila SATU saja unsur
+fingerprint hilang. Berlaku untuk `/chat/completions` MAUPUN `/responses`:
+
+| Unsur | Bentuk chat | Bentuk Responses | Keterangan |
+|---|---|---|---|
+| `stream:true` | `{"stream": true}` | `{"stream": true}` | **Wajib SELALU**, stream maupun non-stream. `false`/hilang → 403. |
+| Kuartet tools | `{"type":"function","function":{"name":...}}` | `{"type":"function","name":...}` | `bash, glob, grep, read` + deskripsi `OpenCode built-in ...`. |
+| `store:false` | — | `{"store": false}` | Stateless; thinking tidak dipertahankan server. |
+| `max_output_tokens` | `max_tokens` klien | `{"max_output_tokens": N}` | Default proxy `65536` bila klien kirim `null`/hilang. |
+| `tool_choice` | apa adanya | `"auto"` bila tools ada | Disintesis bila klien chat tidak mengirim. |
+| `prompt_cache_key` | — | string stabil/conversation | Disintesis dari fingerprint bila klien tidak mengirim. |
+| `reasoning.effort` | `reasoning_effort` klien | `{"effort":"xhigh"}` untuk spark | Spark selalu `xhigh` (override). |
+
+Bukti log: wire sukses `14:00:45` berkunci
+`input/max_output_tokens/model/prompt_cache_key/store/stream/tool_choice/tools`
+→ `200 OK`; wire bridge lama tanpa `stream/prompt_cache_key/tool_choice`
+→ `403` di relay DAN direct (bukan salah IP relay).
+
+Konsekuensi implementasi di proxy:
+
+* SEMUA request upstream dikirim dengan wire `stream:true`, termasuk untuk
+  klien non-stream: generator streaming dijalankan internal lalu hasilnya
+  di-buffer (`collect_chat_completion` / `collect_responses_object`).
+  Tidak ada lagi POST `stream:false` ke upstream.
+* Chat ke model Responses-only (`muse-spark`, lihat `RESPONSES_ONLY_MODELS`)
+  dijembatani otomatis `chat → Responses → chat`
+  (`build_responses_payload_from_chat` menyuntik seluruh fingerprint di atas,
+  bukan meneruskan body klien mentah).
+* `User-Agent` disamakan CLI asli (`opencode/1.18.31 ...`); `python-httpx`
+  bawaan menandai request BUKAN CLI (rawan 403).

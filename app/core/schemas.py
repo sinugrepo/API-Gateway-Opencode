@@ -61,10 +61,25 @@ class ChatCompletionRequest(BaseModel):
 
 
 class ModelInfo(BaseModel):
+    """OpenAI-compatible model entry enriched with context window.
+
+    Upstream only sends id/object/created/owned_by. The proxy adds
+    ``context_length`` (+ ``context_window`` / ``max_input_tokens`` /
+    ``max_context_length`` aliases) from the canonical table in
+    ``app.services.model_context`` so clients can size prompts correctly.
+    All aliases always carry the same value.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
     id: str
     object: str = "model"
     created: int
     owned_by: str = "opencode"
+    context_length: Optional[int] = None
+    context_window: Optional[int] = None
+    max_input_tokens: Optional[int] = None
+    max_context_length: Optional[int] = None
 
 
 class ModelList(BaseModel):

@@ -16,9 +16,9 @@ from starlette.status import (
     HTTP_504_GATEWAY_TIMEOUT,
 )
 from app.core.config import HERMES_COMPAT, MODEL, RELAY_FALLBACK, RELAY_URLS, REQUEST_TIMEOUT, USE_RELAY
-from app.services.models_cache import _fetch_opencode_free_models
+from app.services.models_cache import _enrich_model, _fetch_opencode_free_models
 from app.services.relay import test_relay_connection
-from app.core.schemas import HealthResponse, ModelInfo, ModelList, PropsCapability, PropsDefaults, PropsEndpoint, PropsInfo, PropsRelay, RelayStatus
+from app.core.schemas import HealthResponse, ModelList, PropsCapability, PropsDefaults, PropsEndpoint, PropsInfo, PropsRelay, RelayStatus
 
 router = APIRouter()
 
@@ -49,7 +49,8 @@ async def list_models_alias():
 async def get_model(model_id: str):
     # OpenAI-compatible model lookup. Echo the requested id back so clients
     # can probe arbitrary model names without inventing a default model.
-    return ModelInfo(id=model_id, created=int(time.time()))
+    # Enriched with the canonical context window (same aliases as list).
+    return _enrich_model(model_id, id=model_id, created=int(time.time()))
 
 
 # Small Ollama-compatible discovery endpoints. They are harmless for Hermes
@@ -59,7 +60,14 @@ async def ollama_tags():
     free_models = await _fetch_opencode_free_models()
     return {
         "models": [
-            {"name": m.id, "modified_at": None, "size": 0}
+            {
+                "name": m.id,
+                "model": m.id,
+                "modified_at": None,
+                "size": 0,
+                "context_length": m.context_length,
+                "num_ctx": m.context_length,
+            }
             for m in free_models
         ]
     }
