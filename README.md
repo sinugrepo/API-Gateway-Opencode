@@ -73,6 +73,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `MAX_REQUEST_BYTES` | `8388608` | 413 cepat sebelum buffer OOM |
 | `LIVE_LOG_MAXLEN` | `500` | Ring buffer live-log |
 | `MODEL_CONTEXT_OVERRIDES_JSON` | `` (kosong) | Override window konteks, cth. `'{"my-model": 500000, "qwen*": 1000000}'` (exact + `prefix*`, case-insensitive) |
+| `MODEL_ENDPOINT_OVERRIDES_JSON` | `` (kosong) | Override kategori endpoint native (`chat`/`responses`/`messages`), cth. `'{"my-model": "responses"}'` (exact + `prefix*`) |
+| `RESPONSES_REVERSE_BRIDGE` | `true` | `false` = model non-Responses via `/v1/responses` ditolak 400 bersih (tanpa bridge balik) |
 | `PORT` / `RELOAD` | `8000` / `false` | Server |
 
 ## Endpoint
@@ -80,7 +82,11 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 Inferensi:
 
 - `POST /v1/chat/completions` — OpenAI chat (bridge otomatis bila Responses-only)
-- `POST /v1/responses`, `POST /responses` — Responses pass-through
+- `POST /v1/responses`, `POST /responses` — Responses pass-through untuk
+  model Responses-native (muse-spark/gpt/grok); model chat/messages-native
+  (mimo/deepseek/glm/kimi/minimax/claude/qwen/...) otomatis dijembatani
+  balik lewat pipeline chat (reverse bridge) — SEMUA model jalan di KEDUA
+  endpoint. Kategori native per model di `app/services/model_endpoints.py`.
 - `GET /v1/models`, `GET /models`, `GET /v1/models/{id}`, `GET /api/tags`,
   `GET /api/v1/models`, `POST /api/show` — discovery (Ollama-compatible stub).
   Setiap entri OpenAI diperkaya `context_length` / `context_window` /
@@ -124,7 +130,9 @@ app/core/                # config, schemas, errors, sse, http_client,
                          # logging_utils, error_handlers
 app/security/            # body_limit, scan_guard, monitor_auth
 app/services/            # relay, upstream, streaming, responses_bridge,
-                         # opencode, models_cache, tools_dsml, usage
+                         # chat_bridge (reverse bridge), opencode,
+                         # models_cache, model_context, model_endpoints,
+                         # tools_dsml, usage
 app/routes/              # chat, responses_api, misc, usage_routes, monitor
 app/web/templates/       # login.html, dashboard.html (vanilla, tanpa build)
 test/                    # test_long_stream_fixes.py, test_live_requests.py
@@ -137,6 +145,7 @@ usage.db*                # runtime SQLite, di-gitignore
 ```bash
 python -m compileall -q app main.py test
 python test/test_long_stream_fixes.py   # offline, 34 case, harus ALL PASSED
+python test/test_reverse_bridge.py      # offline, 15 case (routing endpoint + reverse bridge)
 python test/test_live_requests.py       # live: ASGI in-process → relay Vercel
                                         # + opencode.ai; kontrak 200 / 429-bersih /
                                         # EMPTY_RESPONSE; butuh internet

@@ -15,9 +15,16 @@ from starlette.status import (
     HTTP_503_SERVICE_UNAVAILABLE,
     HTTP_504_GATEWAY_TIMEOUT,
 )
-from app.core.config import API_KEY, MODEL, OPENCODE_RESPONSES_URL, STREAM_BYPASS_RELAY, USE_RELAY
+from app.core.config import API_KEY, MODEL, OPENCODE_RESPONSES_URL, RESPONSES_REVERSE_BRIDGE, STREAM_BYPASS_RELAY, USE_RELAY
 from app.core.logging_utils import _log
-from app.core.errors import UpstreamError
+from app.core.errors import UpstreamEmptyResponse, UpstreamError
+from app.services.chat_bridge import (
+    build_chat_request_from_responses,
+    chat_completion_to_responses,
+    chat_stream_to_responses_stream,
+    empty_responses_object,
+)
+from app.services.model_endpoints import is_responses_native
 from app.services.collect import collect_responses_object
 from app.services.opencode import (
     _resolve_opencode_headers,
@@ -31,6 +38,73 @@ from app.services.responses_bridge import (
 from app.services.usage import _safe_record
 
 router = APIRouter()
+
+async def create_response_via_chat(
+    body: Dict[str, Any],
+    client_model: str,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    stream: bool,
+):
+    """Layani request Responses untuk model yang native-nya BUKAN Responses.
+
+    Model chat/messages-native (mimo, deepseek, glm, kimi, minimax, claude,
+    qwen, ...) dijawab 500 oleh upstream bila dipaksa lewat Responses API
+    (terbukti live). Fungsi ini menerjemahkan body ke request chat lalu
+    memakai pipeline chat yang SAMA (rotasi relay, fingerprint, usage) dan
+    membentuk hasilnya kembali menjadi objek/SSE Responses — dinamis per
+    kategori endpoint, tanpa daftar pengecualian di route.
+    """
+    from app.routes.chat import chat_completions
+
+    _log(
+        "RESP",
+        f"REVERSE-BRIDGE model={client_model} stream={stream} "
+        f"-> chat pipeline (native endpoint bukan Responses)",
+    )
+    use_relay_req = body.pop("use_relay", None)
+    chat_req = build_chat_request_from_responses(body, client_model)
+    chat_req.stream = stream
+    if use_relay_req is not None:
+        chat_req.use_relay = bool(use_relay_req)
+    if stream:
+        if not API_KEY:
+            raise UpstreamError(
+                "OPENCODE_API_KEY is not configured",
+                status_code=HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        chat_resp = await chat_completions(chat_req, background_tasks, request)
+        if not isinstance(chat_resp, StreamingResponse):
+            # Defensif: seharusnya selalu StreamingResponse bila stream=True.
+            return JSONResponse(
+                content=chat_completion_to_responses(chat_resp, client_model)
+                if isinstance(chat_resp, dict)
+                else empty_responses_object(client_model),
+                status_code=200,
+            )
+        return StreamingResponse(
+            chat_stream_to_responses_stream(
+                chat_resp.body_iterator, client_model=client_model,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    try:
+        result = await chat_completions(chat_req, background_tasks, request)
+    except UpstreamEmptyResponse:
+        # Samakan kontrak bridge non-stream: upstream kosong tetap 200
+        # dengan output kosong (bukan 502) agar klien bisa retry sendiri.
+        return JSONResponse(content=empty_responses_object(client_model), status_code=200)
+    if not isinstance(result, dict):
+        return JSONResponse(content=empty_responses_object(client_model), status_code=200)
+    # Usage sudah dicatat pipeline chat via background_tasks — jangan catat
+    # ganda di sini.
+    return JSONResponse(content=chat_completion_to_responses(result, client_model), status_code=200)
+
 
 @router.post("/v1/responses")
 @router.post("/responses")
@@ -60,6 +134,24 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(
             HTTP_400_BAD_REQUEST,
             "The model field is required; choose one from GET /v1/models",
+        )
+
+    # Routing dinamis per kategori endpoint native (model_endpoints):
+    # model yang native-nya BUKAN Responses (chat/messages) TIDAK diteruskan
+    # mentah ke OPENCODE_RESPONSES_URL (upstream menjawab 500) melainkan
+    # dijembatani balik lewat pipeline chat.
+    if not is_responses_native(client_model):
+        if not RESPONSES_REVERSE_BRIDGE:
+            raise HTTPException(
+                HTTP_400_BAD_REQUEST,
+                f"Model '{client_model}' is served via /v1/chat/completions, "
+                f"not /v1/responses",
+            )
+        # Identitas CLI + sesi stabil diurus pipeline chat sendiri
+        # (chat_completions me-resolve dari request + messages hasil konversi).
+        return await create_response_via_chat(
+            body, client_model, background_tasks, request,
+            bool(body.get("stream", False)),
         )
 
     use_relay_req = body.pop("use_relay", None)

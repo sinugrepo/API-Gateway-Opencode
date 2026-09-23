@@ -11,6 +11,7 @@ from app.core.config import MODELS_CACHE_TTL_SECONDS, OPENCODE_MODELS_URL
 from app.core.errors import UpstreamError
 from app.core.schemas import ModelInfo
 from app.services.model_context import get_model_context_window
+from app.services.model_endpoints import get_model_endpoint
 from starlette.status import (
     HTTP_502_BAD_GATEWAY,
     HTTP_503_SERVICE_UNAVAILABLE,
@@ -26,11 +27,13 @@ def _enrich_model(model_id: str, **fields) -> ModelInfo:
     LiteLLM-style, and generic OpenAI clients all read the right number.
     """
     ctx = get_model_context_window(model_id)
+    endpoint = fields.pop("endpoint", None) or get_model_endpoint(model_id)
     return ModelInfo(
         context_length=ctx,
         context_window=ctx,
         max_input_tokens=ctx,
         max_context_length=ctx,
+        endpoint=endpoint,
         **fields,
     )
 

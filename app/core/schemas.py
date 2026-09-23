@@ -80,6 +80,10 @@ class ModelInfo(BaseModel):
     context_window: Optional[int] = None
     max_input_tokens: Optional[int] = None
     max_context_length: Optional[int] = None
+    # Native upstream endpoint category: "chat" | "responses" | "messages"
+    # (app.services.model_endpoints). Tells clients which proxy protocol
+    # serves the model natively; the proxy reverse-bridges the rest.
+    endpoint: Optional[str] = None
 
 
 class ModelList(BaseModel):

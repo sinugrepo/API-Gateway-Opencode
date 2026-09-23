@@ -184,8 +184,10 @@ def _load_env_overrides() -> Dict[str, int]:
 def get_model_context_window(model_id: Optional[str]) -> int:
     """Return canonical context window (tokens) for any model id.
 
-    Resolution order: env exact override -> exact table -> env prefix*
-    override -> prefix table (longest match) -> default.
+    Resolution order: env exact override -> env prefix* override ->
+    exact table -> prefix table (longest match) -> default.
+    Env wins over built-ins so operators can correct any entry without
+    code changes.
     """
     name = (model_id or "").strip().lower()
     if not name:
@@ -193,8 +195,6 @@ def get_model_context_window(model_id: Optional[str]) -> int:
     env = _load_env_overrides()
     if name in env:
         return env[name]
-    if name in MODEL_CONTEXT_WINDOWS:
-        return MODEL_CONTEXT_WINDOWS[name]
     # env prefix wildcards: "qwen*" etc.
     best_env: Optional[int] = None
     best_env_len = -1
@@ -206,6 +206,8 @@ def get_model_context_window(model_id: Optional[str]) -> int:
                 best_env_len = len(prefix)
     if best_env is not None:
         return best_env
+    if name in MODEL_CONTEXT_WINDOWS:
+        return MODEL_CONTEXT_WINDOWS[name]
     best: Optional[int] = None
     best_len = -1
     for prefix, tokens in PREFIX_CONTEXT_WINDOWS.items():

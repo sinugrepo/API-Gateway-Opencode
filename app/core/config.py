@@ -298,6 +298,17 @@ BRIDGE_REQUEST_TIMEOUT = float(os.getenv("BRIDGE_REQUEST_TIMEOUT", "300"))
 RELAY_STATUS_TIMEOUT = float(os.getenv("RELAY_STATUS_TIMEOUT", "8"))
 
 
+# Reverse bridge /v1/responses -> chat pipeline untuk model yang native-nya
+# BUKAN Responses API (mimo/deepseek/glm/kimi/minimax/claude/qwen/...).
+# Upstream menjawab 500 bila model chat/messages dipaksa lewat Responses
+# (terbukti live: mimo-v2.6-flash-free 500 di relay DAN direct). Bila True
+# (default), request semacam itu diterjemahkan ke chat upstream lalu
+# hasilnya dibentuk kembali menjadi objek/SSE Responses — SEMUA model jalan
+# di KEDUA endpoint proxy tanpa klien tahu topologi upstream. Bila False,
+# model non-Responses ditolak 400 yang bersih dengan arahan endpoint benar.
+RESPONSES_REVERSE_BRIDGE = os.getenv("RESPONSES_REVERSE_BRIDGE", "true").lower() == "true"
+
+
 # Bot massal rutin memindai path seperti /.env, /.aws/credentials,
 # /terraform.tfstate*, /config.json.bak, dsb. (lihat access log 404 beruntun
 # dari satu IP). Semua itu 404 dan tidak membocorkan apa pun, tapi berisik
