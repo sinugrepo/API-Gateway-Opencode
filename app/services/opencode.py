@@ -263,6 +263,24 @@ def _fresh_request_headers(base: Optional[Dict[str, str]]) -> Dict[str, str]:
     return headers
 
 
+def _fresh_identity_headers(base: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Salinan headers dengan session DAN request ID yang sepenuhnya baru.
+
+    HANYA untuk upaya terakhir fresh-session (semua target 403 termasuk
+    direct): bila identitas lama yang di-flag upstream, identitas baru
+    memberi peluang lolos. Format tetap valid ala CLI
+    (`ses_`/`msg_` + 12 hex + 14 base62); header lain (client, project,
+    User-Agent) dipertahankan agar fingerprint caller tetap konsisten.
+    JANGAN dipakai untuk retry biasa — sesi stabil per-percakapan adalah
+    syarat cache affinity + issuance encrypted_content (lihat
+    `_stable_opencode_session`).
+    """
+    headers = dict(base or {})
+    headers["x-opencode-session"] = _new_opencode_session_id()
+    headers["x-opencode-request"] = _new_opencode_request_id()
+    return headers
+
+
 # ── Free-tier client fingerprint gates ( diverifikasi live 2026-09-18 ) ──
 # Upstream Zen menolak request free-tier dengan 403 FreeTierError bila salah
 # satu gate tidak terpenuhi (lihat `fix opencode.ts`):

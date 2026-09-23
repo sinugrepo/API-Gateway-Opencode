@@ -21,6 +21,11 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
   (>32 KB / >100 item tidak menandai relay rusak), `MAX_RELAY_STREAM_ATTEMPTS=2`.
 - Rate-limit: retry + backoff, hormati `Retry-After` upstream; 429 bersih +
   header `Retry-After` ke klien. Penanganan khusus spurious-429 muse-spark.
+- Free-tier 403: relay yang kena 403 di-cooldown 300 dtk; bila SEMUA target
+  (termasuk direct) 403 pra-payload — yang di-flag identitas request, bukan
+  IP — satu upaya terakhir direct dengan session+request baru
+  (`FORBIDDEN_FRESH_SESSION_RETRY`, `FORBIDDEN_RETRY_DELAY`), kecuali payload
+  membawa replay `encrypted_content` (identitas wajib stabil).
 - Streaming stabil: `Accept-Encoding: identity`, SSE keepalive 5 dtk,
   `reasoning_content` diteruskan agar socket tidak idle.
 - Usage: SQLite WAL (`usage.db`) per `request_id` + agregasi per model/period.
@@ -75,6 +80,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `MODEL_CONTEXT_OVERRIDES_JSON` | `` (kosong) | Override window konteks, cth. `'{"my-model": 500000, "qwen*": 1000000}'` (exact + `prefix*`, case-insensitive) |
 | `MODEL_ENDPOINT_OVERRIDES_JSON` | `` (kosong) | Override kategori endpoint native (`chat`/`responses`/`messages`), cth. `'{"my-model": "responses"}'` (exact + `prefix*`) |
 | `RESPONSES_REVERSE_BRIDGE` | `true` | `false` = model non-Responses via `/v1/responses` ditolak 400 bersih (tanpa bridge balik) |
+| `FORBIDDEN_FRESH_SESSION_RETRY` | `true` | `false` = matikan upaya terakhir sesi-baru saat semua target 403 |
+| `FORBIDDEN_RETRY_DELAY` | `2.0` | Jeda (dtk) sebelum upaya terakhir sesi-baru |
 | `PORT` / `RELOAD` | `8000` / `false` | Server |
 
 ## Endpoint
@@ -135,7 +142,8 @@ app/services/            # relay, upstream, streaming, responses_bridge,
                          # tools_dsml, usage
 app/routes/              # chat, responses_api, misc, usage_routes, monitor
 app/web/templates/       # login.html, dashboard.html (vanilla, tanpa build)
-test/                    # test_long_stream_fixes.py, test_live_requests.py
+test/                    # test_long_stream_fixes.py, test_live_requests.py,
+                         # test_reverse_bridge.py, test_forbidden_fresh_retry.py
 plans/                   # docs lokal, di-gitignore
 usage.db*                # runtime SQLite, di-gitignore
 ```
@@ -146,6 +154,7 @@ usage.db*                # runtime SQLite, di-gitignore
 python -m compileall -q app main.py test
 python test/test_long_stream_fixes.py   # offline, 34 case, harus ALL PASSED
 python test/test_reverse_bridge.py      # offline, 15 case (routing endpoint + reverse bridge)
+python test/test_forbidden_fresh_retry.py  # offline, 7 case (retry sesi-baru all-403)
 python test/test_live_requests.py       # live: ASGI in-process → relay Vercel
                                         # + opencode.ai; kontrak 200 / 429-bersih /
                                         # EMPTY_RESPONSE; butuh internet

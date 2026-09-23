@@ -13,6 +13,8 @@ from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 from app.core.config import (
     API_KEY,
     BRIDGE_REQUEST_TIMEOUT,
+    FORBIDDEN_FRESH_SESSION_RETRY,
+    FORBIDDEN_RETRY_DELAY,
     HERMES_COMPAT,
     OPENCODE_URL,
     RATE_LIMIT_BACKOFF,
@@ -29,7 +31,7 @@ from app.core.config import (
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
 from app.core.http_client import _get_http
 from app.core.logging_utils import _log
-from app.services.opencode import _fresh_request_headers, _oc_session_tag
+from app.services.opencode import _fresh_identity_headers, _fresh_request_headers, _oc_session_tag
 from app.core.sse import _sse
 from app.services.relay import (
     _is_relay_penalized,
@@ -232,6 +234,13 @@ async def stream_generator(
     # Bug spam-429 opencode khusus muse-spark: tiap target boleh dicoba 1x
     # lagi ke route YANG SAMA sebelum dirotasi (dilacak di set ini).
     spurious_429_retried: set = set()
+    # Pelacakan untuk upaya terakhir fresh-session (403 di semua target
+    # termasuk direct): hanya bila SETIAP kegagalan adalah 403 pra-payload
+    # (forbidden_count > 0) dan TIDAK ADA kegagalan lain
+    # (saw_non_403_failure) barulah identitas baru dicoba sekali.
+    forbidden_count = 0
+    saw_non_403_failure = False
+    fresh_session_retry_done = False
     _log("STREAM", f"REQ model={client_model} keys={sorted(payload.keys())} {_oc_session_tag(opencode_headers)}")
 
     try:
@@ -239,436 +248,490 @@ async def stream_generator(
         # retry pada IP yang sama) supaya tiap attempt memakai relay/IP yang
         # berbeda. Retry hanya dilakukan pada level request berikutnya.
         # PENGECUALIAN: muse-spark (Responses-only) retry 1x same-route dulu.
-        target_index = 0
-        while target_index < len(targets):
-            target_url, headers = targets[target_index]
-            is_relay = "x-relay-target" in headers
-            if vision_direct_first and is_relay and not last_rate_limited:
-                # Relay vision hanya untuk 429 direct; kegagalan lain
-                # selesai di direct (last_error sudah terisi).
-                break
-            # Request ID fresh per attempt ala CLI asli (msg_ unik per POST);
-            # memakai ulang satu ID di semua attempt terlihat seperti replay.
-            headers = _fresh_request_headers(headers)
-            _log("STREAM",
-                f"ATTEMPT {target_index + 1}/{len(targets)} "
-                f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}"
-            )
-            try:
-                target_termination_seen = False
-                relay_target_failed = False
-                client = _get_http()
-                async with client.stream(
-                    "POST", target_url, json=payload, headers=headers
-                ) as response:
-                    if response.status_code != 200:
-                        try:
-                            body = await response.aread()
-                            detail = body.decode("utf-8", errors="replace")[:500]
-                        except Exception:  # noqa: BLE001
-                            detail = ""
-                        if is_relay and _is_relay_timeout(response):
-                            # 504 Edge dari Vercel: tidak ada byte dalam 25 dtk.
-                            # Untuk konteks raksasa ini WAJAR (TTFB>25s) -> JANGAN
-                            # tandai broken (relay sehat); untuk request normal
-                            # tandai agar streaming berikut skip relay ini.
-                            if _should_mark_stream_broken(target_url, payload):
-                                _mark_relay_stream_broken(
-                                    target_url,
-                                    time.time() + RELAY_STREAM_BROKEN_COOLDOWN,
-                                )
-                            last_error = f"Relay stream timeout (504): {detail[:200]}"
-                            target_index += 1
-                            _log(
-                                "STREAM",
-                                f"STREAM-TIMEOUT {target_url} | Vercel kill 504 "
-                                f"(limit eksekusi ~25s, bukan bug proxy) -> relay "
-                                f"di-skip streaming {RELAY_STREAM_BROKEN_COOLDOWN:.0f}s, "
-                                f"lanjut ke target berikutnya/direct",
-                            )
-                            continue
-                        if response.status_code == 429 and not sent_payload:
-                            # 429 = IP relay sedang dibatasi (baik dari Vercel
-                            # sendiri maupun OpenCode via relay). Menunggu/
-                            # retry pada IP yang sama hampir selalu 429 lagi.
-                            # Langsung ROTASI: relay dicatat masuk cooldown
-                            # (agar request berikutnya mulai dari relay yang
-                            # sehat) lalu pindah ke target berikutnya.
-                            # PENGECUALIAN bug spam-429 muse-spark: retry 1x
-                            # same-route dulu sebelum rotasi/cooldown.
-                            if _should_retry_same_route_429(client_model) and target_url not in spurious_429_retried:
-                                spurious_429_retried.add(target_url)
-                                _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
+        # Fase luar (while True) hanya berputar SEKALI ekstra: fase
+        # fresh-session sebagai upaya terakhir all-403 (lihat bawah).
+        while True:
+            target_index = 0
+            while target_index < len(targets):
+                target_url, headers = targets[target_index]
+                is_relay = "x-relay-target" in headers
+                if vision_direct_first and is_relay and not last_rate_limited:
+                    # Relay vision hanya untuk 429 direct; kegagalan lain
+                    # selesai di direct (last_error sudah terisi).
+                    break
+                # Request ID fresh per attempt ala CLI asli (msg_ unik per POST);
+                # memakai ulang satu ID di semua attempt terlihat seperti replay.
+                headers = _fresh_request_headers(headers)
+                _log("STREAM",
+                    f"ATTEMPT {target_index + 1}/{len(targets)} "
+                    f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}"
+                )
+                try:
+                    target_termination_seen = False
+                    relay_target_failed = False
+                    client = _get_http()
+                    async with client.stream(
+                        "POST", target_url, json=payload, headers=headers
+                    ) as response:
+                        if response.status_code != 200:
+                            try:
+                                body = await response.aread()
+                                detail = body.decode("utf-8", errors="replace")[:500]
+                            except Exception:  # noqa: BLE001
+                                detail = ""
+                            if is_relay and _is_relay_timeout(response):
+                                # 504 Edge dari Vercel: tidak ada byte dalam 25 dtk.
+                                # Untuk konteks raksasa ini WAJAR (TTFB>25s) -> JANGAN
+                                # tandai broken (relay sehat); untuk request normal
+                                # tandai agar streaming berikut skip relay ini.
+                                if _should_mark_stream_broken(target_url, payload):
+                                    _mark_relay_stream_broken(
+                                        target_url,
+                                        time.time() + RELAY_STREAM_BROKEN_COOLDOWN,
+                                    )
+                                last_error = f"Relay stream timeout (504): {detail[:200]}"
+                                saw_non_403_failure = True
+                                target_index += 1
                                 _log(
                                     "STREAM",
-                                    f"SPURIOUS-429 {target_url} | retry same-route 1x "
-                                    f"in {_delay:.1f}s sebelum ganti route",
+                                    f"STREAM-TIMEOUT {target_url} | Vercel kill 504 "
+                                    f"(limit eksekusi ~25s, bukan bug proxy) -> relay "
+                                    f"di-skip streaming {RELAY_STREAM_BROKEN_COOLDOWN:.0f}s, "
+                                    f"lanjut ke target berikutnya/direct",
                                 )
-                                await asyncio.sleep(_delay)
-                                continue  # ulangi target_index yang sama
-                            rate_cls = _classify_rate_limit(response)
-                            last_retry_after = _retry_after_seconds(
-                                response, RATE_LIMIT_BACKOFF
-                            )
-                            _mark_relay_rate_limited(
-                                target_url,
-                                time.time() + _relay_cooldown_seconds(response),
-                            )
-                            last_error = f"Rate limited (429): {detail}"
-                            last_rate_limited = True
-                            _log(
-                                "STREAM",
-                                f"RATE-LIMITED {target_url} | "
-                                f"{rate_cls['description']} | IP relay dirotasi "
-                                f"terus -> target berikutnya | detail={detail[:300]!r}",
-                            )
-                            target_index += 1
-                            _log("STREAM",
-                                f"FAIL {target_url} | upstream-status=429 detail={detail[:300]!r}"
-                            )
-                            continue  # target berikutnya
-                        last_error = (
-                            f"Upstream responded with {response.status_code}: {detail}"
-                        )
-                        last_rate_limited = response.status_code == 429
-                        if response.status_code == 403 and is_relay and not sent_payload:
-                            # 403 lewat relay = egress IP relay sedang di-flag
-                            # upstream (request identik lewat relay lain lolos).
-                            # Susulkan relay ke akhir rotasi agar request
-                            # berikutnya langsung memakai yang sehat.
-                            _mark_relay_forbidden(
-                                target_url,
-                                time.time() + RELAY_403_COOLDOWN,
-                            )
-                            _log("STREAM",
-                                f"FORBIDDEN {target_url} | upstream 403 "
-                                f"(IP relay di-flag, bukan salah fingerprint) "
-                                f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s, "
-                                f"lanjut ke target berikutnya"
-                            )
-                        target_index += 1
-                        _log("STREAM",
-                            f"FAIL {target_url} "
-                            f"| upstream-status={response.status_code} detail={detail[:300]!r}"
-                        )
-                        continue  # target berikutnya
-
-                    _log("STREAM", f"OK {target_url}")
-
-                    line_iter = response.aiter_lines()
-                    pending_line_task: Optional[asyncio.Task[str]] = None
-                    last_activity_at = time.time()
-                    # wire_bytes / parsed_chunks diakumulasi antar-target
-                    # (diinisialisasi 0 di awal stream_generator agar
-                    # log_phase_summary aman dipanggil sebelum target OK).
-                    # Peringatan: kalau terlihat SERPIHAN panjang (mis. >30s)
-                    # tapi parsed_chunks tidak naik, berarti relay/middlebox
-                    # menahan byte (buffer) — streaming tidak benar-benar
-                    # pass-through, dan idle timeout TIDAK akan pernah memicu
-                    # karena socket tetap "aktif".
-                    try:
-                        while True:
-                            # Idle timeout: landasanya adalah PROGRESS, bukan
-                            # durasi total. Selama upstream terus mengirim byte
-                            # (reasoning/content/komentar), stream dibiarkan
-                            # berjalan. Hanya kalau tidak ada data sama sekali
-                            # selama REQUEST_TIMEOUT detik, stream dibunuh.
-                            idle_seconds = time.time() - last_activity_at
-                            if idle_seconds > REQUEST_TIMEOUT:
-                                raise asyncio.TimeoutError(
-                                    f"No upstream progress for {int(idle_seconds)}s"
-                                    f" (idle timeout {REQUEST_TIMEOUT}s)"
-                                )
-
-                            # Do not wrap __anext__() in wait_for(). wait_for()
-                            # cancels the iterator when the keepalive timer fires;
-                            # cancelling an async generator mid-read can make the
-                            # next __anext__() fail and kill a healthy stream.
-                            if pending_line_task is None:
-                                pending_line_task = asyncio.create_task(
-                                    line_iter.__anext__()
-                                )
-
-                            done, _ = await asyncio.wait(
-                                (pending_line_task,),
-                                timeout=min(
-                                    SSE_KEEPALIVE_INTERVAL,
-                                    max(0.0, REQUEST_TIMEOUT - idle_seconds),
-                                ),
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
-                            if not done:
-                                yield ":\n\n"
                                 continue
-
-                            try:
-                                line = pending_line_task.result()
-                            except StopAsyncIteration:
-                                # Upstream menutup stream SSE. Sumber yang
-                                # seharusnya menutup dengan [DONE] atau chunk
-                                # finish_reason. Beberapa relay/provider memotong
-                                # koneksi tanpa sinyal terminasi; jika payload
-                                # nyata sudah terkirim, akhiri dengan GRACEFUL
-                                # (flush sisa + finish + [DONE]) alih-alih
-                                # membuang seluruh jawaban dengan error chunk.
-                                if not target_termination_seen:
-                                    if sent_payload:
-                                        _log(
-                                            "STREAM",
-                                            f"EOF {target_url} without "
-                                            f"[DONE]/finish_reason - completing "
-                                            f"gracefully",
-                                        )
-                                    else:
-                                        raise httpx.ReadError(
-                                            "Upstream stream ended before completion"
-                                        )
-                                stream_completed = True
-                                break
-                            finally:
-                                pending_line_task = None
-
-                            if not line:
-                                continue
-                            if not line.startswith("data:"):
-                                continue
-
-                            data = line[5:].lstrip()
-                            wire_bytes += len(data)
-                            if data == "[DONE]":
-                                target_termination_seen = True
-                                stream_completed = True
-                                break
-
-                            try:
-                                upstream_chunk = json.loads(data)
-                            except json.JSONDecodeError:
-                                continue
-                            # Relay early-SSE (core.js baru): fetch upstream
-                            # gagal di background dilaporkan sebagai event,
-                            # karena status HTTP sudah terlanjur 200. Tanpa
-                            # cegatan ini, failure dikira sukses kosong.
-                            if (
-                                isinstance(upstream_chunk, dict)
-                                and upstream_chunk.get("type") == "relay.error"
-                                and not sent_payload
-                            ):
-                                relay_status = upstream_chunk.get("status")
-                                relay_body = str(upstream_chunk.get("body") or "")[:300]
-                                if relay_status == 429:
-                                    last_retry_after = RATE_LIMIT_BACKOFF
-                                    last_rate_limited = True
-                                    if is_relay:
-                                        _mark_relay_rate_limited(
-                                            target_url,
-                                            time.time() + RATE_LIMIT_COOLDOWN,
-                                        )
-                                elif relay_status == 403:
-                                    last_rate_limited = False
-                                    if is_relay:
-                                        _mark_relay_forbidden(
-                                            target_url,
-                                            time.time() + RELAY_403_COOLDOWN,
-                                        )
-                                else:
-                                    last_rate_limited = relay_status == 429
-                                last_error = (
-                                    f"Relay error {relay_status}: {relay_body}"
-                                )
-                                relay_target_failed = True
-                                _log(
-                                    "STREAM",
-                                    f"RELAY-ERROR {target_url} | status="
-                                    f"{relay_status} detail={relay_body!r} "
-                                    f"-> target berikutnya",
-                                )
-                                break
-                            parsed_chunks += 1
-                            # Progress dihitung dari CHUNK DATA nyata, bukan dari
-                            # komentar/keepalive SSE. Kalau upstream hanya terus
-                            # mengirim keepalive tanpa konten, idle timeout akan
-                            # memicu dan klien tahu stream macet, bukan hang.
-                            last_activity_at = time.time()
-
-                            if isinstance(upstream_chunk, dict):
-                                upstream_usage = upstream_chunk.get("usage")
-                                if isinstance(upstream_usage, dict) and upstream_usage:
-                                    # Upstream sering mengirim usage KUMULATIF di
-                                    # hampir semua chunk. Simpan nilai terakhir
-                                    # dan rekam SEKALI di akhir stream, bukan per
-                                    # chunk (mencegah inflasi token & request).
-                                    # Tanpa `continue`: chunk yang sekaligus
-                                    # membawa choices/finish_reason tetap diproses
-                                    # di bawah, sehingga delta terakhir dan sinyal
-                                    # terminasi tidak tertelan.
-                                    last_usage = upstream_usage
-
-                            choices = upstream_chunk.get("choices")
-                            if not isinstance(choices, list) or not choices:
-                                continue
-
-                            choice = choices[0] if isinstance(choices[0], dict) else {}
-                            if choice.get("finish_reason") is not None:
-                                last_finish_reason = choice.get("finish_reason")
-                                target_termination_seen = True
-                            delta = choice.get("delta") or {}
-                            if not isinstance(delta, dict):
-                                continue
-
-                            native_call_deltas = normalize_stream_tool_deltas(
-                                delta.get("tool_calls")
-                            )
-                            visible_text = delta.get("content")
-                            if visible_text is not None and not isinstance(
-                                visible_text, str
-                            ):
-                                visible_text = str(visible_text)
-
-                            # Reasoning-capable free models may send
-                            # token di `reasoning_content`; `content` bisa null
-                            # sampai akhir (atau seluruh max_tokens habis untuk
-                            # reasoning). Tampung sebagai fallback anti respons
-                            # kosong: hanya dipakai bila stream berakhir tanpa
-                            # konten maupun tool call.
-                            reasoning_text = delta.get("reasoning_content")
-                            if reasoning_text is None:
-                                # Some OpenAI-compatible providers stream
-                                # thinking under the newer `reasoning` field
-                                # name instead of `reasoning_content`.
-                                reasoning_text = delta.get("reasoning")
-                            if reasoning_text is not None and not isinstance(
-                                reasoning_text, str
-                            ):
-                                reasoning_text = str(reasoning_text)
-                            if reasoning_text:
-                                # Buffer HANYA fallback anti-empty-response: batasi
-                                # ~20rb char terakhir agar stream reasoning panjang
-                                # tidak menumpuk memori per request.
-                                reasoning_buffer.append(reasoning_text)
-                                reasoning_buffer_chars += len(reasoning_text)
-                                while len(reasoning_buffer) > 1 and reasoning_buffer_chars > 20000:
-                                    reasoning_buffer_chars -= len(reasoning_buffer.pop(0))
-                                now = time.time()
-                                reasoning_chars += len(reasoning_text)
-                                if first_reasoning_at is None:
-                                    first_reasoning_at = now
+                            if response.status_code == 429 and not sent_payload:
+                                # 429 = IP relay sedang dibatasi (baik dari Vercel
+                                # sendiri maupun OpenCode via relay). Menunggu/
+                                # retry pada IP yang sama hampir selalu 429 lagi.
+                                # Langsung ROTASI: relay dicatat masuk cooldown
+                                # (agar request berikutnya mulai dari relay yang
+                                # sehat) lalu pindah ke target berikutnya.
+                                # PENGECUALIAN bug spam-429 muse-spark: retry 1x
+                                # same-route dulu sebelum rotasi/cooldown.
+                                if _should_retry_same_route_429(client_model) and target_url not in spurious_429_retried:
+                                    spurious_429_retried.add(target_url)
+                                    _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
                                     _log(
                                         "STREAM",
-                                        f"REASONING start +{now - stream_start:.2f}s",
+                                        f"SPURIOUS-429 {target_url} | retry same-route 1x "
+                                        f"in {_delay:.1f}s sebelum ganti route",
                                     )
-                                last_reasoning_at = now
-                                # Forward reasoning deltas so the socket stays
-                                # active during long thinking phases. Clients
-                                # that do not support `reasoning_content` simply
-                                # ignore the field.
-                                if REASONING_FORWARD:
+                                    await asyncio.sleep(_delay)
+                                    continue  # ulangi target_index yang sama
+                                rate_cls = _classify_rate_limit(response)
+                                last_retry_after = _retry_after_seconds(
+                                    response, RATE_LIMIT_BACKOFF
+                                )
+                                _mark_relay_rate_limited(
+                                    target_url,
+                                    time.time() + _relay_cooldown_seconds(response),
+                                )
+                                last_error = f"Rate limited (429): {detail}"
+                                last_rate_limited = True
+                                saw_non_403_failure = True
+                                _log(
+                                    "STREAM",
+                                    f"RATE-LIMITED {target_url} | "
+                                    f"{rate_cls['description']} | IP relay dirotasi "
+                                    f"terus -> target berikutnya | detail={detail[:300]!r}",
+                                )
+                                target_index += 1
+                                _log("STREAM",
+                                    f"FAIL {target_url} | upstream-status=429 detail={detail[:300]!r}"
+                                )
+                                continue  # target berikutnya
+                            last_error = (
+                                f"Upstream responded with {response.status_code}: {detail}"
+                            )
+                            last_rate_limited = response.status_code == 429
+                            if response.status_code == 403:
+                                # 403 di sini dihitung untuk relay MAUPUN direct:
+                                # 403 direct = identitas yang di-flag (kandidat
+                                # fresh-session retry), bukan IP relay.
+                                forbidden_count += 1
+                            else:
+                                saw_non_403_failure = True
+                            if response.status_code == 403 and is_relay and not sent_payload:
+                                # 403 lewat relay = egress IP relay sedang di-flag
+                                # upstream (request identik lewat relay lain lolos).
+                                # Susulkan relay ke akhir rotasi agar request
+                                # berikutnya langsung memakai yang sehat.
+                                _mark_relay_forbidden(
+                                    target_url,
+                                    time.time() + RELAY_403_COOLDOWN,
+                                )
+                                _log("STREAM",
+                                    f"FORBIDDEN {target_url} | upstream 403 "
+                                    f"(IP relay di-flag, bukan salah fingerprint) "
+                                    f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s, "
+                                    f"lanjut ke target berikutnya"
+                                )
+                            target_index += 1
+                            _log("STREAM",
+                                f"FAIL {target_url} "
+                                f"| upstream-status={response.status_code} detail={detail[:300]!r}"
+                            )
+                            continue  # target berikutnya
+
+                        _log("STREAM", f"OK {target_url}")
+
+                        line_iter = response.aiter_lines()
+                        pending_line_task: Optional[asyncio.Task[str]] = None
+                        last_activity_at = time.time()
+                        # wire_bytes / parsed_chunks diakumulasi antar-target
+                        # (diinisialisasi 0 di awal stream_generator agar
+                        # log_phase_summary aman dipanggil sebelum target OK).
+                        # Peringatan: kalau terlihat SERPIHAN panjang (mis. >30s)
+                        # tapi parsed_chunks tidak naik, berarti relay/middlebox
+                        # menahan byte (buffer) — streaming tidak benar-benar
+                        # pass-through, dan idle timeout TIDAK akan pernah memicu
+                        # karena socket tetap "aktif".
+                        try:
+                            while True:
+                                # Idle timeout: landasanya adalah PROGRESS, bukan
+                                # durasi total. Selama upstream terus mengirim byte
+                                # (reasoning/content/komentar), stream dibiarkan
+                                # berjalan. Hanya kalau tidak ada data sama sekali
+                                # selama REQUEST_TIMEOUT detik, stream dibunuh.
+                                idle_seconds = time.time() - last_activity_at
+                                if idle_seconds > REQUEST_TIMEOUT:
+                                    raise asyncio.TimeoutError(
+                                        f"No upstream progress for {int(idle_seconds)}s"
+                                        f" (idle timeout {REQUEST_TIMEOUT}s)"
+                                    )
+
+                                # Do not wrap __anext__() in wait_for(). wait_for()
+                                # cancels the iterator when the keepalive timer fires;
+                                # cancelling an async generator mid-read can make the
+                                # next __anext__() fail and kill a healthy stream.
+                                if pending_line_task is None:
+                                    pending_line_task = asyncio.create_task(
+                                        line_iter.__anext__()
+                                    )
+
+                                done, _ = await asyncio.wait(
+                                    (pending_line_task,),
+                                    timeout=min(
+                                        SSE_KEEPALIVE_INTERVAL,
+                                        max(0.0, REQUEST_TIMEOUT - idle_seconds),
+                                    ),
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                if not done:
+                                    yield ":\n\n"
+                                    continue
+
+                                try:
+                                    line = pending_line_task.result()
+                                except StopAsyncIteration:
+                                    # Upstream menutup stream SSE. Sumber yang
+                                    # seharusnya menutup dengan [DONE] atau chunk
+                                    # finish_reason. Beberapa relay/provider memotong
+                                    # koneksi tanpa sinyal terminasi; jika payload
+                                    # nyata sudah terkirim, akhiri dengan GRACEFUL
+                                    # (flush sisa + finish + [DONE]) alih-alih
+                                    # membuang seluruh jawaban dengan error chunk.
+                                    if not target_termination_seen:
+                                        if sent_payload:
+                                            _log(
+                                                "STREAM",
+                                                f"EOF {target_url} without "
+                                                f"[DONE]/finish_reason - completing "
+                                                f"gracefully",
+                                            )
+                                        else:
+                                            raise httpx.ReadError(
+                                                "Upstream stream ended before completion"
+                                            )
+                                    stream_completed = True
+                                    break
+                                finally:
+                                    pending_line_task = None
+
+                                if not line:
+                                    continue
+                                if not line.startswith("data:"):
+                                    continue
+
+                                data = line[5:].lstrip()
+                                wire_bytes += len(data)
+                                if data == "[DONE]":
+                                    target_termination_seen = True
+                                    stream_completed = True
+                                    break
+
+                                try:
+                                    upstream_chunk = json.loads(data)
+                                except json.JSONDecodeError:
+                                    continue
+                                # Relay early-SSE (core.js baru): fetch upstream
+                                # gagal di background dilaporkan sebagai event,
+                                # karena status HTTP sudah terlanjur 200. Tanpa
+                                # cegatan ini, failure dikira sukses kosong.
+                                if (
+                                    isinstance(upstream_chunk, dict)
+                                    and upstream_chunk.get("type") == "relay.error"
+                                    and not sent_payload
+                                ):
+                                    relay_status = upstream_chunk.get("status")
+                                    relay_body = str(upstream_chunk.get("body") or "")[:300]
+                                    if relay_status == 429:
+                                        last_retry_after = RATE_LIMIT_BACKOFF
+                                        last_rate_limited = True
+                                        saw_non_403_failure = True
+                                        if is_relay:
+                                            _mark_relay_rate_limited(
+                                                target_url,
+                                                time.time() + RATE_LIMIT_COOLDOWN,
+                                            )
+                                    elif relay_status == 403:
+                                        last_rate_limited = False
+                                        forbidden_count += 1
+                                        if is_relay:
+                                            _mark_relay_forbidden(
+                                                target_url,
+                                                time.time() + RELAY_403_COOLDOWN,
+                                            )
+                                    else:
+                                        last_rate_limited = relay_status == 429
+                                        saw_non_403_failure = True
+                                    last_error = (
+                                        f"Relay error {relay_status}: {relay_body}"
+                                    )
+                                    relay_target_failed = True
+                                    _log(
+                                        "STREAM",
+                                        f"RELAY-ERROR {target_url} | status="
+                                        f"{relay_status} detail={relay_body!r} "
+                                        f"-> target berikutnya",
+                                    )
+                                    break
+                                parsed_chunks += 1
+                                # Progress dihitung dari CHUNK DATA nyata, bukan dari
+                                # komentar/keepalive SSE. Kalau upstream hanya terus
+                                # mengirim keepalive tanpa konten, idle timeout akan
+                                # memicu dan klien tahu stream macet, bukan hang.
+                                last_activity_at = time.time()
+
+                                if isinstance(upstream_chunk, dict):
+                                    upstream_usage = upstream_chunk.get("usage")
+                                    if isinstance(upstream_usage, dict) and upstream_usage:
+                                        # Upstream sering mengirim usage KUMULATIF di
+                                        # hampir semua chunk. Simpan nilai terakhir
+                                        # dan rekam SEKALI di akhir stream, bukan per
+                                        # chunk (mencegah inflasi token & request).
+                                        # Tanpa `continue`: chunk yang sekaligus
+                                        # membawa choices/finish_reason tetap diproses
+                                        # di bawah, sehingga delta terakhir dan sinyal
+                                        # terminasi tidak tertelan.
+                                        last_usage = upstream_usage
+
+                                choices = upstream_chunk.get("choices")
+                                if not isinstance(choices, list) or not choices:
+                                    continue
+
+                                choice = choices[0] if isinstance(choices[0], dict) else {}
+                                if choice.get("finish_reason") is not None:
+                                    last_finish_reason = choice.get("finish_reason")
+                                    target_termination_seen = True
+                                delta = choice.get("delta") or {}
+                                if not isinstance(delta, dict):
+                                    continue
+
+                                native_call_deltas = normalize_stream_tool_deltas(
+                                    delta.get("tool_calls")
+                                )
+                                visible_text = delta.get("content")
+                                if visible_text is not None and not isinstance(
+                                    visible_text, str
+                                ):
+                                    visible_text = str(visible_text)
+
+                                # Reasoning-capable free models may send
+                                # token di `reasoning_content`; `content` bisa null
+                                # sampai akhir (atau seluruh max_tokens habis untuk
+                                # reasoning). Tampung sebagai fallback anti respons
+                                # kosong: hanya dipakai bila stream berakhir tanpa
+                                # konten maupun tool call.
+                                reasoning_text = delta.get("reasoning_content")
+                                if reasoning_text is None:
+                                    # Some OpenAI-compatible providers stream
+                                    # thinking under the newer `reasoning` field
+                                    # name instead of `reasoning_content`.
+                                    reasoning_text = delta.get("reasoning")
+                                if reasoning_text is not None and not isinstance(
+                                    reasoning_text, str
+                                ):
+                                    reasoning_text = str(reasoning_text)
+                                if reasoning_text:
+                                    # Buffer HANYA fallback anti-empty-response: batasi
+                                    # ~20rb char terakhir agar stream reasoning panjang
+                                    # tidak menumpuk memori per request.
+                                    reasoning_buffer.append(reasoning_text)
+                                    reasoning_buffer_chars += len(reasoning_text)
+                                    while len(reasoning_buffer) > 1 and reasoning_buffer_chars > 20000:
+                                        reasoning_buffer_chars -= len(reasoning_buffer.pop(0))
+                                    now = time.time()
+                                    reasoning_chars += len(reasoning_text)
+                                    if first_reasoning_at is None:
+                                        first_reasoning_at = now
+                                        _log(
+                                            "STREAM",
+                                            f"REASONING start +{now - stream_start:.2f}s",
+                                        )
+                                    last_reasoning_at = now
+                                    # Forward reasoning deltas so the socket stays
+                                    # active during long thinking phases. Clients
+                                    # that do not support `reasoning_content` simply
+                                    # ignore the field.
+                                    if REASONING_FORWARD:
+                                        role = role_chunk()
+                                        if role:
+                                            sent_payload = True
+                                            yield role
+                                        sent_payload = True
+                                        yield chunk(
+                                            {"reasoning_content": reasoning_text}
+                                        )
+
+                                filtered_text = ""
+                                dsml_calls: List[Dict[str, Any]] = []
+                                if visible_text:
+                                    filtered_text, dsml_calls = parser.feed(visible_text)
+
+                                calls = native_call_deltas or dsml_calls
+                                if filtered_text or calls:
                                     role = role_chunk()
                                     if role:
                                         sent_payload = True
                                         yield role
+
+                                if filtered_text:
                                     sent_payload = True
-                                    yield chunk(
-                                        {"reasoning_content": reasoning_text}
-                                    )
+                                    saw_text_content = True
+                                    content_chars += len(filtered_text)
+                                    mark_content()
+                                    yield chunk({"content": filtered_text})
 
-                            filtered_text = ""
-                            dsml_calls: List[Dict[str, Any]] = []
-                            if visible_text:
-                                filtered_text, dsml_calls = parser.feed(visible_text)
-
-                            calls = native_call_deltas or dsml_calls
-                            if filtered_text or calls:
-                                role = role_chunk()
-                                if role:
-                                    sent_payload = True
-                                    yield role
-
-                            if filtered_text:
-                                sent_payload = True
-                                saw_text_content = True
-                                content_chars += len(filtered_text)
-                                mark_content()
-                                yield chunk({"content": filtered_text})
-
-                            if native_call_deltas:
-                                saw_tool_call = True
-                                sent_payload = True
-                                mark_content()
-                                yield chunk({"tool_calls": native_call_deltas})
-                            else:
-                                for tool_call in dsml_calls:
+                                if native_call_deltas:
                                     saw_tool_call = True
                                     sent_payload = True
                                     mark_content()
-                                    yield chunk(
-                                        {
-                                            "tool_calls": [
-                                                {
-                                                    "index": call_index,
-                                                    "id": tool_call["id"],
-                                                    "type": "function",
-                                                    "function": tool_call["function"],
-                                                }
-                                            ]
-                                        }
-                                    )
-                                    call_index += 1
-                    finally:
-                        # If the request is cancelled or the total stream
-                        # timeout fires while waiting for a line, do not leave
-                        # a reader task behind after the response is closed.
-                        if pending_line_task is not None:
-                            pending_line_task.cancel()
-                            with suppress(asyncio.CancelledError, Exception):
-                                await pending_line_task
+                                    yield chunk({"tool_calls": native_call_deltas})
+                                else:
+                                    for tool_call in dsml_calls:
+                                        saw_tool_call = True
+                                        sent_payload = True
+                                        mark_content()
+                                        yield chunk(
+                                            {
+                                                "tool_calls": [
+                                                    {
+                                                        "index": call_index,
+                                                        "id": tool_call["id"],
+                                                        "type": "function",
+                                                        "function": tool_call["function"],
+                                                    }
+                                                ]
+                                            }
+                                        )
+                                        call_index += 1
+                        finally:
+                            # If the request is cancelled or the total stream
+                            # timeout fires while waiting for a line, do not leave
+                            # a reader task behind after the response is closed.
+                            if pending_line_task is not None:
+                                pending_line_task.cancel()
+                                with suppress(asyncio.CancelledError, Exception):
+                                    await pending_line_task
 
-                if relay_target_failed:
-                    # relay.error sebelum payload: bukan sukses — rotasi ke
-                    # target berikutnya (failover tetap jalan walau HTTP 200).
-                    target_index += 1
-                    continue
+                    if relay_target_failed:
+                        # relay.error sebelum payload: bukan sukses — rotasi ke
+                        # target berikutnya (failover tetap jalan walau HTTP 200).
+                        target_index += 1
+                        continue
 
-                # SUCCESS. Inner `async with client.stream(...)` sudah
-                # tertutup. Set stream_completed dan HENTIKAN loop target,
-                # sehingga kita tidak connect ke target berikutnya (yang
-                # akan menyebabkan klien menerima chunk duplikat ATAU
-                # error chunk "Stream connection lost" padahal stream
-                # pertama sudah selesai normal).
-                stream_completed = True
-                break  # keluar dari loop target
+                    # SUCCESS. Inner `async with client.stream(...)` sudah
+                    # tertutup. Set stream_completed dan HENTIKAN loop target,
+                    # sehingga kita tidak connect ke target berikutnya (yang
+                    # akan menyebabkan klien menerima chunk duplikat ATAU
+                    # error chunk "Stream connection lost" padahal stream
+                    # pertama sudah selesai normal).
+                    stream_completed = True
+                    break  # keluar dari loop target
 
-            except (
-                httpx.TimeoutException,
-                httpx.ConnectError,
-                httpx.ReadError,
-                httpx.RemoteProtocolError,
-            ) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                _log("STREAM", f"FAIL {target_url} ({type(exc).__name__})")
-                if sent_payload:
-                    # Sudah ada konten sampai ke klien; retry akan
-                    # menduplikasi teks. Akhiri dengan error yang jelas.
-                    record_final_usage()
-                    log_phase_summary("lost")
-                    try:
-                        yield _sse(
-                            {
-                                "error": {
-                                    "message": "Stream connection lost",
-                                    "detail": str(exc),
+                except (
+                    httpx.TimeoutException,
+                    httpx.ConnectError,
+                    httpx.ReadError,
+                    httpx.RemoteProtocolError,
+                ) as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    saw_non_403_failure = True
+                    _log("STREAM", f"FAIL {target_url} ({type(exc).__name__})")
+                    if sent_payload:
+                        # Sudah ada konten sampai ke klien; retry akan
+                        # menduplikasi teks. Akhiri dengan error yang jelas.
+                        record_final_usage()
+                        log_phase_summary("lost")
+                        try:
+                            yield _sse(
+                                {
+                                    "error": {
+                                        "message": "Stream connection lost",
+                                        "detail": str(exc),
+                                    }
                                 }
-                            }
-                        )
-                        yield "data: [DONE]\n\n"
-                    except (GeneratorExit, asyncio.CancelledError):
-                        raise
-                    except Exception:
-                        # Klien sudah putus di tengah yield error-chunk;
-                        # jangan lempar error baru dari dalam handler.
-                        pass
-                    return
-                target_index += 1
-                continue  # belum ada payload terkirim -> aman coba target lain
+                            )
+                            yield "data: [DONE]\n\n"
+                        except (GeneratorExit, asyncio.CancelledError):
+                            raise
+                        except Exception:
+                            # Klien sudah putus di tengah yield error-chunk;
+                            # jangan lempar error baru dari dalam handler.
+                            pass
+                        return
+                    target_index += 1
+                    continue  # belum ada payload terkirim -> aman coba target lain
+
+            if stream_completed:
+                break
+            if (
+                not FORBIDDEN_FRESH_SESSION_RETRY
+                or fresh_session_retry_done
+                or not targets
+                or sent_payload
+                or saw_non_403_failure
+                or forbidden_count == 0
+            ):
+                break
+            # Upaya terakhir all-403: 403 di direct membuktikan yang di-flag
+            # BUKAN IP relay melainkan identitas request (sesi di-flag /
+            # detector transien) — rotasi IP tidak akan sembuh. Satu
+            # percobaan ke target TERAKHIR (direct bila fallback aktif,
+            # sehingga setting USE_RELAY/RELAY_FALLBACK operator dihormati)
+            # dengan session+request ID baru. Aman dari duplikasi: syarat
+            # masuk menjamin nol konten terkirim ke klien.
+            fresh_session_retry_done = True
+            retry_url, retry_headers = targets[-1]
+            old_tag = _oc_session_tag(opencode_headers)
+            base_headers = _fresh_identity_headers(retry_headers)
+            targets = [(retry_url, dict(base_headers))]
+            forbidden_count = 0
+            saw_non_403_failure = False
+            last_error = None
+            last_rate_limited = False
+            last_retry_after = None
+            spurious_429_retried = set()
+            _log(
+                "STREAM",
+                f"FRESH-SESSION-RETRY model={client_model} target={retry_url} "
+                f"{old_tag} -> {_oc_session_tag(base_headers)} "
+                f"(semua target 403 pra-payload, delay {FORBIDDEN_RETRY_DELAY:.1f}s)",
+            )
+            await asyncio.sleep(FORBIDDEN_RETRY_DELAY)
+            continue
 
         if not stream_completed:
             log_phase_summary("all-failed")

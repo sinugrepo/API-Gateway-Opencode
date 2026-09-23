@@ -268,6 +268,23 @@ MODELS_CACHE_TTL_SECONDS = int(os.getenv("MODELS_CACHE_TTL_SECONDS", "300"))
 RELAY_403_COOLDOWN = float(os.getenv("RELAY_403_COOLDOWN", "300"))
 
 
+# Upaya terakhir bila SEMUA target (relay + direct) menolak dengan 403
+# FreeTierError sebelum byte pertama: 403 di direct membuktikan yang
+# di-flag BUKAN IP relay melainkan identitas request itu sendiri (sesi
+# yang di-flag / status detector transien — request identik lolos 5 detik
+# sebelumnya, diverifikasi live 2026-09-23). Satu percobaan direct dengan
+# session+request ID yang sepenuhnya baru memberi peluang lolos tanpa
+# membakar relay lagi. Hanya 1x, hanya bila tidak ada konten terkirim
+# (tanpa risiko duplikasi), dan dilewati bila payload membawa replay
+# reasoning encrypted_content (identitas WAJIB stabil untuk itu).
+FORBIDDEN_FRESH_SESSION_RETRY = os.getenv("FORBIDDEN_FRESH_SESSION_RETRY", "true").lower() == "true"
+
+
+# Jeda sebelum percobaan fresh-session (detik): memberi waktu detector
+# transien upstream mereda. Hanya dipakai pada jalur 403-semua-gagal.
+FORBIDDEN_RETRY_DELAY = float(os.getenv("FORBIDDEN_RETRY_DELAY", "2.0"))
+
+
 # Berapa lama relay yang timeout di-skip untuk request streaming.
 # Default 30 menit: timeout platform Vercel bukan kondisi transien (limit
 # eksekusi ~25 dtk tidak pulih sendiri), jadi menandai ulang tiap 5 menit

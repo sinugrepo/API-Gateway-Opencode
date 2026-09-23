@@ -13,6 +13,8 @@ from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 from app.core.config import (
     API_KEY,
     BRIDGE_REQUEST_TIMEOUT,
+    FORBIDDEN_FRESH_SESSION_RETRY,
+    FORBIDDEN_RETRY_DELAY,
     HERMES_COMPAT,
     HERMES_TOOL_INSTRUCTION,
     MODEL,
@@ -29,7 +31,7 @@ from app.core.config import (
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
 from app.core.http_client import _get_http
 from app.core.logging_utils import _log
-from app.services.opencode import _fresh_request_headers, _oc_session_tag
+from app.services.opencode import _fresh_identity_headers, _fresh_request_headers, _oc_session_tag
 from app.services.relay import (
     _is_relay_timeout,
     _limit_stream_targets,
@@ -657,335 +659,395 @@ async def responses_stream_generator(
     # AUTO-HEAL encrypted_content: sekali per request, kembali ke target 0.
     healed_once = False
     heal_restart = False
+    # Pelacakan upaya terakhir fresh-session (lihat stream_generator chat
+    # untuk rationale lengkap): hanya bila SETIAP kegagalan adalah 403
+    # pra-byte-pertama dan TIDAK ADA kegagalan lain.
+    forbidden_count = 0
+    saw_non_403_failure = False
+    fresh_session_retry_done = False
     _log("RESP", f"REQ model={client_model} stream_keys={sorted(payload.keys())} {_oc_session_tag(opencode_headers)}")
 
     try:
-        target_index = 0
-        while target_index < len(targets):
-            target_url, headers = targets[target_index]
-            is_relay = "x-relay-target" in headers
-            if vision_direct_first and is_relay and not last_rate_limited:
-                # Relay vision hanya untuk 429 direct; kegagalan lain
-                # selesai di direct (last_error sudah terisi).
-                break
-            # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
-            headers = _fresh_request_headers(headers)
-            _log(
-                "RESP",
-                f"ATTEMPT {target_index + 1}/{len(targets)} "
-                f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}",
-            )
-            try:
-                client = _get_http()
-                async with client.stream(
-                    "POST", target_url, json=payload, headers=headers
-                ) as response:
-                    if response.status_code != 200:
-                        try:
-                            body = await response.aread()
-                            detail = body.decode("utf-8", errors="replace")[:500]
-                        except Exception:  # noqa: BLE001
-                            detail = ""
-                        # AUTO-HEAL: penolakan replay encrypted_content tidak
-                        # akan sembuh dengan rotasi target (payload sama, semua
-                        # target menolak). Buang item reasoning replay lalu
-                        # mulai lagi dari target pertama, SEKALI per request.
-                        if (
-                            response.status_code == 400
-                            and not sent_first_byte
-                            and not healed_once
-                            and _is_encrypted_content_rejection(detail)
-                            and _payload_has_replay_reasoning(payload)
-                        ):
-                            payload, removed = _strip_replayed_reasoning(payload)
-                            if removed:
-                                healed_once = True
-                                last_error = (
-                                    f"Upstream responded with {response.status_code}: {detail}"
-                                )
+        # Fase luar (while True) hanya berputar SEKALI ekstra: fase
+        # fresh-session sebagai upaya terakhir all-403 (lihat bawah).
+        while True:
+            target_index = 0
+            while target_index < len(targets):
+                target_url, headers = targets[target_index]
+                is_relay = "x-relay-target" in headers
+                if vision_direct_first and is_relay and not last_rate_limited:
+                    # Relay vision hanya untuk 429 direct; kegagalan lain
+                    # selesai di direct (last_error sudah terisi).
+                    break
+                # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
+                headers = _fresh_request_headers(headers)
+                _log(
+                    "RESP",
+                    f"ATTEMPT {target_index + 1}/{len(targets)} "
+                    f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}",
+                )
+                try:
+                    client = _get_http()
+                    async with client.stream(
+                        "POST", target_url, json=payload, headers=headers
+                    ) as response:
+                        if response.status_code != 200:
+                            try:
+                                body = await response.aread()
+                                detail = body.decode("utf-8", errors="replace")[:500]
+                            except Exception:  # noqa: BLE001
+                                detail = ""
+                            # AUTO-HEAL: penolakan replay encrypted_content tidak
+                            # akan sembuh dengan rotasi target (payload sama, semua
+                            # target menolak). Buang item reasoning replay lalu
+                            # mulai lagi dari target pertama, SEKALI per request.
+                            if (
+                                response.status_code == 400
+                                and not sent_first_byte
+                                and not healed_once
+                                and _is_encrypted_content_rejection(detail)
+                                and _payload_has_replay_reasoning(payload)
+                            ):
+                                payload, removed = _strip_replayed_reasoning(payload)
+                                if removed:
+                                    healed_once = True
+                                    last_error = (
+                                        f"Upstream responded with {response.status_code}: {detail}"
+                                    )
+                                    _log(
+                                        "RESP",
+                                        f"HEAL {target_url} | encrypted_content ditolak "
+                                        f"-> buang {removed} item reasoning replay, "
+                                        f"retry dari target pertama",
+                                    )
+                                    target_index = 0
+                                    continue
+                            if is_relay and _is_relay_timeout(response):
+                                # Konteks raksasa -> 504 Edge wajar (TTFB>25s),
+                                # jangan tandai relay sehat sebagai broken.
+                                if _should_mark_stream_broken(target_url, payload):
+                                    _mark_relay_stream_broken(
+                                        target_url,
+                                        time.time() + RELAY_STREAM_BROKEN_COOLDOWN,
+                                    )
+                                last_error = f"Relay stream timeout (504): {detail[:200]}"
+                                saw_non_403_failure = True
+                                target_index += 1
                                 _log(
                                     "RESP",
-                                    f"HEAL {target_url} | encrypted_content ditolak "
-                                    f"-> buang {removed} item reasoning replay, "
-                                    f"retry dari target pertama",
+                                    f"STREAM-TIMEOUT {target_url} | Vercel kill 504 "
+                                    f"(limit eksekusi ~25s, bukan bug proxy) -> relay "
+                                    f"di-skip streaming {RELAY_STREAM_BROKEN_COOLDOWN:.0f}s, "
+                                    f"lanjut ke target berikutnya/direct",
                                 )
-                                target_index = 0
                                 continue
-                        if is_relay and _is_relay_timeout(response):
-                            # Konteks raksasa -> 504 Edge wajar (TTFB>25s),
-                            # jangan tandai relay sehat sebagai broken.
-                            if _should_mark_stream_broken(target_url, payload):
-                                _mark_relay_stream_broken(
-                                    target_url,
-                                    time.time() + RELAY_STREAM_BROKEN_COOLDOWN,
+                            if response.status_code == 429 and not sent_first_byte:
+                                # PENGECUALIAN bug spam-429 muse-spark: retry 1x
+                                # same-route dulu sebelum rotasi/cooldown.
+                                if _should_retry_same_route_429(client_model) and target_url not in spurious_429_retried:
+                                    spurious_429_retried.add(target_url)
+                                    _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
+                                    _log(
+                                        "RESP",
+                                        f"SPURIOUS-429 {target_url} | retry same-route 1x "
+                                        f"in {_delay:.1f}s sebelum ganti route",
+                                    )
+                                    await asyncio.sleep(_delay)
+                                    continue  # ulangi target_index yang sama
+                                rate_cls = _classify_rate_limit(response)
+                                last_retry_after = _retry_after_seconds(
+                                    response, RATE_LIMIT_BACKOFF
                                 )
-                            last_error = f"Relay stream timeout (504): {detail[:200]}"
-                            target_index += 1
-                            _log(
-                                "RESP",
-                                f"STREAM-TIMEOUT {target_url} | Vercel kill 504 "
-                                f"(limit eksekusi ~25s, bukan bug proxy) -> relay "
-                                f"di-skip streaming {RELAY_STREAM_BROKEN_COOLDOWN:.0f}s, "
-                                f"lanjut ke target berikutnya/direct",
-                            )
-                            continue
-                        if response.status_code == 429 and not sent_first_byte:
-                            # PENGECUALIAN bug spam-429 muse-spark: retry 1x
-                            # same-route dulu sebelum rotasi/cooldown.
-                            if _should_retry_same_route_429(client_model) and target_url not in spurious_429_retried:
-                                spurious_429_retried.add(target_url)
-                                _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
+                                _mark_relay_rate_limited(
+                                    target_url,
+                                    time.time() + _relay_cooldown_seconds(response),
+                                )
+                                last_error = f"Rate limited (429): {detail}"
+                                last_rate_limited = True
+                                saw_non_403_failure = True
                                 _log(
                                     "RESP",
-                                    f"SPURIOUS-429 {target_url} | retry same-route 1x "
-                                    f"in {_delay:.1f}s sebelum ganti route",
+                                    f"RATE-LIMITED {target_url} | "
+                                    f"{rate_cls['description']} | detail={detail[:300]!r}",
                                 )
-                                await asyncio.sleep(_delay)
-                                continue  # ulangi target_index yang sama
-                            rate_cls = _classify_rate_limit(response)
-                            last_retry_after = _retry_after_seconds(
-                                response, RATE_LIMIT_BACKOFF
+                                target_index += 1
+                                continue
+                            last_error = (
+                                f"Upstream responded with {response.status_code}: {detail}"
                             )
-                            _mark_relay_rate_limited(
-                                target_url,
-                                time.time() + _relay_cooldown_seconds(response),
-                            )
-                            last_error = f"Rate limited (429): {detail}"
-                            last_rate_limited = True
-                            _log(
-                                "RESP",
-                                f"RATE-LIMITED {target_url} | "
-                                f"{rate_cls['description']} | detail={detail[:300]!r}",
-                            )
+                            last_rate_limited = response.status_code == 429
+                            if response.status_code == 403:
+                                # Dihitung untuk relay MAUPUN direct (lihat
+                                # stream_generator: 403 direct = kandidat
+                                # fresh-session retry).
+                                forbidden_count += 1
+                            else:
+                                saw_non_403_failure = True
+                            if response.status_code == 403 and is_relay and not sent_first_byte:
+                                _mark_relay_forbidden(
+                                    target_url,
+                                    time.time() + RELAY_403_COOLDOWN,
+                                )
+                                _log(
+                                    "RESP",
+                                    f"FORBIDDEN {target_url} | upstream 403 "
+                                    f"(IP relay di-flag, bukan salah fingerprint) "
+                                    f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s",
+                                )
                             target_index += 1
-                            continue
-                        last_error = (
-                            f"Upstream responded with {response.status_code}: {detail}"
-                        )
-                        last_rate_limited = response.status_code == 429
-                        if response.status_code == 403 and is_relay and not sent_first_byte:
-                            _mark_relay_forbidden(
-                                target_url,
-                                time.time() + RELAY_403_COOLDOWN,
-                            )
                             _log(
                                 "RESP",
-                                f"FORBIDDEN {target_url} | upstream 403 "
-                                f"(IP relay di-flag, bukan salah fingerprint) "
-                                f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s",
+                                f"FAIL {target_url} | upstream-status={response.status_code} "
+                                f"detail={detail[:300]!r}",
                             )
-                        target_index += 1
-                        _log(
-                            "RESP",
-                            f"FAIL {target_url} | upstream-status={response.status_code} "
-                            f"detail={detail[:300]!r}",
-                        )
+                            continue
+
+                        _log("RESP", f"OK {target_url}")
+                        relay_target_failed = False
+                        line_iter = response.aiter_lines()
+                        pending_line_task: Optional[asyncio.Task[str]] = None
+                        last_activity_at = time.time()
+                        try:
+                            while True:
+                                # Samakan dengan bridge (BRIDGE_REQUEST_TIMEOUT):
+                                # endpoint Responses melayani model yang sama dengan
+                                # TTFB wajar 120-300 dtk pada konteks panjang.
+                                # REQUEST_TIMEOUT global (120s) membunuh stream sehat.
+                                idle_seconds = time.time() - last_activity_at
+                                if idle_seconds > BRIDGE_REQUEST_TIMEOUT:
+                                    raise asyncio.TimeoutError(
+                                        f"No upstream progress for {int(idle_seconds)}s"
+                                        f" (idle timeout {BRIDGE_REQUEST_TIMEOUT:.0f}s)"
+                                    )
+                                if pending_line_task is None:
+                                    pending_line_task = asyncio.create_task(
+                                        line_iter.__anext__()
+                                    )
+                                done, _ = await asyncio.wait(
+                                    (pending_line_task,),
+                                    timeout=min(
+                                        SSE_KEEPALIVE_INTERVAL,
+                                        max(0.0, BRIDGE_REQUEST_TIMEOUT - idle_seconds),
+                                    ),
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                if not done:
+                                    yield ":\n\n"
+                                    continue
+                                try:
+                                    line = pending_line_task.result()
+                                except StopAsyncIteration:
+                                    stream_completed = True
+                                    break
+                                finally:
+                                    pending_line_task = None
+
+                                if not line:
+                                    yield "\n"
+                                    continue
+                                if line.startswith(":"):
+                                    yield f"{line}\n\n"
+                                    continue
+                                if not line.startswith("data:"):
+                                    continue
+                                data = line[5:].lstrip()
+                                wire_bytes += len(data)
+                                last_activity_at = time.time()
+                                if data == "[DONE]":
+                                    sent_first_byte = True
+                                    stream_completed = True
+                                    break
+                                # Relay early-SSE: fetch upstream gagal dilaporkan
+                                # sebagai event (HTTP sudah 200). Cegat SEBELUM
+                                # menandai sent_first_byte agar failover ke target
+                                # berikutnya tetap jalan.
+                                if '"relay.error"' in data and not sent_first_byte:
+                                    try:
+                                        _err_obj = json.loads(data)
+                                    except (ValueError, TypeError):
+                                        _err_obj = None
+                                    if isinstance(_err_obj, dict) and _err_obj.get("type") == "relay.error":
+                                        _relay_status = _err_obj.get("status")
+                                        _relay_body = str(_err_obj.get("body") or "")[:300]
+                                        if _relay_status == 429:
+                                            last_retry_after = RATE_LIMIT_BACKOFF
+                                            last_rate_limited = True
+                                            saw_non_403_failure = True
+                                            _mark_relay_rate_limited(
+                                                target_url,
+                                                time.time() + RATE_LIMIT_COOLDOWN,
+                                            )
+                                        elif _relay_status == 403:
+                                            last_rate_limited = False
+                                            forbidden_count += 1
+                                            _mark_relay_forbidden(
+                                                target_url,
+                                                time.time() + RELAY_403_COOLDOWN,
+                                            )
+                                        else:
+                                            last_rate_limited = _relay_status == 429
+                                            saw_non_403_failure = True
+                                        last_error = f"Relay error {_relay_status}: {_relay_body}"
+                                        # AUTO-HEAL encrypted_content lewat relay
+                                        # early-SSE (HTTP 200 + event relay.error):
+                                        # buang reasoning replay, mulai dari target 0.
+                                    if (
+                                        _relay_status == 400
+                                        and not healed_once
+                                        and _is_encrypted_content_rejection(_relay_body)
+                                        and _payload_has_replay_reasoning(payload)
+                                    ):
+                                        _stripped, removed = _strip_replayed_reasoning(payload)
+                                        if removed:
+                                            payload = _stripped
+                                            healed_once = True
+                                            heal_restart = True
+                                            relay_target_failed = True
+                                            _log(
+                                                "RESP",
+                                                f"HEAL {target_url} | encrypted_content "
+                                                f"ditolak (relay.error) -> buang {removed} "
+                                                f"item reasoning replay, retry dari target "
+                                                f"pertama",
+                                            )
+                                            break
+                                    relay_target_failed = True
+                                    _log(
+                                        "RESP",
+                                        f"RELAY-ERROR {target_url} | status="
+                                        f"{_relay_status} detail={_relay_body!r} "
+                                        f"-> target berikutnya",
+                                    )
+                                    break
+                                sent_first_byte = True
+                                # Best-effort: intip usage tanpa mengganggu aliran.
+                                if '"usage"' in data:
+                                    try:
+                                        parsed_line = json.loads(data)
+                                    except (ValueError, TypeError):
+                                        parsed_line = None
+                                    found = _extract_responses_usage(parsed_line)
+                                    if found:
+                                        last_usage = found
+                                    else:
+                                        # Event response.completed membawa respons
+                                        # penuh di .response — intip satu level.
+                                        try:
+                                            inner = (
+                                                parsed_line.get("response")
+                                                if isinstance(parsed_line, dict)
+                                                else None
+                                            )
+                                            found = _extract_responses_usage(
+                                                {"usage": inner.get("usage")}
+                                                if isinstance(inner, dict)
+                                                else None
+                                            )
+                                            if found:
+                                                last_usage = found
+                                        except (AttributeError, TypeError):
+                                            pass
+                                data_events += 1
+                                yield f"data: {data}\n\n"
+                        finally:
+                            if pending_line_task is not None:
+                                pending_line_task.cancel()
+                                with suppress(asyncio.CancelledError, Exception):
+                                    await pending_line_task
+
+                    if relay_target_failed:
+                        if heal_restart:
+                            # Auto-heal: ulangi dari target pertama dengan payload
+                            # yang sudah dibersihkan (bukan maju ke target berikut).
+                            heal_restart = False
+                            target_index = 0
+                        else:
+                            target_index += 1
                         continue
 
-                    _log("RESP", f"OK {target_url}")
-                    relay_target_failed = False
-                    line_iter = response.aiter_lines()
-                    pending_line_task: Optional[asyncio.Task[str]] = None
-                    last_activity_at = time.time()
-                    try:
-                        while True:
-                            # Samakan dengan bridge (BRIDGE_REQUEST_TIMEOUT):
-                            # endpoint Responses melayani model yang sama dengan
-                            # TTFB wajar 120-300 dtk pada konteks panjang.
-                            # REQUEST_TIMEOUT global (120s) membunuh stream sehat.
-                            idle_seconds = time.time() - last_activity_at
-                            if idle_seconds > BRIDGE_REQUEST_TIMEOUT:
-                                raise asyncio.TimeoutError(
-                                    f"No upstream progress for {int(idle_seconds)}s"
-                                    f" (idle timeout {BRIDGE_REQUEST_TIMEOUT:.0f}s)"
-                                )
-                            if pending_line_task is None:
-                                pending_line_task = asyncio.create_task(
-                                    line_iter.__anext__()
-                                )
-                            done, _ = await asyncio.wait(
-                                (pending_line_task,),
-                                timeout=min(
-                                    SSE_KEEPALIVE_INTERVAL,
-                                    max(0.0, BRIDGE_REQUEST_TIMEOUT - idle_seconds),
-                                ),
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
-                            if not done:
-                                yield ":\n\n"
-                                continue
+                    stream_completed = True
+                    break
+
+                except (
+                    httpx.TimeoutException,
+                    httpx.ConnectError,
+                    httpx.ReadError,
+                    httpx.RemoteProtocolError,
+                ) as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    saw_non_403_failure = True
+                    _log("RESP", f"FAIL {target_url} ({type(exc).__name__})")
+                    if sent_first_byte:
+                        if last_usage:
                             try:
-                                line = pending_line_task.result()
-                            except StopAsyncIteration:
-                                stream_completed = True
-                                break
-                            finally:
-                                pending_line_task = None
-
-                            if not line:
-                                yield "\n"
-                                continue
-                            if line.startswith(":"):
-                                yield f"{line}\n\n"
-                                continue
-                            if not line.startswith("data:"):
-                                continue
-                            data = line[5:].lstrip()
-                            wire_bytes += len(data)
-                            last_activity_at = time.time()
-                            if data == "[DONE]":
-                                sent_first_byte = True
-                                stream_completed = True
-                                break
-                            # Relay early-SSE: fetch upstream gagal dilaporkan
-                            # sebagai event (HTTP sudah 200). Cegat SEBELUM
-                            # menandai sent_first_byte agar failover ke target
-                            # berikutnya tetap jalan.
-                            if '"relay.error"' in data and not sent_first_byte:
-                                try:
-                                    _err_obj = json.loads(data)
-                                except (ValueError, TypeError):
-                                    _err_obj = None
-                                if isinstance(_err_obj, dict) and _err_obj.get("type") == "relay.error":
-                                    _relay_status = _err_obj.get("status")
-                                    _relay_body = str(_err_obj.get("body") or "")[:300]
-                                    if _relay_status == 429:
-                                        last_retry_after = RATE_LIMIT_BACKOFF
-                                        last_rate_limited = True
-                                        _mark_relay_rate_limited(
-                                            target_url,
-                                            time.time() + RATE_LIMIT_COOLDOWN,
-                                        )
-                                    elif _relay_status == 403:
-                                        last_rate_limited = False
-                                        _mark_relay_forbidden(
-                                            target_url,
-                                            time.time() + RELAY_403_COOLDOWN,
-                                        )
-                                    else:
-                                        last_rate_limited = _relay_status == 429
-                                    last_error = f"Relay error {_relay_status}: {_relay_body}"
-                                    # AUTO-HEAL encrypted_content lewat relay
-                                    # early-SSE (HTTP 200 + event relay.error):
-                                    # buang reasoning replay, mulai dari target 0.
-                                if (
-                                    _relay_status == 400
-                                    and not healed_once
-                                    and _is_encrypted_content_rejection(_relay_body)
-                                    and _payload_has_replay_reasoning(payload)
-                                ):
-                                    _stripped, removed = _strip_replayed_reasoning(payload)
-                                    if removed:
-                                        payload = _stripped
-                                        healed_once = True
-                                        heal_restart = True
-                                        relay_target_failed = True
-                                        _log(
-                                            "RESP",
-                                            f"HEAL {target_url} | encrypted_content "
-                                            f"ditolak (relay.error) -> buang {removed} "
-                                            f"item reasoning replay, retry dari target "
-                                            f"pertama",
-                                        )
-                                        break
-                                relay_target_failed = True
-                                _log(
-                                    "RESP",
-                                    f"RELAY-ERROR {target_url} | status="
-                                    f"{_relay_status} detail={_relay_body!r} "
-                                    f"-> target berikutnya",
-                                )
-                                break
-                            sent_first_byte = True
-                            # Best-effort: intip usage tanpa mengganggu aliran.
-                            if '"usage"' in data:
-                                try:
-                                    parsed_line = json.loads(data)
-                                except (ValueError, TypeError):
-                                    parsed_line = None
-                                found = _extract_responses_usage(parsed_line)
-                                if found:
-                                    last_usage = found
-                                else:
-                                    # Event response.completed membawa respons
-                                    # penuh di .response — intip satu level.
-                                    try:
-                                        inner = (
-                                            parsed_line.get("response")
-                                            if isinstance(parsed_line, dict)
-                                            else None
-                                        )
-                                        found = _extract_responses_usage(
-                                            {"usage": inner.get("usage")}
-                                            if isinstance(inner, dict)
-                                            else None
-                                        )
-                                        if found:
-                                            last_usage = found
-                                    except (AttributeError, TypeError):
-                                        pass
-                            data_events += 1
-                            yield f"data: {data}\n\n"
-                    finally:
-                        if pending_line_task is not None:
-                            pending_line_task.cancel()
-                            with suppress(asyncio.CancelledError, Exception):
-                                await pending_line_task
-
-                if relay_target_failed:
-                    if heal_restart:
-                        # Auto-heal: ulangi dari target pertama dengan payload
-                        # yang sudah dibersihkan (bukan maju ke target berikut).
-                        heal_restart = False
-                        target_index = 0
-                    else:
-                        target_index += 1
+                                _lost_duration = int((time.time() - stream_start) * 1000)
+                            except (TypeError, ValueError):
+                                _lost_duration = 0
+                            background_tasks.add_task(
+                                _safe_record,
+                                request_id=str(response_id),
+                                model=client_model,
+                                prompt_tokens=last_usage.get("prompt_tokens", 0),
+                                completion_tokens=last_usage.get("completion_tokens", 0),
+                                total_tokens=last_usage.get("total_tokens", 0),
+                                duration_ms=max(0, _lost_duration),
+                            )
+                        log_summary("lost")
+                        try:
+                            yield _sse(
+                                {
+                                    "error": {
+                                        "message": "Stream connection lost",
+                                        "detail": str(exc),
+                                    }
+                                }
+                            )
+                            yield "data: [DONE]\n\n"
+                        except (GeneratorExit, asyncio.CancelledError):
+                            raise
+                        except Exception:
+                            pass
+                        return
+                    target_index += 1
                     continue
 
-                stream_completed = True
+            if stream_completed:
                 break
-
-            except (
-                httpx.TimeoutException,
-                httpx.ConnectError,
-                httpx.ReadError,
-                httpx.RemoteProtocolError,
-            ) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                _log("RESP", f"FAIL {target_url} ({type(exc).__name__})")
-                if sent_first_byte:
-                    if last_usage:
-                        try:
-                            _lost_duration = int((time.time() - stream_start) * 1000)
-                        except (TypeError, ValueError):
-                            _lost_duration = 0
-                        background_tasks.add_task(
-                            _safe_record,
-                            request_id=str(response_id),
-                            model=client_model,
-                            prompt_tokens=last_usage.get("prompt_tokens", 0),
-                            completion_tokens=last_usage.get("completion_tokens", 0),
-                            total_tokens=last_usage.get("total_tokens", 0),
-                            duration_ms=max(0, _lost_duration),
-                        )
-                    log_summary("lost")
-                    try:
-                        yield _sse(
-                            {
-                                "error": {
-                                    "message": "Stream connection lost",
-                                    "detail": str(exc),
-                                }
-                            }
-                        )
-                        yield "data: [DONE]\n\n"
-                    except (GeneratorExit, asyncio.CancelledError):
-                        raise
-                    except Exception:
-                        pass
-                    return
-                target_index += 1
-                continue
+            if (
+                not FORBIDDEN_FRESH_SESSION_RETRY
+                or fresh_session_retry_done
+                or not targets
+                or sent_first_byte
+                or saw_non_403_failure
+                or forbidden_count == 0
+                # Identitas WAJIB stabil bila payload membawa replay
+                # reasoning encrypted_content (di-issuance ke caller
+                # pertama); sesi baru justru menjamin 400 caller-mismatch.
+                or _payload_has_replay_reasoning(payload)
+            ):
+                break
+            # Upaya terakhir all-403 (termasuk direct): identitas lama yang
+            # di-flag. Satu percobaan ke target TERAKHIR dengan session +
+            # request baru (lihat stream_generator untuk rationale penuh).
+            fresh_session_retry_done = True
+            retry_url, retry_headers = targets[-1]
+            old_tag = _oc_session_tag(opencode_headers)
+            base_headers = _fresh_identity_headers(retry_headers)
+            targets = [(retry_url, dict(base_headers))]
+            forbidden_count = 0
+            saw_non_403_failure = False
+            last_error = None
+            last_rate_limited = False
+            last_retry_after = None
+            spurious_429_retried = set()
+            _log(
+                "RESP",
+                f"FRESH-SESSION-RETRY model={client_model} target={retry_url} "
+                f"{old_tag} -> {_oc_session_tag(base_headers)} "
+                f"(semua target 403 pra-byte, delay {FORBIDDEN_RETRY_DELAY:.1f}s)",
+            )
+            await asyncio.sleep(FORBIDDEN_RETRY_DELAY)
+            continue
 
         if not stream_completed:
             log_summary("all-failed")
@@ -1178,329 +1240,163 @@ async def responses_to_chat_stream_generator(
     # AUTO-HEAL encrypted_content: sekali per request, kembali ke target 0.
     healed_once = False
     heal_restart = False
+    # Pelacakan upaya terakhir fresh-session (sama seperti generator lain):
+    # hanya bila SETIAP kegagalan adalah 403 pra-payload dan TIDAK ADA
+    # kegagalan lain. Dilewati bila payload membawa replay reasoning
+    # (identitas wajib stabil) — lihat blok fase di bawah.
+    forbidden_count = 0
+    saw_non_403_failure = False
+    fresh_session_retry_done = False
     _log("RESP", f"CHAT-BRIDGE-STREAM model={client_model} keys={sorted(payload.keys())} {_oc_session_tag(opencode_headers)}")
 
 
     try:
-        target_index = 0
-        while target_index < len(targets):
-            target_url, headers = targets[target_index]
-            is_relay = "x-relay-target" in headers
-            if vision_direct_first and is_relay and not last_rate_limited:
-                # Relay vision hanya untuk 429 direct; kegagalan lain
-                # selesai di direct (last_error sudah terisi).
-                break
-            # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
-            headers = _fresh_request_headers(headers)
-            _log(
-                "RESP",
-                f"ATTEMPT {target_index + 1}/{len(targets)} "
-                f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}",
-            )
-            try:
-                termination_seen = False
-                relay_target_failed = False
-                client = _get_http()
-                # Konteks panjang butuh TTFB lama: read-timeout per-request
-                # BRIDGE_REQUEST_TIMEOUT (bukan global 120s). Heartbeat relay
-                # 10 detik menjaga wire tetap aktif, jadi read-timeout hanya
-                # menembak bila stream benar-benar macet.
-                _bridge_timeout = httpx.Timeout(
-                    connect=10.0,
-                    read=BRIDGE_REQUEST_TIMEOUT,
-                    write=10.0,
-                    pool=10.0,
+        # Fase luar (while True) hanya berputar SEKALI ekstra: fase
+        # fresh-session sebagai upaya terakhir all-403 (lihat bawah).
+        while True:
+            target_index = 0
+            while target_index < len(targets):
+                target_url, headers = targets[target_index]
+                is_relay = "x-relay-target" in headers
+                if vision_direct_first and is_relay and not last_rate_limited:
+                    # Relay vision hanya untuk 429 direct; kegagalan lain
+                    # selesai di direct (last_error sudah terisi).
+                    break
+                # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
+                headers = _fresh_request_headers(headers)
+                _log(
+                    "RESP",
+                    f"ATTEMPT {target_index + 1}/{len(targets)} "
+                    f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}",
                 )
-                async with client.stream(
-                    "POST", target_url, json=payload, headers=headers,
-                    timeout=_bridge_timeout,
-                ) as response:
-                    if response.status_code != 200:
-                        try:
-                            body = await response.aread()
-                            detail = body.decode("utf-8", errors="replace")[:500]
-                        except Exception:  # noqa: BLE001
-                            detail = ""
-                        if is_relay and _is_relay_timeout(response):
-                            # Konteks raksasa -> 504 Edge wajar (TTFB>25s),
-                            # jangan tandai relay sehat sebagai broken.
-                            if _should_mark_stream_broken(target_url, payload):
-                                _mark_relay_stream_broken(
-                                    target_url,
-                                    time.time() + RELAY_STREAM_BROKEN_COOLDOWN,
-                                )
-                            last_error = f"Relay stream timeout (504): {detail[:200]}"
-                            target_index += 1
-                            _log(
-                                "RESP",
-                                f"STREAM-TIMEOUT {target_url} | Vercel kill 504 "
-                                f"(limit eksekusi ~25s, bukan bug proxy) -> relay "
-                                f"di-skip streaming {RELAY_STREAM_BROKEN_COOLDOWN:.0f}s, "
-                                f"lanjut ke target berikutnya/direct",
-                            )
-                            continue
-                        if response.status_code == 429 and not sent_payload:
-                            # PENGECUALIAN bug spam-429 muse-spark: retry 1x
-                            # same-route dulu sebelum rotasi/cooldown.
-                            if _should_retry_same_route_429(client_model) and target_url not in spurious_429_retried:
-                                spurious_429_retried.add(target_url)
-                                _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
+                try:
+                    termination_seen = False
+                    relay_target_failed = False
+                    client = _get_http()
+                    # Konteks panjang butuh TTFB lama: read-timeout per-request
+                    # BRIDGE_REQUEST_TIMEOUT (bukan global 120s). Heartbeat relay
+                    # 10 detik menjaga wire tetap aktif, jadi read-timeout hanya
+                    # menembak bila stream benar-benar macet.
+                    _bridge_timeout = httpx.Timeout(
+                        connect=10.0,
+                        read=BRIDGE_REQUEST_TIMEOUT,
+                        write=10.0,
+                        pool=10.0,
+                    )
+                    async with client.stream(
+                        "POST", target_url, json=payload, headers=headers,
+                        timeout=_bridge_timeout,
+                    ) as response:
+                        if response.status_code != 200:
+                            try:
+                                body = await response.aread()
+                                detail = body.decode("utf-8", errors="replace")[:500]
+                            except Exception:  # noqa: BLE001
+                                detail = ""
+                            if is_relay and _is_relay_timeout(response):
+                                # Konteks raksasa -> 504 Edge wajar (TTFB>25s),
+                                # jangan tandai relay sehat sebagai broken.
+                                if _should_mark_stream_broken(target_url, payload):
+                                    _mark_relay_stream_broken(
+                                        target_url,
+                                        time.time() + RELAY_STREAM_BROKEN_COOLDOWN,
+                                    )
+                                last_error = f"Relay stream timeout (504): {detail[:200]}"
+                                saw_non_403_failure = True
+                                target_index += 1
                                 _log(
                                     "RESP",
-                                    f"SPURIOUS-429 {target_url} | retry same-route 1x "
-                                    f"in {_delay:.1f}s sebelum ganti route",
+                                    f"STREAM-TIMEOUT {target_url} | Vercel kill 504 "
+                                    f"(limit eksekusi ~25s, bukan bug proxy) -> relay "
+                                    f"di-skip streaming {RELAY_STREAM_BROKEN_COOLDOWN:.0f}s, "
+                                    f"lanjut ke target berikutnya/direct",
                                 )
-                                await asyncio.sleep(_delay)
-                                continue  # ulangi target_index yang sama
-                            rate_cls = _classify_rate_limit(response)
-                            last_retry_after = _retry_after_seconds(
-                                response, RATE_LIMIT_BACKOFF
+                                continue
+                            if response.status_code == 429 and not sent_payload:
+                                # PENGECUALIAN bug spam-429 muse-spark: retry 1x
+                                # same-route dulu sebelum rotasi/cooldown.
+                                if _should_retry_same_route_429(client_model) and target_url not in spurious_429_retried:
+                                    spurious_429_retried.add(target_url)
+                                    _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
+                                    _log(
+                                        "RESP",
+                                        f"SPURIOUS-429 {target_url} | retry same-route 1x "
+                                        f"in {_delay:.1f}s sebelum ganti route",
+                                    )
+                                    await asyncio.sleep(_delay)
+                                    continue  # ulangi target_index yang sama
+                                rate_cls = _classify_rate_limit(response)
+                                last_retry_after = _retry_after_seconds(
+                                    response, RATE_LIMIT_BACKOFF
+                                )
+                                _mark_relay_rate_limited(
+                                    target_url,
+                                    time.time() + _relay_cooldown_seconds(response),
+                                )
+                                last_error = f"Rate limited (429): {detail}"
+                                last_rate_limited = True
+                                saw_non_403_failure = True
+                                _log(
+                                    "RESP",
+                                    f"RATE-LIMITED {target_url} | "
+                                    f"{rate_cls['description']} | detail={detail[:300]!r}",
+                                )
+                                target_index += 1
+                                continue
+                            last_error = (
+                                f"Upstream responded with {response.status_code}: {detail}"
                             )
-                            _mark_relay_rate_limited(
-                                target_url,
-                                time.time() + _relay_cooldown_seconds(response),
-                            )
-                            last_error = f"Rate limited (429): {detail}"
-                            last_rate_limited = True
-                            _log(
-                                "RESP",
-                                f"RATE-LIMITED {target_url} | "
-                                f"{rate_cls['description']} | detail={detail[:300]!r}",
-                            )
-                            target_index += 1
-                            continue
-                        last_error = (
-                            f"Upstream responded with {response.status_code}: {detail}"
-                        )
-                        last_rate_limited = response.status_code == 429
-                        if response.status_code == 403 and is_relay and not sent_payload:
-                            _mark_relay_forbidden(
-                                target_url,
-                                time.time() + RELAY_403_COOLDOWN,
-                            )
-                            _log(
-                                "RESP",
-                                f"FORBIDDEN {target_url} | upstream 403 "
-                                f"(IP relay di-flag, bukan salah fingerprint) "
-                                f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s",
-                            )
-                        target_index += 1
-                        _log(
-                            "RESP",
-                            f"FAIL {target_url} | upstream-status={response.status_code} "
-                            f"detail={detail[:300]!r}",
-                        )
-                        continue
-
-                    _log("RESP", f"OK {target_url} (bridge)")
-                    content_type = (response.headers.get("content-type") or "").lower()
-                    if "text/event-stream" not in content_type:
-                        # Relay/CDN men-buffer SSE menjadi SATU body JSON utuh
-                        # (content-type application/json). Jangan dilewatkan ke
-                        # loop baris — konversi langsung menjadi chunk chat.
-                        try:
-                            raw_body = await response.aread()
-                            # Catat byte agar SUMMARY tidak 0 (buffered JSON
-                            # bukan SSE baris-per-baris, tapi tetap sukses).
-                            wire_bytes += len(raw_body or b"")
-                            data_events += 1
-                            buffered = json.loads(raw_body.decode("utf-8"))
-                        except (ValueError, TypeError, UnicodeDecodeError):
-                            buffered = None
-                        if isinstance(buffered, dict) and (
-                            buffered.get("object") == "response"
-                            or "output" in buffered
-                        ):
-                            content_b, calls_b = _responses_output_to_chat(
-                                buffered.get("output")
-                            )
-                            found_b = _extract_responses_usage(buffered)
-                            if found_b:
-                                last_usage = found_b
-                            if content_b or calls_b:
-                                role = role_chunk()
-                                if role:
-                                    sent_payload = True
-                                    yield role
-                                sent_payload = True
-                                if first_content_at is None:
-                                    first_content_at = time.time()
-                                if content_b:
-                                    saw_text_content = True
-                                    yield chunk({"content": content_b})
-                                for idx_b, call_b in enumerate(calls_b):
-                                    call_b = dict(call_b)
-                                    call_b["index"] = idx_b
-                                    saw_tool_call = True
-                                    yield chunk({"tool_calls": [call_b]})
+                            last_rate_limited = response.status_code == 429
+                            if response.status_code == 403:
+                                # Dihitung relay+direct (kandidat fresh-session retry).
+                                forbidden_count += 1
                             else:
-                                reasoning_b = _extract_responses_reasoning_text(
+                                saw_non_403_failure = True
+                            if response.status_code == 403 and is_relay and not sent_payload:
+                                _mark_relay_forbidden(
+                                    target_url,
+                                    time.time() + RELAY_403_COOLDOWN,
+                                )
+                                _log(
+                                    "RESP",
+                                    f"FORBIDDEN {target_url} | upstream 403 "
+                                    f"(IP relay di-flag, bukan salah fingerprint) "
+                                    f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s",
+                                )
+                            target_index += 1
+                            _log(
+                                "RESP",
+                                f"FAIL {target_url} | upstream-status={response.status_code} "
+                                f"detail={detail[:300]!r}",
+                            )
+                            continue
+
+                        _log("RESP", f"OK {target_url} (bridge)")
+                        content_type = (response.headers.get("content-type") or "").lower()
+                        if "text/event-stream" not in content_type:
+                            # Relay/CDN men-buffer SSE menjadi SATU body JSON utuh
+                            # (content-type application/json). Jangan dilewatkan ke
+                            # loop baris — konversi langsung menjadi chunk chat.
+                            try:
+                                raw_body = await response.aread()
+                                # Catat byte agar SUMMARY tidak 0 (buffered JSON
+                                # bukan SSE baris-per-baris, tapi tetap sukses).
+                                wire_bytes += len(raw_body or b"")
+                                data_events += 1
+                                buffered = json.loads(raw_body.decode("utf-8"))
+                            except (ValueError, TypeError, UnicodeDecodeError):
+                                buffered = None
+                            if isinstance(buffered, dict) and (
+                                buffered.get("object") == "response"
+                                or "output" in buffered
+                            ):
+                                content_b, calls_b = _responses_output_to_chat(
                                     buffered.get("output")
                                 )
-                                if reasoning_b and REASONING_FORWARD:
-                                    now_b = time.time()
-                                    reasoning_events += 1
-                                    reasoning_chars += len(reasoning_b)
-                                    reasoning_buffer.append(reasoning_b[:20000])
-                                    reasoning_buffer_chars += min(len(reasoning_b), 20000)
-                                    if first_reasoning_at is None:
-                                        first_reasoning_at = now_b
-                                    last_reasoning_at = now_b
-                                    role = role_chunk()
-                                    if role:
-                                        sent_payload = True
-                                        yield role
-                                    sent_payload = True
-                                    yield chunk(
-                                        {"reasoning_content": reasoning_b[:20000]}
-                                    )
-                            termination_seen = True
-                            stream_completed = True
-                            break
-                        last_error = (
-                            "Upstream returned "
-                            f"{content_type or 'unknown content-type'} instead of SSE: "
-                            f"{(raw_body[:200] if 'raw_body' in dir() else b'').decode('utf-8', errors='replace')}"
-                        )
-                        target_index += 1
-                        _log("RESP", f"FAIL {target_url} | {last_error[:300]}")
-                        continue
-                    line_iter = response.aiter_lines()
-                    pending_line_task: Optional[asyncio.Task[str]] = None
-                    last_activity_at = time.time()
-                    try:
-                        while True:
-                            idle_seconds = time.time() - last_activity_at
-                            # Bridge memakai BRIDGE_REQUEST_TIMEOUT (konteks
-                            # panjang = TTFB wajar 120-300s), bukan global 120s.
-                            if idle_seconds > BRIDGE_REQUEST_TIMEOUT:
-                                raise asyncio.TimeoutError(
-                                    f"No upstream progress for {int(idle_seconds)}s"
-                                    f" (idle timeout {BRIDGE_REQUEST_TIMEOUT:.0f}s)"
-                                )
-                            if pending_line_task is None:
-                                pending_line_task = asyncio.create_task(
-                                    line_iter.__anext__()
-                                )
-                            done, _ = await asyncio.wait(
-                                (pending_line_task,),
-                                timeout=min(
-                                    SSE_KEEPALIVE_INTERVAL,
-                                    max(0.0, BRIDGE_REQUEST_TIMEOUT - idle_seconds),
-                                ),
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
-                            if not done:
-                                yield ":\n\n"
-                                continue
-                            try:
-                                line = pending_line_task.result()
-                            except StopAsyncIteration:
-                                stream_completed = True
-                                break
-                            finally:
-                                pending_line_task = None
-
-                            if not line:
-                                continue
-                            if line.startswith(":"):
-                                continue
-                            if line.startswith("data:"):
-                                data = line[5:].lstrip()
-                            else:
-                                # Toleransi: sebagian relay/middlebox mengirim
-                                # event Responses sebagai baris JSON telanjang
-                                # (tanpa prefix "data:"). Terima bila bentuknya
-                                # event Responses, abaikan selain itu.
-                                try:
-                                    probe = json.loads(line)
-                                except (ValueError, TypeError):
-                                    continue
-                                if not isinstance(probe, dict) or not str(
-                                    probe.get("type", "")
-                                ).startswith("response."):
-                                    if len(raw_preview) < 5:
-                                        raw_preview.append(line[:200])
-                                    continue
-                                data = line
-                            wire_bytes += len(data)
-                            last_activity_at = time.time()
-                            if data == "[DONE]":
-                                termination_seen = True
-                                stream_completed = True
-                                break
-                            try:
-                                event = json.loads(data)
-                            except (ValueError, TypeError):
-                                continue
-                            if not isinstance(event, dict):
-                                continue
-                            # Relay early-SSE: fetch upstream gagal dilaporkan
-                            # sebagai event (HTTP sudah 200). Cegat SEBELUM
-                            # payload agar failover ke target berikutnya jalan.
-                            if event.get("type") == "relay.error" and not sent_payload:
-                                _relay_status = event.get("status")
-                                _relay_body = str(event.get("body") or "")[:300]
-                                if _relay_status == 429:
-                                    last_retry_after = RATE_LIMIT_BACKOFF
-                                    last_rate_limited = True
-                                    _mark_relay_rate_limited(
-                                        target_url,
-                                        time.time() + RATE_LIMIT_COOLDOWN,
-                                    )
-                                elif _relay_status == 403:
-                                    last_rate_limited = False
-                                    _mark_relay_forbidden(
-                                        target_url,
-                                        time.time() + RELAY_403_COOLDOWN,
-                                    )
-                                else:
-                                    last_rate_limited = _relay_status == 429
-                                last_error = f"Relay error {_relay_status}: {_relay_body}"
-                                # AUTO-HEAL encrypted_content lewat relay
-                                # early-SSE (HTTP 200 + event relay.error).
-                                if (
-                                    _relay_status == 400
-                                    and not healed_once
-                                    and _is_encrypted_content_rejection(_relay_body)
-                                    and _payload_has_replay_reasoning(payload)
-                                ):
-                                    _stripped, removed = _strip_replayed_reasoning(payload)
-                                    if removed:
-                                        payload = _stripped
-                                        healed_once = True
-                                        heal_restart = True
-                                        relay_target_failed = True
-                                        _log(
-                                            "RESP",
-                                            f"HEAL {target_url} | encrypted_content "
-                                            f"ditolak (relay.error bridge) -> buang "
-                                            f"{removed} item reasoning replay, retry "
-                                            f"dari target pertama",
-                                        )
-                                        break
-                                relay_target_failed = True
-                                _log(
-                                    "RESP",
-                                    f"RELAY-ERROR {target_url} | status="
-                                    f"{_relay_status} detail={_relay_body!r} "
-                                    f"-> target berikutnya",
-                                )
-                                break
-                            # Relay early-SSE membungkus respons buffered
-                            # (satu JSON utuh) sebagai satu event SSE —
-                            # konversi langsung seperti jalur buffered.
-                            if event.get("object") == "response" or (
-                                isinstance(event.get("output"), list)
-                                and not str(event.get("type", "")).startswith("response.")
-                            ):
-                                content_f, calls_f = _responses_output_to_chat(
-                                    event.get("output")
-                                )
-                                found_f = _extract_responses_usage(event)
-                                if found_f:
-                                    last_usage = found_f
-                                if content_f or calls_f:
+                                found_b = _extract_responses_usage(buffered)
+                                if found_b:
+                                    last_usage = found_b
+                                if content_b or calls_b:
                                     role = role_chunk()
                                     if role:
                                         sent_payload = True
@@ -1508,234 +1404,457 @@ async def responses_to_chat_stream_generator(
                                     sent_payload = True
                                     if first_content_at is None:
                                         first_content_at = time.time()
-                                    if content_f:
+                                    if content_b:
                                         saw_text_content = True
-                                        yield chunk({"content": content_f})
-                                    for idx_f, call_f in enumerate(calls_f):
-                                        call_f = dict(call_f)
-                                        call_f["index"] = idx_f
+                                        yield chunk({"content": content_b})
+                                    for idx_b, call_b in enumerate(calls_b):
+                                        call_b = dict(call_b)
+                                        call_b["index"] = idx_b
                                         saw_tool_call = True
-                                        yield chunk({"tool_calls": [call_f]})
+                                        yield chunk({"tool_calls": [call_b]})
                                 else:
-                                    # Full-object tanpa message/tool (mis. hanya
-                                    # reasoning): teruskan reasoning agar klien
-                                    # tidak menerima stream kosong.
-                                    reasoning_f = _extract_responses_reasoning_text(
-                                        event.get("output")
+                                    reasoning_b = _extract_responses_reasoning_text(
+                                        buffered.get("output")
                                     )
-                                    if reasoning_f and REASONING_FORWARD:
-                                        now_f = time.time()
+                                    if reasoning_b and REASONING_FORWARD:
+                                        now_b = time.time()
                                         reasoning_events += 1
-                                        reasoning_chars += len(reasoning_f)
-                                        # Hormati batas 20rb char seperti jalur delta
-                                        # (satu full-object bisa 20rb char per event).
-                                        if reasoning_buffer_chars < 20000:
-                                            reasoning_buffer.append(reasoning_f[:20000 - reasoning_buffer_chars])
-                                            reasoning_buffer_chars += min(len(reasoning_f), 20000 - reasoning_buffer_chars)
+                                        reasoning_chars += len(reasoning_b)
+                                        reasoning_buffer.append(reasoning_b[:20000])
+                                        reasoning_buffer_chars += min(len(reasoning_b), 20000)
                                         if first_reasoning_at is None:
-                                            first_reasoning_at = now_f
-                                            _log(
-                                                "RESP",
-                                                f"REASONING start +{now_f - stream_start:.2f}s (buffered)",
-                                            )
-                                        last_reasoning_at = now_f
+                                            first_reasoning_at = now_b
+                                        last_reasoning_at = now_b
                                         role = role_chunk()
                                         if role:
                                             sent_payload = True
                                             yield role
                                         sent_payload = True
                                         yield chunk(
-                                            {"reasoning_content": reasoning_f[:20000]}
+                                            {"reasoning_content": reasoning_b[:20000]}
                                         )
                                 termination_seen = True
                                 stream_completed = True
                                 break
-                            data_events += 1
-                            event_type = event.get("type", "")
+                            last_error = (
+                                "Upstream returned "
+                                f"{content_type or 'unknown content-type'} instead of SSE: "
+                                f"{(raw_body[:200] if 'raw_body' in dir() else b'').decode('utf-8', errors='replace')}"
+                            )
+                            target_index += 1
+                            _log("RESP", f"FAIL {target_url} | {last_error[:300]}")
+                            continue
+                        line_iter = response.aiter_lines()
+                        pending_line_task: Optional[asyncio.Task[str]] = None
+                        last_activity_at = time.time()
+                        try:
+                            while True:
+                                idle_seconds = time.time() - last_activity_at
+                                # Bridge memakai BRIDGE_REQUEST_TIMEOUT (konteks
+                                # panjang = TTFB wajar 120-300s), bukan global 120s.
+                                if idle_seconds > BRIDGE_REQUEST_TIMEOUT:
+                                    raise asyncio.TimeoutError(
+                                        f"No upstream progress for {int(idle_seconds)}s"
+                                        f" (idle timeout {BRIDGE_REQUEST_TIMEOUT:.0f}s)"
+                                    )
+                                if pending_line_task is None:
+                                    pending_line_task = asyncio.create_task(
+                                        line_iter.__anext__()
+                                    )
+                                done, _ = await asyncio.wait(
+                                    (pending_line_task,),
+                                    timeout=min(
+                                        SSE_KEEPALIVE_INTERVAL,
+                                        max(0.0, BRIDGE_REQUEST_TIMEOUT - idle_seconds),
+                                    ),
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                if not done:
+                                    yield ":\n\n"
+                                    continue
+                                try:
+                                    line = pending_line_task.result()
+                                except StopAsyncIteration:
+                                    stream_completed = True
+                                    break
+                                finally:
+                                    pending_line_task = None
 
-                            # Reasoning upstream: teruskan sebagai
-                            # `reasoning_content` agar klien menerima `data:`
-                            # selama fase thinking (mencegah idle-timeout
-                            # ~90s di Hermes/SDK yang mengabaikan `:`
-                            # keepalive). Pola sama dengan REASONING_FORWARD
-                            # di stream_generator chat.
-                            reasoning_frag = _extract_responses_reasoning_delta(event)
-                            if reasoning_frag:
-                                now = time.time()
-                                reasoning_events += 1
-                                reasoning_chars += len(reasoning_frag)
-                                # Simpan untuk fallback anti-kosong (dibatasi
-                                # agar memori datar bila reasoning sangat panjang).
-                                if reasoning_buffer_chars < 20000:
-                                    reasoning_buffer.append(reasoning_frag)
-                                    reasoning_buffer_chars += len(reasoning_frag)
-                                if first_reasoning_at is None:
-                                    first_reasoning_at = now
+                                if not line:
+                                    continue
+                                if line.startswith(":"):
+                                    continue
+                                if line.startswith("data:"):
+                                    data = line[5:].lstrip()
+                                else:
+                                    # Toleransi: sebagian relay/middlebox mengirim
+                                    # event Responses sebagai baris JSON telanjang
+                                    # (tanpa prefix "data:"). Terima bila bentuknya
+                                    # event Responses, abaikan selain itu.
+                                    try:
+                                        probe = json.loads(line)
+                                    except (ValueError, TypeError):
+                                        continue
+                                    if not isinstance(probe, dict) or not str(
+                                        probe.get("type", "")
+                                    ).startswith("response."):
+                                        if len(raw_preview) < 5:
+                                            raw_preview.append(line[:200])
+                                        continue
+                                    data = line
+                                wire_bytes += len(data)
+                                last_activity_at = time.time()
+                                if data == "[DONE]":
+                                    termination_seen = True
+                                    stream_completed = True
+                                    break
+                                try:
+                                    event = json.loads(data)
+                                except (ValueError, TypeError):
+                                    continue
+                                if not isinstance(event, dict):
+                                    continue
+                                # Relay early-SSE: fetch upstream gagal dilaporkan
+                                # sebagai event (HTTP sudah 200). Cegat SEBELUM
+                                # payload agar failover ke target berikutnya jalan.
+                                if event.get("type") == "relay.error" and not sent_payload:
+                                    _relay_status = event.get("status")
+                                    _relay_body = str(event.get("body") or "")[:300]
+                                    if _relay_status == 429:
+                                        last_retry_after = RATE_LIMIT_BACKOFF
+                                        last_rate_limited = True
+                                        saw_non_403_failure = True
+                                        _mark_relay_rate_limited(
+                                            target_url,
+                                            time.time() + RATE_LIMIT_COOLDOWN,
+                                        )
+                                    elif _relay_status == 403:
+                                        last_rate_limited = False
+                                        forbidden_count += 1
+                                        _mark_relay_forbidden(
+                                            target_url,
+                                            time.time() + RELAY_403_COOLDOWN,
+                                        )
+                                    else:
+                                        last_rate_limited = _relay_status == 429
+                                        saw_non_403_failure = True
+                                    last_error = f"Relay error {_relay_status}: {_relay_body}"
+                                    # AUTO-HEAL encrypted_content lewat relay
+                                    # early-SSE (HTTP 200 + event relay.error).
+                                    if (
+                                        _relay_status == 400
+                                        and not healed_once
+                                        and _is_encrypted_content_rejection(_relay_body)
+                                        and _payload_has_replay_reasoning(payload)
+                                    ):
+                                        _stripped, removed = _strip_replayed_reasoning(payload)
+                                        if removed:
+                                            payload = _stripped
+                                            healed_once = True
+                                            heal_restart = True
+                                            relay_target_failed = True
+                                            _log(
+                                                "RESP",
+                                                f"HEAL {target_url} | encrypted_content "
+                                                f"ditolak (relay.error bridge) -> buang "
+                                                f"{removed} item reasoning replay, retry "
+                                                f"dari target pertama",
+                                            )
+                                            break
+                                    relay_target_failed = True
                                     _log(
                                         "RESP",
-                                        f"REASONING start +{now - stream_start:.2f}s",
+                                        f"RELAY-ERROR {target_url} | status="
+                                        f"{_relay_status} detail={_relay_body!r} "
+                                        f"-> target berikutnya",
                                     )
-                                last_reasoning_at = now
-                                if REASONING_FORWARD:
-                                    role = role_chunk()
-                                    if role:
+                                    break
+                                # Relay early-SSE membungkus respons buffered
+                                # (satu JSON utuh) sebagai satu event SSE —
+                                # konversi langsung seperti jalur buffered.
+                                if event.get("object") == "response" or (
+                                    isinstance(event.get("output"), list)
+                                    and not str(event.get("type", "")).startswith("response.")
+                                ):
+                                    content_f, calls_f = _responses_output_to_chat(
+                                        event.get("output")
+                                    )
+                                    found_f = _extract_responses_usage(event)
+                                    if found_f:
+                                        last_usage = found_f
+                                    if content_f or calls_f:
+                                        role = role_chunk()
+                                        if role:
+                                            sent_payload = True
+                                            yield role
                                         sent_payload = True
-                                        yield role
-                                    sent_payload = True
-                                    yield chunk(
-                                        {"reasoning_content": reasoning_frag}
-                                    )
-                                continue
+                                        if first_content_at is None:
+                                            first_content_at = time.time()
+                                        if content_f:
+                                            saw_text_content = True
+                                            yield chunk({"content": content_f})
+                                        for idx_f, call_f in enumerate(calls_f):
+                                            call_f = dict(call_f)
+                                            call_f["index"] = idx_f
+                                            saw_tool_call = True
+                                            yield chunk({"tool_calls": [call_f]})
+                                    else:
+                                        # Full-object tanpa message/tool (mis. hanya
+                                        # reasoning): teruskan reasoning agar klien
+                                        # tidak menerima stream kosong.
+                                        reasoning_f = _extract_responses_reasoning_text(
+                                            event.get("output")
+                                        )
+                                        if reasoning_f and REASONING_FORWARD:
+                                            now_f = time.time()
+                                            reasoning_events += 1
+                                            reasoning_chars += len(reasoning_f)
+                                            # Hormati batas 20rb char seperti jalur delta
+                                            # (satu full-object bisa 20rb char per event).
+                                            if reasoning_buffer_chars < 20000:
+                                                reasoning_buffer.append(reasoning_f[:20000 - reasoning_buffer_chars])
+                                                reasoning_buffer_chars += min(len(reasoning_f), 20000 - reasoning_buffer_chars)
+                                            if first_reasoning_at is None:
+                                                first_reasoning_at = now_f
+                                                _log(
+                                                    "RESP",
+                                                    f"REASONING start +{now_f - stream_start:.2f}s (buffered)",
+                                                )
+                                            last_reasoning_at = now_f
+                                            role = role_chunk()
+                                            if role:
+                                                sent_payload = True
+                                                yield role
+                                            sent_payload = True
+                                            yield chunk(
+                                                {"reasoning_content": reasoning_f[:20000]}
+                                            )
+                                    termination_seen = True
+                                    stream_completed = True
+                                    break
+                                data_events += 1
+                                event_type = event.get("type", "")
 
-                            if event_type in (
-                                "response.output_text.delta",
-                                "response.text.delta",
-                            ):
-                                text = event.get("delta", "")
-                                if not isinstance(text, str):
-                                    text = str(text) if text is not None else ""
-                                if text:
-                                    role = role_chunk()
-                                    if role:
-                                        sent_payload = True
-                                        yield role
-                                    sent_payload = True
-                                    saw_text_content = True
-                                    if first_content_at is None:
-                                        first_content_at = time.time()
-                                    yield chunk({"content": text})
-                            elif event_type == "response.output_item.added":
-                                item = event.get("item") or {}
-                                if isinstance(item, dict) and item.get("type") == "reasoning":
-                                    # Awal blok reasoning (deltas menyusul di
-                                    # event reasoning_*.delta di atas).
+                                # Reasoning upstream: teruskan sebagai
+                                # `reasoning_content` agar klien menerima `data:`
+                                # selama fase thinking (mencegah idle-timeout
+                                # ~90s di Hermes/SDK yang mengabaikan `:`
+                                # keepalive). Pola sama dengan REASONING_FORWARD
+                                # di stream_generator chat.
+                                reasoning_frag = _extract_responses_reasoning_delta(event)
+                                if reasoning_frag:
+                                    now = time.time()
+                                    reasoning_events += 1
+                                    reasoning_chars += len(reasoning_frag)
+                                    # Simpan untuk fallback anti-kosong (dibatasi
+                                    # agar memori datar bila reasoning sangat panjang).
+                                    if reasoning_buffer_chars < 20000:
+                                        reasoning_buffer.append(reasoning_frag)
+                                        reasoning_buffer_chars += len(reasoning_frag)
                                     if first_reasoning_at is None:
-                                        first_reasoning_at = time.time()
+                                        first_reasoning_at = now
+                                        _log(
+                                            "RESP",
+                                            f"REASONING start +{now - stream_start:.2f}s",
+                                        )
+                                    last_reasoning_at = now
+                                    if REASONING_FORWARD:
+                                        role = role_chunk()
+                                        if role:
+                                            sent_payload = True
+                                            yield role
+                                        sent_payload = True
+                                        yield chunk(
+                                            {"reasoning_content": reasoning_frag}
+                                        )
                                     continue
-                                if isinstance(item, dict) and item.get("type") == "function_call":
-                                    key = str(
-                                        event.get("output_index", item.get("item_id", len(call_ids)))
-                                    )
+
+                                if event_type in (
+                                    "response.output_text.delta",
+                                    "response.text.delta",
+                                ):
+                                    text = event.get("delta", "")
+                                    if not isinstance(text, str):
+                                        text = str(text) if text is not None else ""
+                                    if text:
+                                        role = role_chunk()
+                                        if role:
+                                            sent_payload = True
+                                            yield role
+                                        sent_payload = True
+                                        saw_text_content = True
+                                        if first_content_at is None:
+                                            first_content_at = time.time()
+                                        yield chunk({"content": text})
+                                elif event_type == "response.output_item.added":
+                                    item = event.get("item") or {}
+                                    if isinstance(item, dict) and item.get("type") == "reasoning":
+                                        # Awal blok reasoning (deltas menyusul di
+                                        # event reasoning_*.delta di atas).
+                                        if first_reasoning_at is None:
+                                            first_reasoning_at = time.time()
+                                        continue
+                                    if isinstance(item, dict) and item.get("type") == "function_call":
+                                        key = str(
+                                            event.get("output_index", item.get("item_id", len(call_ids)))
+                                        )
+                                        if key not in call_index_by_key:
+                                            call_index_by_key[key] = len(call_ids)
+                                            call_ids.append(
+                                                item.get("call_id") or item.get("item_id") or f"call_{len(call_ids)}"
+                                            )
+                                        idx = call_index_by_key[key]
+                                        call_id = call_ids[idx]
+                                        saw_tool_call = True
+                                        role = role_chunk()
+                                        if role:
+                                            sent_payload = True
+                                            yield role
+                                        sent_payload = True
+                                        call_id_emitted.add(call_id)
+                                        yield chunk(
+                                            {
+                                                "tool_calls": [
+                                                    {
+                                                        "index": idx,
+                                                        "id": call_id,
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": item.get("name") or "",
+                                                            "arguments": "",
+                                                        },
+                                                    }
+                                                ]
+                                            }
+                                        )
+                                elif event_type == "response.function_call_arguments.delta":
+                                    key = str(event.get("output_index", event.get("item_id", "")))
                                     if key not in call_index_by_key:
                                         call_index_by_key[key] = len(call_ids)
                                         call_ids.append(
-                                            item.get("call_id") or item.get("item_id") or f"call_{len(call_ids)}"
+                                            event.get("item_id") or f"call_{len(call_ids)}"
                                         )
                                     idx = call_index_by_key[key]
                                     call_id = call_ids[idx]
-                                    saw_tool_call = True
-                                    role = role_chunk()
-                                    if role:
+                                    fragment = event.get("delta", "")
+                                    if not isinstance(fragment, str):
+                                        fragment = str(fragment) if fragment is not None else ""
+                                    if fragment:
+                                        saw_tool_call = True
+                                        role = role_chunk()
+                                        if role:
+                                            sent_payload = True
+                                            yield role
                                         sent_payload = True
-                                        yield role
-                                    sent_payload = True
-                                    call_id_emitted.add(call_id)
-                                    yield chunk(
-                                        {
-                                            "tool_calls": [
-                                                {
-                                                    "index": idx,
-                                                    "id": call_id,
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": item.get("name") or "",
-                                                        "arguments": "",
-                                                    },
-                                                }
-                                            ]
+                                        entry: Dict[str, Any] = {
+                                            "index": idx,
+                                            "type": "function",
+                                            "function": {"arguments": fragment},
                                         }
-                                    )
-                            elif event_type == "response.function_call_arguments.delta":
-                                key = str(event.get("output_index", event.get("item_id", "")))
-                                if key not in call_index_by_key:
-                                    call_index_by_key[key] = len(call_ids)
-                                    call_ids.append(
-                                        event.get("item_id") or f"call_{len(call_ids)}"
-                                    )
-                                idx = call_index_by_key[key]
-                                call_id = call_ids[idx]
-                                fragment = event.get("delta", "")
-                                if not isinstance(fragment, str):
-                                    fragment = str(fragment) if fragment is not None else ""
-                                if fragment:
-                                    saw_tool_call = True
+                                        if call_id not in call_id_emitted:
+                                            entry["id"] = call_id
+                                            call_id_emitted.add(call_id)
+                                        yield chunk({"tool_calls": [entry]})
+                                elif event_type == "response.created":
                                     role = role_chunk()
                                     if role:
-                                        sent_payload = True
                                         yield role
-                                    sent_payload = True
-                                    entry: Dict[str, Any] = {
-                                        "index": idx,
-                                        "type": "function",
-                                        "function": {"arguments": fragment},
-                                    }
-                                    if call_id not in call_id_emitted:
-                                        entry["id"] = call_id
-                                        call_id_emitted.add(call_id)
-                                    yield chunk({"tool_calls": [entry]})
-                            elif event_type == "response.created":
-                                role = role_chunk()
-                                if role:
-                                    yield role
-                            elif event_type in (
-                                "response.completed",
-                                "response.failed",
-                                "response.incomplete",
-                            ):
-                                inner = event.get("response") or {}
-                                found = _extract_responses_usage({"usage": inner.get("usage")})
-                                if found:
-                                    last_usage = found
-                                termination_seen = True
-                                stream_completed = True
-                                break
-                    finally:
-                        if pending_line_task is not None:
-                            pending_line_task.cancel()
-                            with suppress(asyncio.CancelledError, Exception):
-                                await pending_line_task
+                                elif event_type in (
+                                    "response.completed",
+                                    "response.failed",
+                                    "response.incomplete",
+                                ):
+                                    inner = event.get("response") or {}
+                                    found = _extract_responses_usage({"usage": inner.get("usage")})
+                                    if found:
+                                        last_usage = found
+                                    termination_seen = True
+                                    stream_completed = True
+                                    break
+                        finally:
+                            if pending_line_task is not None:
+                                pending_line_task.cancel()
+                                with suppress(asyncio.CancelledError, Exception):
+                                    await pending_line_task
 
-                if relay_target_failed:
-                    if heal_restart:
-                        # Auto-heal: ulangi dari target pertama dengan payload
-                        # yang sudah dibersihkan (bukan maju ke target berikut).
-                        heal_restart = False
-                        target_index = 0
-                    else:
-                        target_index += 1
+                    if relay_target_failed:
+                        if heal_restart:
+                            # Auto-heal: ulangi dari target pertama dengan payload
+                            # yang sudah dibersihkan (bukan maju ke target berikut).
+                            heal_restart = False
+                            target_index = 0
+                        else:
+                            target_index += 1
+                        continue
+
+                    stream_completed = True
+                    break
+
+                except (
+                    httpx.TimeoutException,
+                    httpx.ConnectError,
+                    httpx.ReadError,
+                    httpx.RemoteProtocolError,
+                ) as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    saw_non_403_failure = True
+                    _log("RESP", f"FAIL {target_url} ({type(exc).__name__})")
+                    if sent_payload:
+                        record_final_usage()
+                        log_summary("lost")
+                        try:
+                            yield _sse(
+                                {
+                                    "error": {
+                                        "message": "Stream connection lost",
+                                        "detail": str(exc),
+                                    }
+                                }
+                            )
+                            yield "data: [DONE]\n\n"
+                        except (GeneratorExit, asyncio.CancelledError):
+                            raise
+                        except Exception:
+                            pass
+                        return
+                    target_index += 1
                     continue
 
-                stream_completed = True
+            if stream_completed:
                 break
-
-            except (
-                httpx.TimeoutException,
-                httpx.ConnectError,
-                httpx.ReadError,
-                httpx.RemoteProtocolError,
-            ) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                _log("RESP", f"FAIL {target_url} ({type(exc).__name__})")
-                if sent_payload:
-                    record_final_usage()
-                    log_summary("lost")
-                    try:
-                        yield _sse(
-                            {
-                                "error": {
-                                    "message": "Stream connection lost",
-                                    "detail": str(exc),
-                                }
-                            }
-                        )
-                        yield "data: [DONE]\n\n"
-                    except (GeneratorExit, asyncio.CancelledError):
-                        raise
-                    except Exception:
-                        pass
-                    return
-                target_index += 1
-                continue
+            if (
+                not FORBIDDEN_FRESH_SESSION_RETRY
+                or fresh_session_retry_done
+                or not targets
+                or sent_payload
+                or saw_non_403_failure
+                or forbidden_count == 0
+                # Identitas WAJIB stabil bila payload membawa replay
+                # reasoning encrypted_content (lihat generator-1).
+                or _payload_has_replay_reasoning(payload)
+            ):
+                break
+            # Upaya terakhir all-403 (termasuk direct): satu percobaan
+            # ke target TERAKHIR dengan session+request baru.
+            fresh_session_retry_done = True
+            retry_url, retry_headers = targets[-1]
+            old_tag = _oc_session_tag(opencode_headers)
+            base_headers = _fresh_identity_headers(retry_headers)
+            targets = [(retry_url, dict(base_headers))]
+            forbidden_count = 0
+            saw_non_403_failure = False
+            last_error = None
+            last_rate_limited = False
+            last_retry_after = None
+            spurious_429_retried = set()
+            _log(
+                "RESP",
+                f"FRESH-SESSION-RETRY model={client_model} target={retry_url} "
+                f"{old_tag} -> {_oc_session_tag(base_headers)} "
+                f"(semua target 403 pra-payload, delay {FORBIDDEN_RETRY_DELAY:.1f}s)",
+            )
+            await asyncio.sleep(FORBIDDEN_RETRY_DELAY)
+            continue
 
         if not stream_completed:
             log_summary("all-failed")
