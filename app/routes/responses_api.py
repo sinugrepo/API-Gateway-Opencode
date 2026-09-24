@@ -7,8 +7,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from app.security.gateway_auth import verify_gateway_key
 from starlette.status import (
     HTTP_400_BAD_REQUEST,
     HTTP_502_BAD_GATEWAY,
@@ -106,8 +107,8 @@ async def create_response_via_chat(
     return JSONResponse(content=chat_completion_to_responses(result, client_model), status_code=200)
 
 
-@router.post("/v1/responses")
-@router.post("/responses")
+@router.post("/v1/responses", dependencies=[Depends(verify_gateway_key)])
+@router.post("/responses", dependencies=[Depends(verify_gateway_key)])
 async def create_response(request: Request, background_tasks: BackgroundTasks):
     """OpenAI Responses API pass-through (untuk Muse Spark & model sejenis).
 

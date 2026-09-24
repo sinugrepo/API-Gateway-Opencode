@@ -7,8 +7,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from app.security.gateway_auth import verify_gateway_key
 from starlette.status import (
     HTTP_400_BAD_REQUEST,
     HTTP_502_BAD_GATEWAY,
@@ -57,18 +58,18 @@ async def health():
     )
 
 
-@router.get("/v1/models", response_model=ModelList)
+@router.get("/v1/models", response_model=ModelList, dependencies=[Depends(verify_gateway_key)])
 async def list_models():
     return ModelList(data=await _fetch_opencode_free_models())
 
 
-@router.get("/models", response_model=ModelList)
+@router.get("/models", response_model=ModelList, dependencies=[Depends(verify_gateway_key)])
 async def list_models_alias():
     """OpenAI-compatible model discovery without the /v1 prefix."""
     return ModelList(data=await _fetch_opencode_free_models())
 
 
-@router.get("/v1/models/{model_id}")
+@router.get("/v1/models/{model_id}", dependencies=[Depends(verify_gateway_key)])
 async def get_model(model_id: str):
     # OpenAI-compatible model lookup. Echo the requested id back so clients
     # can probe arbitrary model names without inventing a default model.
@@ -78,7 +79,7 @@ async def get_model(model_id: str):
 
 # Small Ollama-compatible discovery endpoints. They are harmless for Hermes
 # installations that probe multiple provider styles.
-@router.get("/api/tags")
+@router.get("/api/tags", dependencies=[Depends(verify_gateway_key)])
 async def ollama_tags():
     free_models = await _fetch_opencode_free_models()
     return {
@@ -96,12 +97,12 @@ async def ollama_tags():
     }
 
 
-@router.get("/api/v1/models")
+@router.get("/api/v1/models", dependencies=[Depends(verify_gateway_key)])
 async def ollama_v1_models():
     return ModelList(data=await _fetch_opencode_free_models())
 
 
-@router.post("/api/show")
+@router.post("/api/show", dependencies=[Depends(verify_gateway_key)])
 async def ollama_show():
     return {
         "modelfile": "",
@@ -116,12 +117,12 @@ async def version():
     return {"version": "2.0.0", "hermes_compatible": HERMES_COMPAT}
 
 
-@router.get("/relay/status", response_model=RelayStatus)
+@router.get("/relay/status", response_model=RelayStatus, dependencies=[Depends(verify_gateway_key)])
 async def relay_status():
     return await test_relay_connection()
 
 
-@router.get("/v1/props", response_model=PropsInfo)
+@router.get("/v1/props", response_model=PropsInfo, dependencies=[Depends(verify_gateway_key)])
 async def get_props():
     """Return configuration properties and supported capabilities.
 

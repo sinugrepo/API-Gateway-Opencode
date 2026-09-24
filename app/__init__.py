@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.core.config import APP_VERSION, HERMES_COMPAT, MODEL, MONITOR_PASSWORD, USE_RELAY
+from app.core.config import APP_VERSION, GATEWAY_AUTH_ENABLED, HERMES_COMPAT, MODEL, MONITOR_PASSWORD, USE_RELAY
 from app.core.error_handlers import register_error_handlers
 from app.core.http_client import _close_http, _get_http
 from app.core.logging_utils import _log
@@ -29,6 +29,10 @@ async def lifespan(app: FastAPI):
     _log("INFO", f"Model: {MODEL}")
     _log("INFO", f"Relay: {'ON' if USE_RELAY else 'OFF'}")
     _log("INFO", f"Hermes compatibility: {'ON' if HERMES_COMPAT else 'OFF'}")
+    if GATEWAY_AUTH_ENABLED:
+        _log("INFO", "Gateway API-key auth: ON (/v1/* + /relay/status wajib Bearer/x-api-key)")
+    else:
+        _log("WARN", "Gateway API-key auth: OFF (GATEWAY_API_KEYS kosong, mode terbuka). Isi .env untuk proteksi traffic luar.")
     if MONITOR_PASSWORD == "admin123":
         _log("WARN", "MONITOR_PASSWORD is still default 'admin123'! Set a strong password via env var.")
         enforce = os.getenv("ENFORCE_MONITOR_PASSWORD", "false").lower() == "true"

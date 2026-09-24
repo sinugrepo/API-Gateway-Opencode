@@ -11,7 +11,9 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
 
 - `POST /v1/chat/completions` — non-stream + SSE `stream=true`, tool-calling
   OpenAI + fallback parser DSML, vision (`image_url`/`file` → `input_image`/`input_file`),
-  batas media ~3 MB → 400 jelas.
+  batas media ~3 MB → 400 jelas. `tool_choice` klien (`none`/`required`/named)
+  dikoersi ke `"auto"` bila tools ada (provider Console menolak selain auto
+  dengan 400) atau di-drop bila tidak ada tools — berlaku di semua jalur.
 - `POST /v1/responses` (alias `/responses`) — pass-through mentah ke upstream
   Responses API untuk Muse Spark & sejenisnya.
 - Bridge otomatis: model Responses-only yang diminta via chat dijembatani
@@ -62,9 +64,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ## Konfigurasi (env)
 
+`.env` di root project otomatis dimuat saat start (tanpa `python-dotenv`);
+contoh siap salin di `.env.example`. Environment yang sudah ada menang atas `.env`.
+
 | Var | Default | Keterangan |
 |---|---|---|
-| `OPENCODE_API_KEY` | `public` | Jangan hard-code; set di environment |
+| `GATEWAY_API_KEYS` / `GATEWAY_API_KEY` / `API_KEYS` | `` (kosong = terbuka) | **Auth klien gateway** (koma-dipisah, digabung). Terisi = `/v1/*` + `/api/*` + `/relay/status` wajib `Authorization: Bearer <key>` / `x-api-key: <key>` / `?api_key=`; kosong = mode terbuka (lokal saja). BEDA dari `OPENCODE_API_KEY` |
+| `OPENCODE_API_KEY` | `public` | Key upstream server-to-server; jangan dibagikan ke klien |
 | `OPENCODE_URL` | `.../zen/v1/chat/completions` | Upstream chat |
 | `OPENCODE_RESPONSES_URL` | `.../zen/v1/responses` | Upstream responses |
 | `OPENCODE_MODELS_URL` | `.../zen/v1/models` | Daftar model |
@@ -153,7 +159,8 @@ app/routes/              # chat, responses_api, misc, usage_routes, monitor
 app/web/templates/       # login.html, dashboard.html (vanilla, tanpa build)
 test/                    # test_long_stream_fixes.py, test_live_requests.py,
                          # test_reverse_bridge.py, test_forbidden_fresh_retry.py,
-                         # test_direct_first_slow.py, test_output_item_done.py
+                         # test_direct_first_slow.py, test_output_item_done.py,
+                         # test_tool_choice_coerce.py
 plans/                   # docs lokal, di-gitignore
 usage.db*                # runtime SQLite, di-gitignore
 ```
@@ -166,6 +173,7 @@ python test/test_long_stream_fixes.py   # offline, 34 case, harus ALL PASSED
 python test/test_reverse_bridge.py      # offline, 15 case (routing endpoint + reverse bridge)
 python test/test_forbidden_fresh_retry.py  # offline, 7 case (retry sesi-baru all-403)
 python test/test_direct_first_slow.py  # offline, 8 case (direct-first request lambat)
+python test/test_tool_choice_coerce.py  # offline, 7 case (koersi tool_choice auto)
 python test/test_output_item_done.py  # offline, 5 case (reasoning utuh done-event)
 python test/test_live_requests.py       # live: ASGI in-process → relay Vercel
                                         # + opencode.ai; kontrak 200 / 429-bersih /
@@ -174,8 +182,11 @@ python test/test_live_requests.py       # live: ASGI in-process → relay Vercel
 
 ## Catatan produksi
 
+- Isi `GATEWAY_API_KEYS` di `.env` (lihat `.env.example`); tanpa ini gateway
+  mode TERBUKA. Klien kirim `Authorization: Bearer <key>` (atau
+  `x-api-key: <key>`). `/health`, `/version`, `/monitor` (cookie sendiri)
+  tetap publik; `/v1/*`, `/api/*`, `/relay/status` diproteksi bila key diisi.
 - Ganti `MONITOR_PASSWORD`; pertimbangkan `ENFORCE_MONITOR_PASSWORD=true`.
 - Set `SCAN_GUARD_TRUST_PROXY=true` bila di belakang reverse proxy/CDN.
-- Jangan ekspos langsung tanpa firewall/bind `127.0.0.1`/reverse proxy —
-  tidak ada auth klien (sengaja demi Hermes).
+- Jangan ekspos langsung tanpa firewall/bind `127.0.0.1`/reverse proxy.
 - Jangan tambah GZip (buffer SSE) atau `workers>1` tanpa uji SQLite dulu.

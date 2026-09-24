@@ -7,8 +7,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from app.security.gateway_auth import verify_gateway_key
 from starlette.status import (
     HTTP_400_BAD_REQUEST,
     HTTP_502_BAD_GATEWAY,
@@ -125,7 +126,7 @@ async def chat_completions_via_responses(
     }
 
 
-@router.post("/v1/chat/completions")
+@router.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_key)])
 async def chat_completions(
     req: ChatCompletionRequest,
     background_tasks: BackgroundTasks,

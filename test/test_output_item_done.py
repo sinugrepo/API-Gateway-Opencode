@@ -189,6 +189,23 @@ def _d1():
     assert "response.created:1" in joined, joined[-600:]
 
 
+@case("F1 log SUMMARY memuat rincian items=done:reasoning")
+def _f1():
+    import app.services.responses_bridge as rb
+    logs: list = []
+    orig = rb._log
+    rb._log = lambda tag, msg: logs.append(f"{tag} {msg}")
+    try:
+        body = (_sse_created() + _sse_done_reasoning() + _sse_completed()
+                + b"data: [DONE]\n\n")
+        _install_fake(_ScriptClient(body))
+        _drive(body)
+    finally:
+        rb._log = orig
+    joined = "\n".join(logs)
+    assert "items=done:reasoning:1" in joined, joined[-600:]
+
+
 # ---------- E: unit formatter ----------
 
 @case("E1 _format_event_types: kosong/normal/aneh")

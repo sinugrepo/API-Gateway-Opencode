@@ -450,4 +450,47 @@ def ensure_responses_wire_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload["store"] = False
     ensure_responses_fingerprint_tools(payload)
     ensure_spark_reasoning_xhigh(payload)
+    coerce_tool_choice_auto(payload, "responses-wire")
     return payload
+
+
+def coerce_tool_choice_auto(payload: Dict[str, Any], context: str = "") -> bool:
+    """Paksa tool_choice ke bentuk yang didukung provider Console.
+
+    Upstream (Console) HANYA mendukung `"auto"` — `none`/`required`/named
+    function choice ditolak 400 `invalid_request_error` (live 2026-09-24:
+    Kilo Code mengirim named/required ke spark & mimo -> 400 -> 502 ke
+    klien di SEMUA target karena ini salah payload, bukan salah route).
+    Aturan: tools ada dan choice bukan auto -> `"auto"`; tools tidak ada ->
+    key di-drop (choice tanpa tools tak bermakna). Return True bila payload
+    diubah (sekaligus dilog), False bila sudah benar. Tidak pernah melempar.
+    Berlaku di SEMUA jalur payload upstream (chat, bridge, responses,
+    reverse bridge) karena batasan ini milik provider, bukan model.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return False
+        tools = payload.get("tools")
+        has_tools = isinstance(tools, list) and len(tools) > 0
+        current = payload.get("tool_choice", None)
+        if has_tools:
+            if current == "auto":
+                return False
+            payload["tool_choice"] = "auto"
+        else:
+            if "tool_choice" not in payload:
+                return False
+            payload.pop("tool_choice", None)
+        try:
+            from app.core.logging_utils import _log as _tools_log
+            _tools_log(
+                "TOOLS",
+                f"tool_choice {current!r} -> "
+                f"{payload.get('tool_choice', '<dropped>')!r} "
+                f"({context or 'unspecified'})",
+            )
+        except (ImportError, AttributeError, TypeError, ValueError):
+            pass
+        return True
+    except (AttributeError, TypeError, ValueError):
+        return False

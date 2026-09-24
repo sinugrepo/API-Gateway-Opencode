@@ -1,1 +1,1 @@
-"""Protection: scan guard + monitor auth."""
+"""Protection: scan guard + monitor auth + gateway API-key auth."""

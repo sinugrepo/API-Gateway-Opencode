@@ -1,13 +1,108 @@
 """Central configuration (env vars + pure helpers)."""
 import os
 import secrets
+from pathlib import Path
 from urllib.parse import urlparse
+
+
+def _load_dotenv() -> None:
+    """Muat `.env` sederhana tanpa dependensi tambahan.
+
+    - Dicari di CWD lalu di root project (parent dari `app/`).
+    - Format: `KEY=VALUE`, mendukung `export KEY=...`, komentar `#`,
+      dan quote tunggal/ganda.
+    - TIDAK menimpa env yang sudah ada (environment menang atas `.env`).
+    - Tidak pernah melempar: gateway tetap jalan walau `.env` rusak.
+    """
+    candidates = []
+    try:
+        candidates.append(Path.cwd() / ".env")
+    except (OSError, ValueError):
+        pass
+    try:
+        # app/core/config.py -> parents[2] = root project
+        candidates.append(Path(__file__).resolve().parents[2] / ".env")
+    except (IndexError, OSError, ValueError):
+        pass
+    seen = set()
+    for path in candidates:
+        try:
+            resolved = str(path.resolve())
+        except (OSError, ValueError):
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, UnicodeError):
+            continue
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("export "):
+                line = line[7:].lstrip()
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if not key or not key.replace("_", "").isalnum():
+                continue
+            if key in os.environ:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            # Inline comment di luar quote: `KEY=val # komen`.
+            # Sederhana: potong ` #` bila value tidak di-quote.
+            if " #" in value:
+                value = value.split(" #", 1)[0].rstrip()
+            os.environ[key] = value
+
+
+_load_dotenv()
 
 APP_VERSION = "2.0.0"
 
 
 # Do not hard-code secrets in source code. Set OPENCODE_API_KEY in your service environment.
 API_KEY = os.getenv("OPENCODE_API_KEY", "public")
+
+
+def _parse_api_key_list(*raw_values: str) -> list:
+    """Parse daftar API key gateway dari satu/beberapa env koma-dipisah.
+
+    Kosong/whitespace dibuang, duplikat dibuang (urutan pertama menang).
+    """
+    seen: set = set()
+    result: list = []
+    for raw in raw_values:
+        for part in (raw or "").split(","):
+            key = part.strip().strip("'\"")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(key)
+    return result
+
+
+# Auth klien gateway (traffic luar). BEDA dari OPENCODE_API_KEY (upstream).
+# - Diisi via `.env` / environment: GATEWAY_API_KEYS (utama, koma-dipisah
+#   untuk multi-key/rotasi), atau GATEWAY_API_KEY (satu key), atau API_KEYS
+#   (alias). Ketiganya digabung.
+# - Kosong = mode TERBUKA (backward-compat lokal/Hermes tanpa key).
+#   Terisi = SEMUA endpoint /v1/* + /relay/status WAJIB kirim key.
+# - Jangan hard-code; set di `.env` (sudah di-gitignore).
+GATEWAY_API_KEYS: list = _parse_api_key_list(
+    os.getenv("GATEWAY_API_KEYS", ""),
+    os.getenv("GATEWAY_API_KEY", ""),
+    os.getenv("API_KEYS", ""),
+)
+
+GATEWAY_AUTH_ENABLED = len(GATEWAY_API_KEYS) > 0
 
 
 OPENCODE_URL = os.getenv(

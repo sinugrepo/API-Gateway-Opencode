@@ -400,18 +400,22 @@ def build_responses_payload_from_chat(req: ChatCompletionRequest) -> Dict[str, A
     payload["store"] = False
     try:
         from app.services.opencode import (
+            coerce_tool_choice_auto,
             ensure_responses_fingerprint_tools,
             ensure_spark_reasoning_xhigh,
         )
         ensure_responses_fingerprint_tools(payload)
         # muse-spark: reasoning effort SELALU xhigh (override nilai klien).
         ensure_spark_reasoning_xhigh(payload)
+        # Provider Console HANYA mendukung tool_choice "auto" (live
+        # 2026-09-24: named/required/none dari Kilo -> 400 di semua target).
+        # Bila tools ada paksa "auto"; bila tidak ada, drop key-nya sekalian.
+        coerce_tool_choice_auto(payload, "chat-bridge")
     except (ImportError, AttributeError, TypeError):
-        pass
-    # tool_choice default "auto" bila tools ada (samakan dengan klien
-    # Responses yang selalu mengirimnya; tanpanya upstream 403).
-    if payload.get("tool_choice") is None and payload.get("tools"):
-        payload["tool_choice"] = "auto"
+        # Fallback minimal bila helper tak tersedia: default auto seperti
+        # sebelumnya (tanpanya upstream 403 bila tools ada).
+        if payload.get("tool_choice") is None and payload.get("tools"):
+            payload["tool_choice"] = "auto"
     # prompt_cache_key stabil per-percakapan (samakan dengan sukses direct).
     # Dipetakan dari fingerprint percakapan agar stabil antar-turn/restart.
     if not payload.get("prompt_cache_key"):
@@ -529,6 +533,23 @@ def _extract_responses_reasoning_text(output: Any) -> str:
         return "".join(collected)
     except (TypeError, ValueError, AttributeError):
         return ""
+
+
+def _count_item_kind(counts: Dict[str, int], phase: str, item: Any) -> None:
+    """Hitung kemunculan item output per (fase, tipe): added:reasoning:1.
+
+    Observability untuk kasus done-item tanpa konten terekstrak (EMPTY
+    dengan wire besar). Bounded 32 kunci. Tidak pernah melempar.
+    """
+    try:
+        if not isinstance(counts, dict):
+            return
+        kind = item.get("type") if isinstance(item, dict) else None
+        key = f"{phase}:{kind if isinstance(kind, str) and kind else '?'}"
+        if len(counts) < 32 or key in counts:
+            counts[key] = counts.get(key, 0) + 1
+    except (TypeError, ValueError, AttributeError):
+        pass
 
 
 def _format_event_types(counts: Any) -> str:
@@ -1173,6 +1194,7 @@ async def responses_to_chat_stream_generator(
     wire_bytes = 0
     data_events = 0
     event_type_counts: Dict[str, int] = {}
+    item_kinds: Dict[str, int] = {}
     reasoning_events = 0
     reasoning_chars = 0
     reasoning_buffer: List[str] = []
@@ -1217,6 +1239,7 @@ async def responses_to_chat_stream_generator(
                 f"BRIDGE-SUMMARY id={stream_id[:8]} {note} model={client_model} "
                 f"wire_bytes={wire_bytes} events={data_events} "
                 f"types={_format_event_types(event_type_counts)} "
+                f"items={_format_event_types(item_kinds)} "
                 f"reasoning:events={reasoning_events} chars={reasoning_chars} dur={reasoning_dur} "
                 f"content_start={'+%.2fs' % (first_content_at - stream_start) if first_content_at is not None else '-'} "
                 f"total={time.time() - stream_start:.2f}s",
@@ -1734,6 +1757,7 @@ async def responses_to_chat_stream_generator(
                                         yield chunk({"content": text})
                                 elif event_type == "response.output_item.added":
                                     item = event.get("item") or {}
+                                    _count_item_kind(item_kinds, "added", item)
                                     if isinstance(item, dict) and item.get("type") == "reasoning":
                                         # Awal blok reasoning (deltas menyusul di
                                         # event reasoning_*.delta di atas).
@@ -1786,6 +1810,7 @@ async def responses_to_chat_stream_generator(
                                     if not isinstance(done_item, dict):
                                         continue
                                     done_kind = done_item.get("type")
+                                    _count_item_kind(item_kinds, "done", done_item)
                                     if done_kind == "reasoning":
                                         done_text = _extract_responses_reasoning_text(
                                             [done_item]
@@ -2041,6 +2066,8 @@ async def responses_to_chat_stream_generator(
                 f"EMPTY-STREAM model={client_model} wire_bytes={wire_bytes} "
                 f"events={data_events} reasoning_events={reasoning_events} "
                 f"types={_format_event_types(event_type_counts)} "
+                f"items={_format_event_types(item_kinds)} "
+                f"budget={payload.get('max_output_tokens') if isinstance(payload, dict) else '?'} "
                 f"preview={raw_preview[:5]!r}",
             )
             yield _sse(

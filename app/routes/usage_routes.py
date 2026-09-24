@@ -7,8 +7,9 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from app.security.gateway_auth import verify_gateway_key
 from starlette.status import (
     HTTP_400_BAD_REQUEST,
     HTTP_502_BAD_GATEWAY,
@@ -20,7 +21,7 @@ from app.services.usage import _VALID_PERIODS, _query_usage, _resolve_period
 
 router = APIRouter()
 
-@router.get("/v1/usage", response_model=UsageResponse)
+@router.get("/v1/usage", response_model=UsageResponse, dependencies=[Depends(verify_gateway_key)])
 async def get_usage(
     period: str = "today",
     start: Optional[str] = None,
@@ -52,7 +53,7 @@ async def get_usage(
     )
 
 
-@router.get("/v1/usage/periods", response_model=UsagePeriodsResponse)
+@router.get("/v1/usage/periods", response_model=UsagePeriodsResponse, dependencies=[Depends(verify_gateway_key)])
 async def list_usage_periods():
     """List the period keywords accepted by `GET /v1/usage`."""
     return UsagePeriodsResponse(

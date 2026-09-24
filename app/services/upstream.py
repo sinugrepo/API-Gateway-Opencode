@@ -103,9 +103,15 @@ def build_upstream_payload(req: ChatCompletionRequest) -> Dict[str, Any]:
 
     # Free-tier fingerprint gate (403 bila hilang): kuartet tools bawaan
     # OpenCode wajib hadir di body chat (diverifikasi live 2026-09-18).
+    # Provider Console juga HANYA mendukung tool_choice "auto" (live
+    # 2026-09-24: named/required/none -> 400 di semua target) -> koersi.
     try:
-        from app.services.opencode import ensure_chat_fingerprint_tools
+        from app.services.opencode import (
+            coerce_tool_choice_auto,
+            ensure_chat_fingerprint_tools,
+        )
         ensure_chat_fingerprint_tools(payload)
+        coerce_tool_choice_auto(payload, "chat-upstream")
     except (ImportError, AttributeError, TypeError):
         pass
 
