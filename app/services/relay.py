@@ -83,7 +83,8 @@ _relay_stream_broken_lock = threading.Lock()
 def _payload_has_media(payload: Any) -> bool:
     """True bila payload membawa gambar/file (vision), dua bentuk API.
 
-    - Chat: message content part `image_url` / `file`.
+    - Chat: message content part `image_url` / `file` / `image` (Anthropic
+      `source`) / `input_image`+`input_file` nyasar via chat.
     - Responses: input item content `input_image` / `input_file`.
     Dicek struktural (bukan substring) agar teks biasa yang kebetulan
     menyebut "image_url" tidak salah diklasifikasi.
@@ -107,13 +108,13 @@ def _payload_has_media(payload: Any) -> bool:
                     if not isinstance(part, dict):
                         continue
                     ptype = part.get("type")
-                    if ptype in ("image_url", "input_image"):
+                    if ptype in ("image_url", "input_image", "image"):
                         return True
-                    if ptype == "file":
-                        return True
-                    if key == "input" and ptype == "input_file":
+                    if ptype in ("file", "input_file"):
                         return True
                     if isinstance(part.get("image_url"), (str, dict)):
+                        return True
+                    if isinstance(part.get("source"), dict):
                         return True
         return False
     except (TypeError, ValueError, AttributeError):

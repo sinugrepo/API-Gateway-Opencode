@@ -164,6 +164,37 @@ def _guess_media_ext(data_url: str, default: str) -> str:
     return default
 
 
+def _anthropic_source_to_data_url(source: Any) -> str:
+    """Ubah Anthropic `source` menjadi data-URL (`""` bila tak dikenal).
+
+    Bentuk yang didukung (Kilo/Cline/Roo kadang mengirim gaya Anthropic
+    walau lewat endpoint OpenAI-compatible):
+    - `{"type": "base64", "media_type": "image/png", "data": "..."}`
+    - `{"type": "url", "url": "..."}`
+    Tidak pernah melempar.
+    """
+    try:
+        if not isinstance(source, dict):
+            return ""
+        stype = source.get("type")
+        if stype == "base64":
+            data = source.get("data")
+            if not isinstance(data, str) or not data:
+                return ""
+            mime = source.get("media_type") or "image/png"
+            if not isinstance(mime, str) or "/" not in mime:
+                mime = "image/png"
+            if data.startswith("data:"):
+                return data
+            return f"data:{mime};base64,{data}"
+        if stype == "url":
+            url = source.get("url")
+            return url if isinstance(url, str) and url else ""
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return ""
+
+
 def _chat_media_contents(content: Any) -> List[Dict[str, Any]]:
     """Ekstrak SEMUA part media gaya chat menjadi part Responses.
 
@@ -171,6 +202,10 @@ def _chat_media_contents(content: Any) -> List[Dict[str, Any]]:
     - `{"type": "file", "file": {"file_data", "filename"}}` (PDF/dokumen)
       -> `{"type": "input_file", ...}`
     - `{"type": "file", "file": {"file_id": ...}}` -> `input_file` by id.
+    - `{"type": "image", "source": {...}}` (gaya Anthropic: base64/url)
+      -> `{"type": "input_image", ...}` (Kilo/Cline/Roo kadang mengirim ini).
+    - `{"type": "input_image"/"input_file", ...}` (gaya Responses nyasar via
+      chat) -> diteruskan apa adanya (dinormalisasi ringan).
     Budget byte (base64) dipakai BERSAMA gambar+file; lewat batas -> HTTP 400.
     """
     media: List[Dict[str, Any]] = []
@@ -222,6 +257,49 @@ def _chat_media_contents(content: Any) -> List[Dict[str, Any]]:
                 filename = "file" + _guess_media_ext(data, ".bin")
             media.append({"type": "input_file", "filename": filename,
                           "file_data": data})
+        elif ptype in ("image", "input_image"):
+            # Gaya Anthropic (`source`) atau Responses nyasar via chat.
+            # Prioritas: source Anthropic -> image_url str/dict -> file_id.
+            url = ""
+            detail = part.get("detail") if part.get("detail") in ("auto", "low", "high") else "auto"
+            source_url = _anthropic_source_to_data_url(part.get("source"))
+            if source_url:
+                url = source_url
+            else:
+                ref = part.get("image_url")
+                if isinstance(ref, dict):
+                    if isinstance(ref.get("url"), str) and ref["url"]:
+                        url = ref["url"]
+                    if ref.get("detail") in ("auto", "low", "high"):
+                        detail = ref["detail"]
+                elif isinstance(ref, str) and ref:
+                    url = ref
+            if url:
+                _charge(_media_byte_size(url))
+                media.append({"type": "input_image", "image_url": url, "detail": detail})
+                continue
+            file_id = part.get("file_id")
+            if isinstance(file_id, str) and file_id:
+                media.append({"type": "input_image", "file_id": file_id})
+                continue
+            # `image` tanpa payload yang dikenal -> lewati (bukan crash).
+            continue
+        elif ptype == "input_file":
+            # Passthrough Responses-style nyasar via chat.
+            file_id = part.get("file_id")
+            if isinstance(file_id, str) and file_id:
+                media.append({"type": "input_file", "file_id": file_id})
+                continue
+            data = part.get("file_data")
+            if isinstance(data, str) and data:
+                _charge(_media_byte_size(data))
+                filename = part.get("filename")
+                if not isinstance(filename, str) or not filename:
+                    filename = "file" + _guess_media_ext(data, ".bin")
+                media.append({"type": "input_file", "filename": filename,
+                              "file_data": data})
+                continue
+            continue
         elif isinstance(part.get("image_url"), (str, dict)):
             # Toleransi: part gambar tanpa type eksplisit.
             ref = part["image_url"]

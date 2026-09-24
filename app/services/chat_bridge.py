@@ -105,11 +105,24 @@ def _responses_item_to_chat_message(item: Any) -> Optional[Dict[str, Any]]:
                 continue
             ptype = part.get("type")
             if ptype == "input_image":
-                url = part.get("image_url")
+                ref = part.get("image_url")
+                url = ref.get("url") if isinstance(ref, dict) else ref
                 if isinstance(url, str) and url:
+                    detail = part.get("detail")
+                    if not isinstance(detail, str) or detail not in ("auto", "low", "high"):
+                        detail = (ref.get("detail") if isinstance(ref, dict) else None) or "auto"
+                        if detail not in ("auto", "low", "high"):
+                            detail = "auto"
                     media.append({
                         "type": "image_url",
-                        "image_url": {"url": url, "detail": part.get("detail") or "auto"},
+                        "image_url": {"url": url, "detail": detail},
+                    })
+                    continue
+                file_id = part.get("file_id")
+                if isinstance(file_id, str) and file_id:
+                    media.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"file:{file_id}", "detail": "auto"},
                     })
             elif ptype == "input_file":
                 if isinstance(part.get("file_id"), str) and part["file_id"]:

@@ -103,7 +103,13 @@ contoh siap salin di `.env.example`. Environment yang sudah ada menang atas `.en
 
 Inferensi:
 
-- `POST /v1/chat/completions` — OpenAI chat (bridge otomatis bila Responses-only)
+- `POST /v1/chat/completions` — OpenAI chat (bridge otomatis bila Responses-only).
+  Vision: part `image_url`/`file` OpenAI, `image`+`source` Anthropic
+  (base64/url), dan `input_image`/`input_file` Responses-style yang nyasar
+  via chat semuanya dikonversi ke `input_image`/`input_file`; `detail`
+  (`auto`/`low`/`high`) diteruskan. `/v1/models` mengiklankan
+  `modalities: ["text","image"]` + `supports_vision` untuk muse-spark,
+  gpt, gemini, grok, claude, qwen, glm, kimi, minimax, deepseek-vision.
 - `POST /v1/responses`, `POST /responses` — Responses pass-through untuk
   model Responses-native (muse-spark/gpt/grok); model chat/messages-native
   (mimo/deepseek/glm/kimi/minimax/claude/qwen/...) otomatis dijembatani

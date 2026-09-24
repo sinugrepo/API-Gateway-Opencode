@@ -160,6 +160,53 @@ PREFIX_CONTEXT_WINDOWS: Dict[str, int] = {
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 
+# ── Vision support (untuk advertise ke klien seperti Kilo Code) ──
+# Upstream hanya mengembalikan id/object/created/owned_by (tanpa flag
+# vision), jadi proxy memelihara tabel ini. muse-spark terverifikasi live
+# (input_image diterima, input_tokens ikut naik). Keluarga besar lain
+# mengikuti spec vendor masing-masing. Model di luar daftar = False agar
+# klien tidak mengirim gambar ke model text-only (400 upstream).
+VISION_EXACT_MODELS = frozenset({
+    "deepseek-v4-flash-vision-exp",
+})
+
+VISION_PREFIXES = (
+    "muse-spark",
+    "gpt-",
+    "gemini-",
+    "grok-",
+    "claude-",
+    "qwen",
+    "glm-",
+    "kimi-",
+    "minimax-",
+)
+
+
+def supports_vision(model_id: Optional[str]) -> bool:
+    """True bila model mendukung input gambar (vision).
+
+    Dipakai untuk mengiklankan `modalities` di `/v1/models` agar klien
+    seperti Kilo Code mengaktifkan tombol/lampiran gambar. Tidak pernah
+    melempar; unknown -> False.
+    """
+    try:
+        name = (model_id or "").strip().lower()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not name:
+        return False
+    if name in VISION_EXACT_MODELS:
+        return True
+    for prefix in VISION_PREFIXES:
+        try:
+            if name.startswith(prefix):
+                return True
+        except (TypeError, AttributeError):
+            continue
+    return False
+
+
 def _load_env_overrides() -> Dict[str, int]:
     raw = os.getenv("MODEL_CONTEXT_OVERRIDES_JSON", "").strip()
     if not raw:

@@ -10,7 +10,7 @@ from app.core.http_client import _get_http
 from app.core.config import MODELS_CACHE_TTL_SECONDS, OPENCODE_MODELS_URL
 from app.core.errors import UpstreamError
 from app.core.schemas import ModelInfo
-from app.services.model_context import get_model_context_window
+from app.services.model_context import get_model_context_window, supports_vision
 from app.services.model_endpoints import get_model_endpoint
 from starlette.status import (
     HTTP_502_BAD_GATEWAY,
@@ -25,9 +25,17 @@ def _enrich_model(model_id: str, **fields) -> ModelInfo:
     All four aliases (context_length / context_window / max_input_tokens /
     max_context_length) carry the same value so OpenRouter-style,
     LiteLLM-style, and generic OpenAI clients all read the right number.
+    Vision diiklankan via `modalities` + `supports_vision`/`vision` agar
+    klien seperti Kilo Code mengaktifkan lampiran gambar (khususnya
+    muse-spark yang terverifikasi live). Extra fields lolos karena
+    `ModelInfo.model_config = extra="allow"`.
     """
     ctx = get_model_context_window(model_id)
     endpoint = fields.pop("endpoint", None) or get_model_endpoint(model_id)
+    vision = supports_vision(model_id)
+    fields.setdefault("modalities", ["text", "image"] if vision else ["text"])
+    fields.setdefault("supports_vision", vision)
+    fields.setdefault("vision", vision)
     return ModelInfo(
         context_length=ctx,
         context_window=ctx,
