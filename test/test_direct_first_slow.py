@@ -130,10 +130,10 @@ def _c2():
 
 # ---------- D. knob ----------
 
-@case("D1 knob ada + default true")
+@case("D1 knob ada + default false (relay-first)")
 def _d1():
     import app.core.config as c
-    assert c.DIRECT_FIRST_SLOW is True
+    assert c.DIRECT_FIRST_SLOW is False
 
 
 def main() -> int:

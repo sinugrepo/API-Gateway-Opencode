@@ -86,7 +86,10 @@ class _FakeClient:
         self.calls = []
 
     def stream(self, method, url, json=None, headers=None, **kwargs):
-        self.calls.append({"url": url, "headers": dict(headers or {})})
+        # Salin dangkal: generator memutasi payload in-place (fresh retry),
+        # tanpa salinan semua call tampak memakai nilai terakhir.
+        self.calls.append({"url": url, "headers": dict(headers or {}),
+                           "payload": dict(json) if isinstance(json, dict) else json})
         status, data = self._script.pop(0)
         if status == 200:
             return _FakeCM(_FakeResp(200, lines=data))
@@ -285,6 +288,92 @@ def _f1():
     joined = "\n".join(chunks)
     assert "response.output_text.delta" in joined, joined[-500:]
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+# ---------- H. rotasi penuh + pasangan konsisten ----------
+
+@case("H1 chat all-403 relay+direct -> fresh rotasi penuh 1 sesi baru")
+def _h1():
+    import app.services.streaming as s
+    old_delay, s.FORBIDDEN_RETRY_DELAY = s.FORBIDDEN_RETRY_DELAY, 0.0
+    old_http, fake = s._get_http, _FakeClient([
+        (403, FORBIDDEN_BODY),  # fase 1: relay lama
+        (403, FORBIDDEN_BODY),  # fase 1: direct lama
+        (403, FORBIDDEN_BODY),  # fase fresh: relay baru
+        (200, _chat_ok_lines()),
+    ])
+    old_batch = s._relay_batch_for_request
+    old_limit = s._limit_stream_targets
+    s._get_http = lambda: fake
+    s._relay_batch_for_request = lambda for_stream=True: ["https://relay-test-1/"]
+    s._limit_stream_targets = lambda targets: targets
+    try:
+        chunks = _run_stream(s, s.stream_generator(
+            {"model": "mimo-v2.6-flash-free",
+             "messages": [{"role": "user", "content": "hi"}],
+             "stream": True},
+            client_model="mimo-v2.6-flash-free",
+            include_usage_requested=True,
+            background_tasks=BackgroundTasks(),
+            use_relay=True,
+            opencode_headers=_base_headers(),
+        ))
+    finally:
+        s._get_http = old_http
+        s._relay_batch_for_request = old_batch
+        s._limit_stream_targets = old_limit
+        s.FORBIDDEN_RETRY_DELAY = old_delay
+    assert len(fake.calls) == 4, f"2 fase-1 + 2 fresh, got {len(fake.calls)}"
+    sessions = [c["headers"]["x-opencode-session"] for c in fake.calls]
+    assert sessions[0] == sessions[1] == "ses_abcdef1234567890abcdefghij"
+    assert sessions[2] == sessions[3] != sessions[0], \
+        "fase fresh: SATU sesi baru dipakai di semua target"
+    joined = "\n".join(chunks)
+    assert chunks[-1] == "data: [DONE]\n\n", joined[-300:]
+
+
+@case("H2 responses all-403 -> cache-key ikut disegarkan konsisten")
+def _h2():
+    import app.services.responses_bridge as b
+    old_delay, b.FORBIDDEN_RETRY_DELAY = b.FORBIDDEN_RETRY_DELAY, 0.0
+    old_http, fake = b._get_http, _FakeClient([
+        (403, FORBIDDEN_BODY),
+        (200, _resp_ok_lines()),
+    ])
+    b._get_http = lambda: fake
+    orig_key = "ORIGKEY0123456789abcdef01234567"
+    try:
+        chunks = _run_stream(b, b.responses_stream_generator(
+            {"model": "mimo-v2.6-flash-free", "input": "hi", "stream": True,
+             "prompt_cache_key": orig_key},
+            client_model="mimo-v2.6-flash-free",
+            background_tasks=BackgroundTasks(),
+            use_relay=False,
+            opencode_headers=_base_headers(),
+        ))
+    finally:
+        b._get_http = old_http
+        b.FORBIDDEN_RETRY_DELAY = old_delay
+    assert len(fake.calls) == 2, f"harus 1 direct + 1 fresh, got {len(fake.calls)}"
+    keys = [c["payload"].get("prompt_cache_key") for c in fake.calls]
+    assert keys[0] == orig_key, keys
+    assert keys[1] != orig_key and len(keys[1]) == 32, keys
+    sessions = [c["headers"]["x-opencode-session"] for c in fake.calls]
+    assert sessions[1] != sessions[0]
+    joined = "\n".join(chunks)
+    assert chunks[-1] == "data: [DONE]\n\n", joined[-300:]
+
+
+@case("H3 tanpa cache-key di payload -> tidak ditambah-tambah")
+def _h3():
+    from app.services.opencode import _fresh_retry_targets
+    targets = [("https://x/", {"x-opencode-session": "ses_OLD"})]
+    payload = {"model": "m", "messages": []}
+    new_targets, session, key = _fresh_retry_targets(targets, payload)
+    assert "prompt_cache_key" not in payload
+    assert len(new_targets) == 1
+    assert new_targets[0][1]["x-opencode-session"] == session != "ses_OLD"
+    assert len(key) == 32
 
 
 # ---------- G. struktural generator-3 ----------

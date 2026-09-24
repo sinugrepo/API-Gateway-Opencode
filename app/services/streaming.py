@@ -33,7 +33,7 @@ from app.core.config import (
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
 from app.core.http_client import _get_http
 from app.core.logging_utils import _log
-from app.services.opencode import _fresh_identity_headers, _fresh_request_headers, _oc_session_tag
+from app.services.opencode import _fresh_request_headers, _fresh_retry_targets, _oc_session_tag
 from app.core.sse import _sse
 from app.services.relay import (
     _is_giant_payload,
@@ -722,16 +722,19 @@ async def stream_generator(
                 break
             # Upaya terakhir all-403: 403 di direct membuktikan yang di-flag
             # BUKAN IP relay melainkan identitas request (sesi di-flag /
-            # detector transien) — rotasi IP tidak akan sembuh. Satu
-            # percobaan ke target TERAKHIR (direct bila fallback aktif,
-            # sehingga setting USE_RELAY/RELAY_FALLBACK operator dihormati)
-            # dengan session+request ID baru. Aman dari duplikasi: syarat
-            # masuk menjamin nol konten terkirim ke klien.
+            # detector transien) — rotasi IP saja tidak sembuh. Rotasi PENUH
+            # dengan SATU pasangan (session, prompt_cache_key) baru yang
+            # konsisten (lihat _fresh_retry_targets): menguji hipotesis sesi
+            # di SETIAP egress, murah karena 403 gagal cepat. Aman dari
+            # duplikasi: syarat masuk menjamin nol konten terkirim ke klien.
             fresh_session_retry_done = True
-            retry_url, retry_headers = targets[-1]
             old_tag = _oc_session_tag(opencode_headers)
-            base_headers = _fresh_identity_headers(retry_headers)
-            targets = [(retry_url, dict(base_headers))]
+            fresh_targets, fresh_session, _fresh_key = _fresh_retry_targets(
+                targets, payload
+            )
+            if not fresh_targets:
+                break
+            targets = fresh_targets
             forbidden_count = 0
             saw_non_403_failure = False
             last_error = None
@@ -740,9 +743,9 @@ async def stream_generator(
             spurious_429_retried = set()
             _log(
                 "STREAM",
-                f"FRESH-SESSION-RETRY model={client_model} target={retry_url} "
-                f"{old_tag} -> {_oc_session_tag(base_headers)} "
-                f"(semua target 403 pra-payload, delay {FORBIDDEN_RETRY_DELAY:.1f}s)",
+                f"FRESH-SESSION-RETRY model={client_model} {len(targets)} target "
+                f"{old_tag} -> {_oc_session_tag({'x-opencode-session': fresh_session})} "
+                f"(rotasi penuh pasangan baru, delay {FORBIDDEN_RETRY_DELAY:.1f}s)",
             )
             await asyncio.sleep(FORBIDDEN_RETRY_DELAY)
             continue

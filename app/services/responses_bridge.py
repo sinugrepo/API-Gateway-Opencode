@@ -33,7 +33,7 @@ from app.core.config import (
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
 from app.core.http_client import _get_http
 from app.core.logging_utils import _log
-from app.services.opencode import _fresh_identity_headers, _fresh_request_headers, _oc_session_tag
+from app.services.opencode import _fresh_request_headers, _fresh_retry_targets, _oc_session_tag
 from app.services.relay import (
     _is_giant_payload,
     _is_relay_timeout,
@@ -1055,13 +1055,17 @@ async def responses_stream_generator(
             ):
                 break
             # Upaya terakhir all-403 (termasuk direct): identitas lama yang
-            # di-flag. Satu percobaan ke target TERAKHIR dengan session +
-            # request baru (lihat stream_generator untuk rationale penuh).
+            # di-flag. Rotasi PENUH dengan SATU pasangan (session,
+            # prompt_cache_key) baru yang konsisten (lihat
+            # _fresh_retry_targets): menguji hipotesis sesi di setiap egress.
             fresh_session_retry_done = True
-            retry_url, retry_headers = targets[-1]
             old_tag = _oc_session_tag(opencode_headers)
-            base_headers = _fresh_identity_headers(retry_headers)
-            targets = [(retry_url, dict(base_headers))]
+            fresh_targets, fresh_session, _fresh_key = _fresh_retry_targets(
+                targets, payload
+            )
+            if not fresh_targets:
+                break
+            targets = fresh_targets
             forbidden_count = 0
             saw_non_403_failure = False
             last_error = None
@@ -1070,9 +1074,9 @@ async def responses_stream_generator(
             spurious_429_retried = set()
             _log(
                 "RESP",
-                f"FRESH-SESSION-RETRY model={client_model} target={retry_url} "
-                f"{old_tag} -> {_oc_session_tag(base_headers)} "
-                f"(semua target 403 pra-byte, delay {FORBIDDEN_RETRY_DELAY:.1f}s)",
+                f"FRESH-SESSION-RETRY model={client_model} {len(targets)} target "
+                f"{old_tag} -> {_oc_session_tag({'x-opencode-session': fresh_session})} "
+                f"(rotasi penuh pasangan baru, delay {FORBIDDEN_RETRY_DELAY:.1f}s)",
             )
             await asyncio.sleep(FORBIDDEN_RETRY_DELAY)
             continue
@@ -1976,13 +1980,17 @@ async def responses_to_chat_stream_generator(
                 or _payload_has_replay_reasoning(payload)
             ):
                 break
-            # Upaya terakhir all-403 (termasuk direct): satu percobaan
-            # ke target TERAKHIR dengan session+request baru.
+            # Upaya terakhir all-403 (termasuk direct): rotasi PENUH
+            # dengan SATU pasangan (session, prompt_cache_key) baru yang
+            # konsisten (lihat _fresh_retry_targets).
             fresh_session_retry_done = True
-            retry_url, retry_headers = targets[-1]
             old_tag = _oc_session_tag(opencode_headers)
-            base_headers = _fresh_identity_headers(retry_headers)
-            targets = [(retry_url, dict(base_headers))]
+            fresh_targets, fresh_session, _fresh_key = _fresh_retry_targets(
+                targets, payload
+            )
+            if not fresh_targets:
+                break
+            targets = fresh_targets
             forbidden_count = 0
             saw_non_403_failure = False
             last_error = None
@@ -1991,9 +1999,9 @@ async def responses_to_chat_stream_generator(
             spurious_429_retried = set()
             _log(
                 "RESP",
-                f"FRESH-SESSION-RETRY model={client_model} target={retry_url} "
-                f"{old_tag} -> {_oc_session_tag(base_headers)} "
-                f"(semua target 403 pra-payload, delay {FORBIDDEN_RETRY_DELAY:.1f}s)",
+                f"FRESH-SESSION-RETRY model={client_model} {len(targets)} target "
+                f"{old_tag} -> {_oc_session_tag({'x-opencode-session': fresh_session})} "
+                f"(rotasi penuh pasangan baru, delay {FORBIDDEN_RETRY_DELAY:.1f}s)",
             )
             await asyncio.sleep(FORBIDDEN_RETRY_DELAY)
             continue

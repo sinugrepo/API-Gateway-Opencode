@@ -15,7 +15,7 @@ import os
 import secrets
 import struct
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import OPENCODE_CLIENT_NAME, OPENCODE_PROJECT, OPENCODE_SESSION_ID
 
@@ -279,6 +279,47 @@ def _fresh_identity_headers(base: Optional[Dict[str, str]]) -> Dict[str, str]:
     headers["x-opencode-session"] = _new_opencode_session_id()
     headers["x-opencode-request"] = _new_opencode_request_id()
     return headers
+
+
+def _fresh_retry_targets(
+    targets: Any, payload: Any
+) -> Tuple[List[Tuple[str, Dict[str, str]]], str, str]:
+    """Bangun ulang daftar target untuk fase fresh-session retry.
+
+    Return (new_targets, fresh_session, fresh_key):
+    - SEMUA target (rotasi penuh, bukan satu target terakhir) memakai SATU
+      session baru yang sama — menguji hipotesis "sesi lama yang di-flag"
+      di SETIAP egress IP, bukan cuma satu. Penandaan 403-cooldown relay
+      hanya memengaruhi batch request BERIKUTNYA, bukan list ini.
+    - prompt_cache_key payload ikut disegarkan (bila payload memang punya
+      key) agar pasangan (session, key) tetap konsisten seperti percakapan
+      baru yang alami. Pasangan (sesi acak + key lama) tidak pernah terjadi
+      di alam dan dicurigai memperbesar peluang 403 lanjutan.
+    - Kunci klien yang eksplisit ikut disegarkan demi konsistensi pasangan;
+      turn klien berikutnya menurunkan pasangan stabil normal seperti biasa
+      (derivasi per-request, tidak disimpan).
+    - Format tetap valid: session `ses_` ala CLI, key 32 hex seperti
+      fingerprint[:32] bawaan proxy.
+    """
+    fresh_session = _new_opencode_session_id()
+    fresh_key = secrets.token_hex(16)
+    new_targets: List[Tuple[str, Dict[str, str]]] = []
+    try:
+        items = list(targets or [])
+    except TypeError:
+        items = []
+    for entry in items:
+        try:
+            url, headers = entry
+        except (TypeError, ValueError):
+            continue
+        fresh_headers = dict(headers or {})
+        fresh_headers["x-opencode-session"] = fresh_session
+        fresh_headers["x-opencode-request"] = _new_opencode_request_id()
+        new_targets.append((url, fresh_headers))
+    if isinstance(payload, dict) and isinstance(payload.get("prompt_cache_key"), str):
+        payload["prompt_cache_key"] = fresh_key
+    return new_targets, fresh_session, fresh_key
 
 
 # ── Free-tier client fingerprint gates ( diverifikasi live 2026-09-18 ) ──

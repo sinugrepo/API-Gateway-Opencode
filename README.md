@@ -27,9 +27,11 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
   header `Retry-After` ke klien. Penanganan khusus spurious-429 muse-spark.
 - Free-tier 403: relay yang kena 403 di-cooldown 300 dtk; bila SEMUA target
   (termasuk direct) 403 pra-payload — yang di-flag identitas request, bukan
-  IP — satu upaya terakhir direct dengan session+request baru
-  (`FORBIDDEN_FRESH_SESSION_RETRY`, `FORBIDDEN_RETRY_DELAY`), kecuali payload
-  membawa replay `encrypted_content` (identitas wajib stabil).
+  IP — rotasi PENUH sekali lagi dengan SATU pasangan (session,
+  prompt_cache_key) baru yang konsisten (`FORBIDDEN_FRESH_SESSION_RETRY`,
+  `FORBIDDEN_RETRY_DELAY`), kecuali payload membawa replay `encrypted_content`
+  (identitas wajib stabil). Fingerprint §8 opencode-session.md ditegakkan di
+  semua jalur (kuartet tools, stream:true, store:false, key stabil, xhigh).
 - Streaming stabil: `Accept-Encoding: identity`, SSE keepalive 5 dtk,
   `reasoning_content` diteruskan agar socket tidak idle — termasuk reasoning
   yang datang utuh via `response.output_item.done` (tanpa summary delta);
@@ -88,7 +90,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `RESPONSES_REVERSE_BRIDGE` | `true` | `false` = model non-Responses via `/v1/responses` ditolak 400 bersih (tanpa bridge balik) |
 | `FORBIDDEN_FRESH_SESSION_RETRY` | `true` | `false` = matikan upaya terakhir sesi-baru saat semua target 403 |
 | `FORBIDDEN_RETRY_DELAY` | `2.0` | Jeda (dtk) sebelum upaya terakhir sesi-baru |
-| `DIRECT_FIRST_SLOW` | `true` | `false` = perilaku lama (relay dulu selalu, walau TTFB diprediksi >25s) |
+| `DIRECT_FIRST_SLOW` | `false` | `true` = direct dulu untuk thinking xhigh/giant (relay fallback); default relay-first agar rotasi 11 IP maksimal menemukan egress bersih saat flagging dinamis |
 | `PORT` / `RELOAD` | `8000` / `false` | Server |
 
 ## Endpoint
