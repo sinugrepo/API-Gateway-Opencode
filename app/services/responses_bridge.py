@@ -13,6 +13,7 @@ from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 from app.core.config import (
     API_KEY,
     BRIDGE_REQUEST_TIMEOUT,
+    DIRECT_FIRST_SLOW,
     FORBIDDEN_FRESH_SESSION_RETRY,
     FORBIDDEN_RETRY_DELAY,
     HERMES_COMPAT,
@@ -27,17 +28,20 @@ from app.core.config import (
     RELAY_STREAM_BROKEN_COOLDOWN,
     SSE_KEEPALIVE_INTERVAL,
     USE_RELAY,
+    _is_responses_only_model,
 )
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
 from app.core.http_client import _get_http
 from app.core.logging_utils import _log
 from app.services.opencode import _fresh_identity_headers, _fresh_request_headers, _oc_session_tag
 from app.services.relay import (
+    _is_giant_payload,
     _is_relay_timeout,
     _limit_stream_targets,
     _mark_relay_forbidden,
     _mark_relay_rate_limited,
     _mark_relay_stream_broken,
+    _order_targets_direct_first,
     _payload_has_media,
     _relay_batch_for_request,
     _should_mark_stream_broken,
@@ -650,6 +654,14 @@ async def responses_stream_generator(
         relays = [t for t in targets if "x-relay-target" in t[1]]
         targets = direct + relays
         _log("RESP", "VISION: direct dulu, relay khusus 429")
+    if DIRECT_FIRST_SLOW and (
+        _is_responses_only_model(client_model) or _is_giant_payload(payload)
+    ):
+        # Lihat STREAM/SLOW di stream_generator: relay untuk kasus ini pasti
+        # 504 tanpa byte; direct dulu agar thinking tidak dibuang + klien
+        # seperti Hermes tidak reconnect dalam loop stall.
+        targets = _order_targets_direct_first(targets)
+        _log("RESP", f"SLOW model={client_model}: direct dulu, relay fallback")
 
     last_error: Optional[str] = None
     last_rate_limited = False
@@ -1231,6 +1243,15 @@ async def responses_to_chat_stream_generator(
         relays = [t for t in targets if "x-relay-target" in t[1]]
         targets = direct + relays
         _log("RESP", "VISION: direct dulu, relay khusus 429")
+    if DIRECT_FIRST_SLOW and (
+        _is_responses_only_model(client_model) or _is_giant_payload(payload)
+    ):
+        # Generator ini KHUSUS model Responses-only (spark & co.): thinking
+        # xhigh rutin >25s sehingga relay selalu 504 tanpa byte. Direct dulu
+        # agar thinking jalan sekali + klien seperti Hermes yang mengabaikan
+        # keepalive `:` tidak reconnect dalam loop stall.
+        targets = _order_targets_direct_first(targets)
+        _log("RESP", f"SLOW model={client_model}: direct dulu, relay fallback")
 
     last_error: Optional[str] = None
     last_rate_limited = False

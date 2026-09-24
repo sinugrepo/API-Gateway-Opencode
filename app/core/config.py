@@ -285,6 +285,16 @@ FORBIDDEN_FRESH_SESSION_RETRY = os.getenv("FORBIDDEN_FRESH_SESSION_RETRY", "true
 FORBIDDEN_RETRY_DELAY = float(os.getenv("FORBIDDEN_RETRY_DELAY", "2.0"))
 
 
+# Direct-first untuk request yang relay-nya MUSTAHIL sukses: thinking xhigh
+# muse-spark (TTFB wajar >25s) atau payload konteks raksasa. Tiap relay yang
+# dicoba pada kasus ini mati 504 tanpa byte (~25 dtk hangus per relay) dan
+# membuang progres thinking upstream; klien seperti Hermes yang mengabaikan
+# keepalive `:` lalu reconnect setelah ~85s tanpa data akan terjebak loop
+# stall selamanya. Direct dicoba dulu, relay tetap fallback bila direct
+# 429/5xx. `false` = perilaku lama (relay dulu selalu).
+DIRECT_FIRST_SLOW = os.getenv("DIRECT_FIRST_SLOW", "true").lower() == "true"
+
+
 # Berapa lama relay yang timeout di-skip untuk request streaming.
 # Default 30 menit: timeout platform Vercel bukan kondisi transien (limit
 # eksekusi ~25 dtk tidak pulih sendiri), jadi menandai ulang tiap 5 menit

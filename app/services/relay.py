@@ -269,6 +269,37 @@ def _relay_batch_for_request(for_stream: bool = False) -> List[str]:
     return healthy + penalized
 
 
+def _order_targets_direct_first(
+    targets: List[Tuple[str, Dict[str, str]]],
+) -> List[Tuple[str, Dict[str, str]]]:
+    """Susun ulang kandidat agar direct dicoba DULU, relay sebagai fallback.
+
+    Dipakai bila sukses via relay MUSTAHIL sejak awal: TTFB upstream yang
+    wajar melebihi limit eksekusi Vercel (~25s) — mis. thinking xhigh
+    muse-spark, atau payload konteks raksasa. Tiap percobaan relay pada
+    kasus ini murni membuang ~25 dtk (lalu 504 tanpa byte) plus membuang
+    progres thinking upstream yang sudah berjalan, karena attempt berikutnya
+    memulai request upstream baru dari nol. Klien seperti Hermes yang
+    mengabaikan keepalive `:` lalu reconnect setelah ~85s tanpa data akan
+    terjebak dalam loop stall selamanya bila 50 dtk pertama tiap request
+    selalu habis untuk churn relay.
+
+    Relay TIDAK dibuang — tetap menjadi fallback bila direct 429/5xx —
+    sehingga distribusi 429 dan masking IP cadangan tetap berfungsi.
+    Idempoten: bila direct sudah di depan (mis. hasil reorder vision),
+    urutan tidak berubah.
+    """
+    directs = [t for t in targets if "x-relay-target" not in t[1]]
+    relays = [t for t in targets if "x-relay-target" in t[1]]
+    if directs and targets and targets[0] not in directs:
+        _log(
+            "RELAY",
+            f"direct-first {len(relays)} relay -> direct dulu, "
+            f"relay sebagai fallback (TTFB diprediksi >25s Vercel)",
+        )
+    return directs + relays
+
+
 def _stream_request_headers(
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:

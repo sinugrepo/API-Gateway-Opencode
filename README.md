@@ -19,6 +19,10 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
 - Relay: 11 deployment Vercel di-rotasi per-request, 429-cooldown 60 dtk,
   penanda stream-broken 1800 dtk untuk timeout platform, giant-payload guard
   (>32 KB / >100 item tidak menandai relay rusak), `MAX_RELAY_STREAM_ATTEMPTS=2`.
+  Request yang relay-nya mustahil sukses (thinking xhigh spark, konteks
+  raksasa — TTFB wajar >25s limit Vercel) langsung direct-first, relay tetap
+  fallback (`DIRECT_FIRST_SLOW`); tanpa ini tiap request membuang ~50 dtk
+  churn relay dan klien seperti Hermes reconnect dalam loop stall.
 - Rate-limit: retry + backoff, hormati `Retry-After` upstream; 429 bersih +
   header `Retry-After` ke klien. Penanganan khusus spurious-429 muse-spark.
 - Free-tier 403: relay yang kena 403 di-cooldown 300 dtk; bila SEMUA target
@@ -82,6 +86,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `RESPONSES_REVERSE_BRIDGE` | `true` | `false` = model non-Responses via `/v1/responses` ditolak 400 bersih (tanpa bridge balik) |
 | `FORBIDDEN_FRESH_SESSION_RETRY` | `true` | `false` = matikan upaya terakhir sesi-baru saat semua target 403 |
 | `FORBIDDEN_RETRY_DELAY` | `2.0` | Jeda (dtk) sebelum upaya terakhir sesi-baru |
+| `DIRECT_FIRST_SLOW` | `true` | `false` = perilaku lama (relay dulu selalu, walau TTFB diprediksi >25s) |
 | `PORT` / `RELOAD` | `8000` / `false` | Server |
 
 ## Endpoint
@@ -143,7 +148,8 @@ app/services/            # relay, upstream, streaming, responses_bridge,
 app/routes/              # chat, responses_api, misc, usage_routes, monitor
 app/web/templates/       # login.html, dashboard.html (vanilla, tanpa build)
 test/                    # test_long_stream_fixes.py, test_live_requests.py,
-                         # test_reverse_bridge.py, test_forbidden_fresh_retry.py
+                         # test_reverse_bridge.py, test_forbidden_fresh_retry.py,
+                         # test_direct_first_slow.py
 plans/                   # docs lokal, di-gitignore
 usage.db*                # runtime SQLite, di-gitignore
 ```
@@ -155,6 +161,7 @@ python -m compileall -q app main.py test
 python test/test_long_stream_fixes.py   # offline, 34 case, harus ALL PASSED
 python test/test_reverse_bridge.py      # offline, 15 case (routing endpoint + reverse bridge)
 python test/test_forbidden_fresh_retry.py  # offline, 7 case (retry sesi-baru all-403)
+python test/test_direct_first_slow.py  # offline, 8 case (direct-first request lambat)
 python test/test_live_requests.py       # live: ASGI in-process → relay Vercel
                                         # + opencode.ai; kontrak 200 / 429-bersih /
                                         # EMPTY_RESPONSE; butuh internet
