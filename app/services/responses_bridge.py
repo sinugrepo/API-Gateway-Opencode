@@ -531,6 +531,22 @@ def _extract_responses_reasoning_text(output: Any) -> str:
         return ""
 
 
+def _format_event_types(counts: Any) -> str:
+    """Render ringkas {'a':1} -> 'a:1' untuk log (observability).
+
+    Dipakai di SUMMARY + EMPTY-STREAM agar kasus "banyak byte, nol konten"
+    langsung terlihat komposisi event-nya (mis. hanya created + item.done
+    reasoning + completed). Tidak pernah melempar.
+    """
+    try:
+        if not isinstance(counts, dict) or not counts:
+            return "-"
+        items = sorted(counts.items(), key=lambda kv: str(kv[0]))[:32]
+        return ",".join(f"{k}:{v}" for k, v in items)[:300]
+    except (TypeError, ValueError, AttributeError):
+        return "-"
+
+
 def _payload_has_replay_reasoning(payload: Any) -> bool:
     """True bila payload input membawa item reasoning ber-encrypted_content."""
     try:
@@ -1152,6 +1168,7 @@ async def responses_to_chat_stream_generator(
     saw_text_content = False
     wire_bytes = 0
     data_events = 0
+    event_type_counts: Dict[str, int] = {}
     reasoning_events = 0
     reasoning_chars = 0
     reasoning_buffer: List[str] = []
@@ -1195,6 +1212,7 @@ async def responses_to_chat_stream_generator(
                 "RESP",
                 f"BRIDGE-SUMMARY id={stream_id[:8]} {note} model={client_model} "
                 f"wire_bytes={wire_bytes} events={data_events} "
+                f"types={_format_event_types(event_type_counts)} "
                 f"reasoning:events={reasoning_events} chars={reasoning_chars} dur={reasoning_dur} "
                 f"content_start={'+%.2fs' % (first_content_at - stream_start) if first_content_at is not None else '-'} "
                 f"total={time.time() - stream_start:.2f}s",
@@ -1655,6 +1673,9 @@ async def responses_to_chat_stream_generator(
                                     break
                                 data_events += 1
                                 event_type = event.get("type", "")
+                                if isinstance(event_type, str) and event_type:
+                                    if len(event_type_counts) < 32 or event_type in event_type_counts:
+                                        event_type_counts[event_type] = event_type_counts.get(event_type, 0) + 1
 
                                 # Reasoning upstream: teruskan sebagai
                                 # `reasoning_content` agar klien menerima `data:`
@@ -1748,6 +1769,106 @@ async def responses_to_chat_stream_generator(
                                                 ]
                                             }
                                         )
+                                elif event_type == "response.output_item.done":
+                                    # Item lengkap (thinking/message/tool) yang
+                                    # dikirim utuh di akhir TANPA delta
+                                    # sebelumnya — mis. reasoning xhigh yang
+                                    # tidak men-streaming summary. Tanpa cabang
+                                    # ini, thinking puluhan KB tidak terlihat
+                                    # klien (reasoning_events=0) dan stream
+                                    # berakhir EMPTY. Guard anti-duplikat:
+                                    # teruskan hanya yang belum mengalir.
+                                    done_item = event.get("item") or {}
+                                    if not isinstance(done_item, dict):
+                                        continue
+                                    done_kind = done_item.get("type")
+                                    if done_kind == "reasoning":
+                                        done_text = _extract_responses_reasoning_text(
+                                            [done_item]
+                                        )
+                                        if done_text:
+                                            now = time.time()
+                                            if reasoning_buffer_chars < 20000:
+                                                reasoning_buffer.append(
+                                                    done_text[:20000 - reasoning_buffer_chars]
+                                                )
+                                                reasoning_buffer_chars += min(
+                                                    len(done_text), 20000 - reasoning_buffer_chars
+                                                )
+                                            # Forward live hanya bila belum ada
+                                            # reasoning delta (hindari thinking
+                                            # ganda di layar klien).
+                                            if reasoning_events == 0:
+                                                if first_reasoning_at is None:
+                                                    first_reasoning_at = now
+                                                    _log(
+                                                        "RESP",
+                                                        f"REASONING start +{now - stream_start:.2f}s (item.done)",
+                                                    )
+                                                last_reasoning_at = now
+                                                if REASONING_FORWARD:
+                                                    role = role_chunk()
+                                                    if role:
+                                                        sent_payload = True
+                                                        yield role
+                                                    sent_payload = True
+                                                    reasoning_events += 1
+                                                    reasoning_chars += len(done_text)
+                                                    yield chunk(
+                                                        {"reasoning_content": done_text[:20000]}
+                                                    )
+                                    elif done_kind == "message":
+                                        if not saw_text_content:
+                                            content_d, _calls_d = _responses_output_to_chat(
+                                                [done_item]
+                                            )
+                                            if content_d:
+                                                role = role_chunk()
+                                                if role:
+                                                    sent_payload = True
+                                                    yield role
+                                                sent_payload = True
+                                                saw_text_content = True
+                                                if first_content_at is None:
+                                                    first_content_at = time.time()
+                                                yield chunk({"content": content_d})
+                                    elif done_kind == "function_call":
+                                        key = str(
+                                            event.get("output_index", done_item.get("item_id", len(call_ids)))
+                                        )
+                                        if key not in call_index_by_key:
+                                            call_index_by_key[key] = len(call_ids)
+                                            call_ids.append(
+                                                done_item.get("call_id") or done_item.get("id") or f"call_{len(call_ids)}"
+                                            )
+                                        idx = call_index_by_key[key]
+                                        call_id = call_ids[idx]
+                                        if call_id not in call_id_emitted:
+                                            args = done_item.get("arguments", "{}")
+                                            if isinstance(args, (dict, list)):
+                                                args = json.dumps(args, ensure_ascii=False)
+                                            saw_tool_call = True
+                                            role = role_chunk()
+                                            if role:
+                                                sent_payload = True
+                                                yield role
+                                            sent_payload = True
+                                            call_id_emitted.add(call_id)
+                                            yield chunk(
+                                                {
+                                                    "tool_calls": [
+                                                        {
+                                                            "index": idx,
+                                                            "id": call_id,
+                                                            "type": "function",
+                                                            "function": {
+                                                                "name": done_item.get("name") or "",
+                                                                "arguments": str(args if args is not None else "{}"),
+                                                            },
+                                                        }
+                                                    ]
+                                                }
+                                            )
                                 elif event_type == "response.function_call_arguments.delta":
                                     key = str(event.get("output_index", event.get("item_id", "")))
                                     if key not in call_index_by_key:
@@ -1911,6 +2032,7 @@ async def responses_to_chat_stream_generator(
                 "RESP",
                 f"EMPTY-STREAM model={client_model} wire_bytes={wire_bytes} "
                 f"events={data_events} reasoning_events={reasoning_events} "
+                f"types={_format_event_types(event_type_counts)} "
                 f"preview={raw_preview[:5]!r}",
             )
             yield _sse(

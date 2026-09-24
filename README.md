@@ -31,7 +31,9 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
   (`FORBIDDEN_FRESH_SESSION_RETRY`, `FORBIDDEN_RETRY_DELAY`), kecuali payload
   membawa replay `encrypted_content` (identitas wajib stabil).
 - Streaming stabil: `Accept-Encoding: identity`, SSE keepalive 5 dtk,
-  `reasoning_content` diteruskan agar socket tidak idle.
+  `reasoning_content` diteruskan agar socket tidak idle — termasuk reasoning
+  yang datang utuh via `response.output_item.done` (tanpa summary delta);
+  `BRIDGE-SUMMARY`/`EMPTY-STREAM` mencatat rincian `types=` per tipe event.
 - Usage: SQLite WAL (`usage.db`) per `request_id` + agregasi per model/period.
 - Hardening: `BodyLimitMiddleware` 413 via `Content-Length` (>8 MB),
   `ScanGuardMiddleware` ala fail2ban untuk probe `/.env` dkk, HMAC cookie
@@ -149,7 +151,7 @@ app/routes/              # chat, responses_api, misc, usage_routes, monitor
 app/web/templates/       # login.html, dashboard.html (vanilla, tanpa build)
 test/                    # test_long_stream_fixes.py, test_live_requests.py,
                          # test_reverse_bridge.py, test_forbidden_fresh_retry.py,
-                         # test_direct_first_slow.py
+                         # test_direct_first_slow.py, test_output_item_done.py
 plans/                   # docs lokal, di-gitignore
 usage.db*                # runtime SQLite, di-gitignore
 ```
@@ -162,6 +164,7 @@ python test/test_long_stream_fixes.py   # offline, 34 case, harus ALL PASSED
 python test/test_reverse_bridge.py      # offline, 15 case (routing endpoint + reverse bridge)
 python test/test_forbidden_fresh_retry.py  # offline, 7 case (retry sesi-baru all-403)
 python test/test_direct_first_slow.py  # offline, 8 case (direct-first request lambat)
+python test/test_output_item_done.py  # offline, 5 case (reasoning utuh done-event)
 python test/test_live_requests.py       # live: ASGI in-process → relay Vercel
                                         # + opencode.ai; kontrak 200 / 429-bersih /
                                         # EMPTY_RESPONSE; butuh internet
