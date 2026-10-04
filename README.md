@@ -21,10 +21,9 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
 - Relay: 11 deployment Vercel di-rotasi per-request, 429-cooldown 60 dtk,
   penanda stream-broken 1800 dtk untuk timeout platform, giant-payload guard
   (>32 KB / >100 item tidak menandai relay rusak), `MAX_RELAY_STREAM_ATTEMPTS=2`.
-  Request yang relay-nya mustahil sukses (thinking xhigh spark, konteks
-  raksasa — TTFB wajar >25s limit Vercel) langsung direct-first, relay tetap
-  fallback (`DIRECT_FIRST_SLOW`); tanpa ini tiap request membuang ~50 dtk
-  churn relay dan klien seperti Hermes reconnect dalam loop stall.
+  Kebijakan relay-first: non-vision WAJIB relay dulu, direct hanya fallback
+  terakhir setelah SEMUA relay gagal; vision tetap direct-first (biner base64
+  rawan 413/504 relay). `DIRECT_FIRST_SLOW` deprecated (no-op).
 - Rate-limit: retry + backoff, hormati `Retry-After` upstream; 429 bersih +
   header `Retry-After` ke klien. Penanganan khusus spurious-429 muse-spark.
 - Free-tier 403: relay yang kena 403 di-cooldown 300 dtk; bila SEMUA target
@@ -96,7 +95,7 @@ contoh siap salin di `.env.example`. Environment yang sudah ada menang atas `.en
 | `RESPONSES_REVERSE_BRIDGE` | `true` | `false` = model non-Responses via `/v1/responses` ditolak 400 bersih (tanpa bridge balik) |
 | `FORBIDDEN_FRESH_SESSION_RETRY` | `true` | `false` = matikan upaya terakhir sesi-baru saat semua target 403 |
 | `FORBIDDEN_RETRY_DELAY` | `2.0` | Jeda (dtk) sebelum upaya terakhir sesi-baru |
-| `DIRECT_FIRST_SLOW` | `false` | `true` = direct dulu untuk thinking xhigh/giant (relay fallback); default relay-first agar rotasi 11 IP maksimal menemukan egress bersih saat flagging dinamis |
+| `DIRECT_FIRST_SLOW` | `false` | DEPRECATED no-op: relay-first selalu untuk non-vision; vision tetap direct-first |
 | `PORT` / `RELOAD` | `8000` / `false` | Server |
 
 ## Endpoint

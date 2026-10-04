@@ -380,16 +380,12 @@ FORBIDDEN_FRESH_SESSION_RETRY = os.getenv("FORBIDDEN_FRESH_SESSION_RETRY", "true
 FORBIDDEN_RETRY_DELAY = float(os.getenv("FORBIDDEN_RETRY_DELAY", "2.0"))
 
 
-# Direct-first untuk request yang relay-nya MUSTAHIL sukses: thinking xhigh
-# muse-spark (TTFB wajar >25s) atau payload konteks raksasa. Tiap relay yang
-# dicoba pada kasus ini mati 504 tanpa byte (~25 dtk hangus per relay) dan
-# membuang progres thinking upstream; klien seperti Hermes yang mengabaikan
-# keepalive `:` lalu reconnect setelah ~85s tanpa data akan terjebak loop
-# stall selamanya. Direct dicoba dulu, relay tetap fallback bila direct
-# 429/5xx. DEFAULT false (relay-first): di bawah flagging IP upstream yang
-# dinamis, rotasi 11 IP relay memberi peluang terbesar menemukan egress
-# bersih — pinning ke satu IP direct justru berisiko 100% gagal saat IP itu
-# di-flag. Aktifkan (`true`) hanya bila loop stall Hermes kembali muncul.
+# DEPRECATED (no-op): dulu direct-first untuk thinking xhigh / giant bila
+# `true`. Kebijakan kini RELAY-FIRST selalu untuk non-vision: direct hanya
+# fallback terakhir setelah SEMUA relay gagal, agar IP ter-masking dan rotasi
+# menemukan egress bersih. Variabel dibaca agar env lama tidak crash, tapi
+# tidak lagi mengubah urutan target di generator mana pun. Vision tetap
+# direct-first (biner base64 rawan 413/504 relay) via _payload_has_media.
 DIRECT_FIRST_SLOW = os.getenv("DIRECT_FIRST_SLOW", "false").lower() == "true"
 
 

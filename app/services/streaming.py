@@ -13,7 +13,6 @@ from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 from app.core.config import (
     API_KEY,
     BRIDGE_REQUEST_TIMEOUT,
-    DIRECT_FIRST_SLOW,
     FORBIDDEN_FRESH_SESSION_RETRY,
     FORBIDDEN_RETRY_DELAY,
     HERMES_COMPAT,
@@ -28,7 +27,6 @@ from app.core.config import (
     SSE_KEEPALIVE_INTERVAL,
     STREAM_BYPASS_RELAY,
     USE_RELAY,
-    _is_responses_only_model,
 )
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
 from app.core.http_client import _get_http
@@ -36,7 +34,6 @@ from app.core.logging_utils import _log
 from app.services.opencode import _fresh_request_headers, _fresh_retry_targets, _oc_session_tag
 from app.core.sse import _sse
 from app.services.relay import (
-    _is_giant_payload,
     _is_relay_penalized,
     _is_relay_stream_broken,
     _is_relay_timeout,
@@ -44,7 +41,6 @@ from app.services.relay import (
     _mark_relay_forbidden,
     _mark_relay_rate_limited,
     _mark_relay_stream_broken,
-    _order_targets_direct_first,
     _payload_has_media,
     _relay_batch_for_request,
     _relay_stream_headers,
@@ -231,16 +227,11 @@ async def stream_generator(
         relays = [t for t in targets if "x-relay-target" in t[1]]
         targets = direct + relays
         _log("STREAM", f"VISION model={client_model}: direct dulu, relay khusus 429")
-    if DIRECT_FIRST_SLOW and (
-        _is_responses_only_model(client_model) or _is_giant_payload(payload)
-    ):
-        # Thinking xhigh (spark) / konteks raksasa: TTFB wajar >25s sehingga
-        # relay PASTI mati 504 tanpa byte. Mencoba relay dulu membuang ~25s
-        # per relay + progres thinking, dan membuat klien seperti Hermes
-        # (abaikan keepalive, reconnect ~85s tanpa data) stall selamanya.
-        # Short-circuit: spark dicek dulu (murah) agar tidak json.dumps.
-        targets = _order_targets_direct_first(targets)
-        _log("STREAM", f"SLOW model={client_model}: direct dulu, relay fallback")
+    # Kebijakan relay-first: non-vision WAJIB lewat relay dulu, direct hanya
+    # fallback terakhir setelah SEMUA relay gagal (429/5xx/timeout/
+    # relay.error). Direct-first untuk slow/giant dihapus — operator meminta
+    # relay selalu dicoba dulu (biaya 504 Vercel ditanggung limit 2 attempt +
+    # stream-broken cooldown, bukan direct-first).
 
     last_error: Optional[str] = None
     last_rate_limited = False  # True bila kegagalan terakhir adalah 429

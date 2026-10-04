@@ -1,21 +1,18 @@
-"""Validasi direct-first untuk request lambat (harus ALL PASSED).
+"""Validasi kebijakan relay-first (harus ALL PASSED).
 
 Jalankan dari repo root:  python test/test_direct_first_slow.py
 Keluar dengan kode 0 bila semua passed, 1 bila ada yang gagal.
 
-Latar: thinking xhigh muse-spark / konteks raksasa punya TTFB wajar >25s,
-sehingga tiap percobaan relay PASTI mati 504 tanpa byte. Mencoba 2 relay
-dulu membuang ~50 dtk + progres thinking upstream (attempt berikutnya mulai
-dari nol); klien seperti Hermes yang mengabaikan keepalive `:` lalu
-reconnect setelah ~85s tanpa data terjebak loop stall selamanya.
-Perbaikan: bila model Responses-only ATAU payload giant, direct dicoba
-DULU dan relay tetap sebagai fallback (distribusi 429 terjaga).
+Kebijakan (operator): non-vision WAJIB relay dulu, direct hanya fallback
+terakhir setelah SEMUA relay gagal. Vision tetap direct-first (biner base64
+rawan 413/504 relay). `DIRECT_FIRST_SLOW` deprecated (no-op, dibaca agar env
+lama tidak crash tapi tidak mengubah urutan target).
 
 Cakupan (semua offline, tanpa network):
-  A. Helper reorder: direct ke depan, relay utuh, idempoten
-  B. Kondisi pemicu: spark selalu; giant non-spark; kecil non-spark tidak
-  C. Ketiga generator memuat wiring kondisi + helper yang sama
-  D. Knob config ada + default true (perilaku baru aktif)
+  A. Helper reorder tetap ada & benar (dipakai test lain / kompatibilitas)
+  B. Deteksi model/giant tetap ada (dipakai guard giant-payload upstream)
+  C. Ketiga generator TIDAK lagi direct-first slow, vision guard tetap utuh
+  D. Knob config tetap ada (kompat env lama) + default false
 """
 import os
 import sys
@@ -42,7 +39,7 @@ def _direct():
     return ("https://opencode.ai/zen/v1/responses", {"Authorization": "Bearer x"})
 
 
-# ---------- A. helper reorder ----------
+# ---------- A. helper reorder (kompatibilitas) ----------
 
 @case("A1 direct ke depan, relay utuh sebagai fallback")
 def _a1():
@@ -64,9 +61,9 @@ def _a2():
     assert _order_targets_direct_first(mixed) == mixed
 
 
-# ---------- B. kondisi pemicu ----------
+# ---------- B. deteksi model/giant (dipakai guard lain) ----------
 
-@case("B1 spark selalu direct-first (tanpa hitung giant)")
+@case("B1 spark terdeteksi responses-only; mimo/gpt tidak")
 def _b1():
     from app.core.config import _is_responses_only_model
     assert _is_responses_only_model("muse-spark-1.3-contributor-free") is True
@@ -84,25 +81,9 @@ def _b2():
     assert _is_giant_payload(many) is True
 
 
-@case("B3 short-circuit: spark tidak perlu dumps raksasa")
-def _b3():
-    # Orde evaluasi di call-site: model dulu (murah), giant kemudian.
-    # Buktikan _is_giant_payload tidak dipanggil untuk spark dengan
-    # memalsukan fungsi yang melempar bila dipanggil.
-    import app.services.streaming as s
+# ---------- C. generator: relay-first enforced ----------
 
-    def _boom(payload):
-        raise AssertionError("giant check tak boleh jalan untuk spark")
-
-    # Simulasi ekspresi call-site persis seperti di kode.
-    from app.core.config import _is_responses_only_model
-    model = "muse-spark-1.3-contributor-free"
-    assert (_is_responses_only_model(model) or _boom({})) is True
-
-
-# ---------- C. wiring ketiga generator ----------
-
-@case("C1 ketiga generator pakai kondisi + helper yang sama")
+@case("C1 ketiga generator TANPA direct-first slow")
 def _c1():
     import inspect
     import app.services.streaming as s
@@ -111,28 +92,34 @@ def _c1():
                b.responses_stream_generator,
                b.responses_to_chat_stream_generator):
         src = inspect.getsource(fn)
-        assert "DIRECT_FIRST_SLOW" in src, fn.__name__
-        assert "_is_responses_only_model(client_model)" in src, fn.__name__
-        assert "_is_giant_payload(payload)" in src, fn.__name__
-        assert "_order_targets_direct_first(targets)" in src, fn.__name__
+        assert "DIRECT_FIRST_SLOW" not in src, fn.__name__
+        assert "_order_targets_direct_first" not in src, fn.__name__
 
 
-@case("C2 fallback relay tetap ada setelah reorder (bukan dibuang)")
+@case("C2 vision guard + limit relay tetap utuh di ketiga generator")
 def _c2():
     import inspect
+    import app.services.streaming as s
     import app.services.responses_bridge as b
-    src = inspect.getsource(b.responses_to_chat_stream_generator)
-    # Guard vision-429 (relay dipakai bila direct 429) tetap utuh.
-    assert "vision_direct_first and is_relay and not last_rate_limited" in src
-    # Limit 2 relay + direct dipertahankan sebelum reorder.
-    assert "_limit_stream_targets(targets)" in src
+    for fn in (s.stream_generator,
+               b.responses_stream_generator,
+               b.responses_to_chat_stream_generator):
+        src = inspect.getsource(fn)
+        # Vision tetap direct-first, relay hanya fallback bila direct 429.
+        assert "vision_direct_first and is_relay and not last_rate_limited" in src, \
+            fn.__name__
+        # Batas 2 relay + direct sebagai fallback terakhir dipertahankan.
+        assert "_limit_stream_targets(targets)" in src, fn.__name__
+        # Direct dibangun PALING AKHIR (fallback), bukan di depan.
+        assert "targets.append((OPENCODE" in src, fn.__name__
 
 
-# ---------- D. knob ----------
+# ---------- D. knob (kompat env lama) ----------
 
-@case("D1 knob ada + default false (relay-first)")
+@case("D1 knob tetap ada + default false (no-op)")
 def _d1():
     import app.core.config as c
+    assert hasattr(c, "DIRECT_FIRST_SLOW")
     assert c.DIRECT_FIRST_SLOW is False
 
 
