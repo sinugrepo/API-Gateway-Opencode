@@ -310,13 +310,26 @@ def _fresh_retry_targets(
         items = []
     for entry in items:
         try:
-            url, headers = entry
+            # Dukung target 2-tuple lama (url, headers) maupun 3-tuple baru
+            # (url, headers, proxy_url) dari lapisan proxy SOCKS/HTTP:
+            # elemen proxy dipertahankan agar fase fresh tetap memakai egress
+            # yang sama (hanya identitas sesi yang disegarkan).
+            if isinstance(entry, (list, tuple)) and len(entry) == 3:
+                url, headers, proxy_url = entry
+            elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                url, headers = entry
+                proxy_url = None
+            else:
+                continue
         except (TypeError, ValueError):
             continue
         fresh_headers = dict(headers or {})
         fresh_headers["x-opencode-session"] = fresh_session
         fresh_headers["x-opencode-request"] = _new_opencode_request_id()
-        new_targets.append((url, fresh_headers))
+        if proxy_url:
+            new_targets.append((url, fresh_headers, proxy_url))
+        else:
+            new_targets.append((url, fresh_headers))
     if isinstance(payload, dict) and isinstance(payload.get("prompt_cache_key"), str):
         payload["prompt_cache_key"] = fresh_key
     return new_targets, fresh_session, fresh_key

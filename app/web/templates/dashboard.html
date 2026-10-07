@@ -10,24 +10,34 @@
 <title>Sinug Gateway — Monitor</title>
 <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
-:root{--bg:#111217;--panel:#1b1c21;--panel-2:#212226;--border:#2c2d33;--border-soft:#28292f;--text:#d8d9da;--muted:#9a9ca3;--accent:#5794f2;--accent-hover:#4a85e0;--accent-bg:rgba(87,148,242,.15);--green:#7dce9a;--yellow:#f8d16c;--red:#f2495c;--purple:#c38dd4;--cyan:#7ad7f0;--font:system-ui,-apple-system,'Segoe UI',Inter,Roboto,sans-serif;--mono:ui-monospace,'JetBrains Mono',Consolas,monospace}
+:root{--bg:#111217;--panel:#1b1c21;--panel-2:#222329;--panel-3:#0d0e11;--border:#2c2d33;--border-soft:#26272d;--text:#d8d9da;--muted:#9a9ca3;--faint:#6b6d75;--accent:#5794f2;--accent-hover:#4a85e0;--accent-bg:rgba(87,148,242,.14);--green:#7dce9a;--yellow:#f8d16c;--red:#f2495c;--purple:#c38dd4;--cyan:#7ad7f0;--font:system-ui,-apple-system,'Segoe UI',Inter,Roboto,sans-serif;--mono:ui-monospace,'JetBrains Mono',Consolas,monospace;--radius:10px}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
 a{color:var(--accent)}
-button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
+button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+/* ---------- topbar ---------- */
+.topbar{position:sticky;top:0;z-index:30;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 20px;background:rgba(27,28,33,.97);backdrop-filter:blur(6px);border-bottom:1px solid var(--border)}
 .brand{display:flex;align-items:center;gap:10px}
-.brand .logo{width:30px;height:30px;background:linear-gradient(135deg,#5794f2,#3d71d9);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff}
-.brand h1{font-size:15px;font-weight:650;color:#f0f1f2}
-.brand .sub{font-size:12px;color:var(--muted);border-left:1px solid var(--border);padding-left:10px;margin-left:4px}
+.brand .logo{width:32px;height:32px;background:linear-gradient(135deg,#5794f2,#3d71d9);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;color:#fff;box-shadow:0 2px 10px rgba(87,148,242,.35)}
+.brand h1{font-size:15px;font-weight:700;color:#f0f1f2;letter-spacing:.1px}
+.brand .sub{font-size:12px;color:var(--muted);border-left:1px solid var(--border);padding-left:10px;margin-left:4px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .top-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
-.pill{display:inline-flex;align-items:center;gap:6px;background:var(--panel-2);border:1px solid var(--border);border-radius:20px;padding:4px 10px;color:var(--muted);font-variant-numeric:tabular-nums}
-.pill .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
-.pill.ok .dot{background:var(--green);box-shadow:0 0 6px rgba(125,206,154,.6)}
+.pill{display:inline-flex;align-items:center;gap:6px;background:var(--panel-2);border:1px solid var(--border);border-radius:20px;padding:4px 10px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.pill .dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:none}
+.pill.ok{color:var(--text)}.pill.ok .dot{background:var(--green);box-shadow:0 0 6px rgba(125,206,154,.6)}
 .pill.bad .dot{background:var(--red);box-shadow:0 0 6px rgba(242,73,92,.6)}
 .pill.info .dot{background:var(--accent)}
-.logout{font-size:12px;font-weight:650;color:var(--muted);text-decoration:none;padding:4px 8px;border-radius:4px}
-.logout:hover{color:var(--red)}
+.pill.warn .dot{background:var(--yellow)}
+.logout{font-size:12px;font-weight:700;color:var(--muted);text-decoration:none;padding:5px 10px;border-radius:6px;border:1px solid transparent}
+.logout:hover{color:var(--red);border-color:var(--border)}
+/* ---------- view nav ---------- */
+.viewnav{position:sticky;top:53px;z-index:25;display:flex;align-items:center;gap:6px;padding:8px 20px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+.viewnav .nav-btn{display:inline-flex;align-items:center;gap:8px;padding:7px 16px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--muted);font-size:13px;font-weight:650;font-family:inherit;cursor:pointer}
+.viewnav .nav-btn:hover{color:var(--text);background:var(--panel-2)}
+.viewnav .nav-btn.active{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 2px 12px rgba(87,148,242,.35)}
+.viewnav .nav-btn .ico{font-size:14px}
+.viewnav .nav-hint{margin-left:auto;font-size:11px;color:var(--faint)}
+/* ---------- toolbar ---------- */
 .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--border)}
 .seg{display:flex;gap:4px;flex-wrap:wrap}
 .period-btn{padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--muted);font-size:12px;font-weight:600;font-family:inherit;cursor:pointer}
@@ -36,25 +46,41 @@ button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{ou
 .custom{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);flex-wrap:wrap}
 .custom input{padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:12px;font-family:inherit}
 .btn{padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel-2);color:var(--text);font-size:12px;font-weight:650;font-family:inherit;cursor:pointer}
-.btn:hover{border-color:#3a3b42}
+.btn:hover{border-color:#3f4047;background:#26272d}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 .btn.primary:hover{background:var(--accent-hover)}
+.btn.danger{color:var(--red)}
+.btn.danger:hover{border-color:var(--red)}
 .btn:disabled{opacity:.55;cursor:wait}
 .btn.on{color:var(--accent);border-color:var(--accent)}
+.btn.sm{padding:3px 9px;font-size:11px}
 .form-err{font-size:11px;color:var(--red);display:none;width:100%}
 .toolbar .spacer{flex:1}
+/* ---------- layout ---------- */
 .content{max-width:1400px;margin:0 auto;padding:16px 20px 32px;display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;display:flex;flex-direction:column;min-width:0}
-.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border-soft)}
-.panel-head h2,.panel-head h3{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-.badge{font-size:10px;font-weight:700;color:var(--muted);background:var(--panel-2);border:1px solid var(--border);padding:2px 8px;border-radius:10px}
+.view{display:contents}
+.view[hidden]{display:none}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;min-width:0;box-shadow:0 1px 8px rgba(0,0,0,.25)}
+.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:11px 14px;border-bottom:1px solid var(--border-soft);flex-wrap:wrap}
+.panel-head h2,.panel-head h3{font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+.panel-head .actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.badge{font-size:10px;font-weight:700;color:var(--muted);background:var(--panel-2);border:1px solid var(--border);padding:2px 8px;border-radius:10px;white-space:nowrap}
 .badge.green{color:var(--green)}.badge.red{color:var(--red)}.badge.blue{color:var(--accent)}.badge.yellow{color:var(--yellow)}
 .panel-body{padding:14px;flex:1;min-width:0}
+.panel-body.tight{padding:0}
+.hint{font-size:11.5px;color:var(--muted);line-height:1.55;margin-bottom:12px}
+.hint b{color:var(--text)}
+.route-preview{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;background:var(--panel-3);border:1px dashed var(--border);border-radius:8px;padding:9px 12px;margin-bottom:12px}
+.route-preview .hop{background:var(--accent-bg);border:1px solid rgba(87,148,242,.4);color:var(--accent);border-radius:6px;padding:2px 9px;font-weight:700}
+.route-preview .hop.off{background:transparent;border-color:var(--border);color:var(--faint)}
+.route-preview .arrow{color:var(--faint)}
+/* KPI */
 .kpi{grid-column:span 12;display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.kpi-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;border-left:3px solid var(--border)}
+.kpi-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;border-left:3px solid var(--border)}
 .kpi-card.a{border-left-color:var(--accent)}.kpi-card.g{border-left-color:var(--green)}.kpi-card.y{border-left-color:var(--yellow)}.kpi-card.p{border-left-color:var(--purple)}
 .kpi-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin-bottom:6px}
 .kpi-val{font-size:26px;font-weight:650;letter-spacing:-.5px;font-variant-numeric:tabular-nums;color:#f0f1f2}
+/* chart */
 .chart-panel{grid-column:span 12}
 .tabs{display:flex;gap:4px}
 .tab{padding:4px 12px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--muted);font-size:11px;font-weight:650;cursor:pointer;font-family:inherit}
@@ -64,27 +90,33 @@ button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{ou
 .fallback-table{font-size:12px;width:100%;border-collapse:collapse;display:none}
 .fallback-table td,.fallback-table th{padding:6px 8px;border-bottom:1px solid var(--border-soft);text-align:right;font-variant-numeric:tabular-nums}
 .fallback-table th:first-child,.fallback-table td:first-child{text-align:left}
-.ops{grid-column:span 4}
-.ops-wide{grid-column:span 4}
+/* generic rows + tables */
 .row{display:flex;justify-content:space-between;gap:10px;padding:7px 2px;font-size:12px;border-bottom:1px solid var(--border-soft)}
 .row:last-child{border-bottom:none}
 .row .k{color:var(--muted)}
 .row .v{font-weight:650;text-align:right;word-break:break-all}
 .row .v.green{color:var(--green)}.row .v.red{color:var(--red)}.row .v.yellow{color:var(--yellow)}.row .v.mono{font-family:var(--mono);font-size:11px;font-weight:500}
 table.mini{width:100%;border-collapse:collapse;font-size:12px}
-table.mini th{text-align:left;padding:6px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--border-soft)}
-table.mini td{padding:6px 8px;border-bottom:1px solid var(--border-soft);font-variant-numeric:tabular-nums}
+table.mini th{text-align:left;padding:7px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--border-soft);white-space:nowrap}
+table.mini td{padding:7px 8px;border-bottom:1px solid var(--border-soft);font-variant-numeric:tabular-nums;vertical-align:middle}
 table.mini tr:last-child td{border-bottom:none}
+table.mini tbody tr:hover td{background:rgba(255,255,255,.015)}
 .mono{font-family:var(--mono);font-size:11px}
-.tag{font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px}
+.tag{font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;white-space:nowrap}
 .tag.ok{color:var(--green);background:rgba(125,206,154,.12)}
 .tag.fail{color:var(--red);background:rgba(242,73,92,.12)}
-.unban{background:none;border:1px solid var(--border);color:var(--muted);font-size:11px;border-radius:4px;padding:2px 8px;cursor:pointer;font-family:inherit}
-.unban:hover{color:var(--red);border-color:var(--red)}
-.models-panel{grid-column:span 5}
-.side-note{grid-column:span 7}
-.recent-panel{grid-column:span 5}
-.logs-panel{grid-column:span 7}
+.unban,.px-del,.rl-del{background:none;border:1px solid var(--border);color:var(--muted);font-size:11px;border-radius:5px;padding:3px 9px;cursor:pointer;font-family:inherit;font-weight:600}
+.unban:hover,.px-del:hover,.rl-del:hover{color:var(--red);border-color:var(--red)}
+.mt-test-btn,.px-test-btn,.rl-test-btn{background:none;border:1px solid var(--border);color:var(--accent);font-size:11px;border-radius:5px;padding:3px 9px;cursor:pointer;font-family:inherit;font-weight:650}
+.mt-test-btn:hover,.px-test-btn:hover,.rl-test-btn:hover{border-color:var(--accent)}
+.mt-test-btn:disabled,.px-test-btn:disabled,.rl-test-btn:disabled{opacity:.55;cursor:wait}
+input[type=checkbox].switch{width:34px;height:19px;appearance:none;background:var(--panel-2);border:1px solid var(--border);border-radius:12px;position:relative;cursor:pointer;vertical-align:middle;flex:none}
+input[type=checkbox].switch:checked{background:var(--accent);border-color:var(--accent)}
+input[type=checkbox].switch::after{content:'';position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#fff;transition:left .15s}
+input[type=checkbox].switch:checked::after{left:17px}
+/* grid spans */
+.span4{grid-column:span 4}.span5{grid-column:span 5}.span6{grid-column:span 6}.span7{grid-column:span 7}.span8{grid-column:span 8}.span12{grid-column:span 12}
+/* logs */
 .ago{color:var(--muted);font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .ago.fresh{color:var(--green);font-weight:700}
 .req-model{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:bottom}
@@ -94,7 +126,7 @@ table.mini tr:last-child td{border-bottom:none}
 .log-status .dot{width:7px;height:7px;border-radius:50%;background:var(--green)}
 .log-status.paused .dot{background:var(--yellow)}
 .log-status.off .dot{background:var(--red)}
-.log-box{background:#0d0e11;border:1px solid var(--border-soft);border-radius:6px;height:380px;overflow-y:auto;padding:8px 10px;font-family:var(--mono);font-size:11px;line-height:1.55}
+.log-box{background:var(--panel-3);border:1px solid var(--border-soft);border-radius:8px;height:380px;overflow-y:auto;padding:8px 10px;font-family:var(--mono);font-size:11px;line-height:1.55}
 .log-line{white-space:pre-wrap;word-break:break-word;padding:1px 0}
 .log-line .ts{color:#55565e}
 .log-lv{font-weight:700;padding:0 6px;border-radius:3px;margin:0 6px 0 2px;font-size:10px}
@@ -104,29 +136,36 @@ table.mini tr:last-child td{border-bottom:none}
 .log-lv.RELAY{color:var(--cyan);background:rgba(122,215,240,.1)}
 .log-lv.STREAM{color:var(--accent);background:var(--accent-bg)}
 .log-lv.RESP,.log-lv.USAGE,.log-lv.MODELS{color:var(--purple);background:rgba(195,141,212,.12)}
+/* forms */
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px}
+.field{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--muted);font-weight:600}
+.field select,.field input,.field textarea{background:var(--panel-2);border:1px solid var(--border);color:var(--text);font-size:12px;font-family:inherit;border-radius:7px;padding:7px 9px;outline:none;width:100%}
+.field select:focus,.field input:focus,.field textarea:focus{border-color:var(--accent)}
+.field textarea{min-height:36px;resize:vertical}
+.form-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.egress-toggles{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-bottom:12px}
+.toggle-card{display:flex;gap:10px;align-items:flex-start;background:var(--panel-3);border:1px solid var(--border-soft);border-radius:8px;padding:10px 12px}
+.toggle-card .tt{font-size:12px;font-weight:700;color:var(--text)}
+.toggle-card .dd{font-size:11px;color:var(--muted);margin-top:2px;line-height:1.5}
+.seg-order{display:flex;gap:6px;flex-wrap:wrap}
+.order-btn{flex:1;min-width:200px;text-align:left;padding:9px 12px;border:1px solid var(--border);border-radius:8px;background:var(--panel-3);color:var(--muted);font-size:12px;font-family:inherit;cursor:pointer;line-height:1.45}
+.order-btn b{display:block;color:var(--text);font-size:12px;margin-bottom:2px}
+.order-btn.active{border-color:var(--accent);background:var(--accent-bg);color:var(--text)}
+.result{background:var(--panel-3);border:1px solid var(--border-soft);border-radius:8px;padding:10px 12px;font-size:12px;margin-bottom:10px;white-space:pre-wrap;word-break:break-word;line-height:1.55}
+.result .mt-out{color:#f0f1f2;margin-top:6px}
+.result .mt-meta{color:var(--muted);font-size:11px;margin-top:6px}
 .footer{grid-column:span 12;text-align:center;font-size:11px;color:var(--muted);padding:8px}
 .footer a{color:var(--muted);margin:0 8px}
 .loading{color:var(--muted);font-size:12px}
 .spinner{width:13px;height:13px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;display:inline-block;vertical-align:middle;margin-right:8px}
 @keyframes spin{to{transform:rotate(360deg)}}
 #toast{position:fixed;bottom:20px;right:20px;display:flex;flex-direction:column;gap:8px;z-index:100}
-.toast{background:var(--panel-2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:12px;max-width:320px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.toast{background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:12px;max-width:340px;box-shadow:0 8px 24px rgba(0,0,0,.45)}
 .toast.err{border-color:var(--red);color:var(--red)}
 .toast.ok{border-color:var(--green)}
-.modeltest-panel{grid-column:span 12}
-.mt-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px}
-.mt-field{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)}
-.mt-field select,.mt-field input,.mt-field textarea{background:var(--panel-2);border:1px solid var(--border);color:var(--text);font-size:12px;font-family:inherit;border-radius:6px;padding:6px 8px;outline:none}
-.mt-field select{max-width:280px}
-.mt-field textarea{min-width:220px;min-height:34px;resize:vertical}
-.mt-result{background:#0d0e11;border:1px solid var(--border-soft);border-radius:6px;padding:10px 12px;font-size:12px;margin-bottom:10px;white-space:pre-wrap;word-break:break-word}
-.mt-result .mono{font-size:11px}
-.mt-out{color:#f0f1f2;margin-top:6px}
-.mt-meta{color:var(--muted);font-size:11px;margin-top:6px}
-.mt-test-btn{background:none;border:1px solid var(--border);color:var(--accent);font-size:11px;border-radius:4px;padding:2px 8px;cursor:pointer;font-family:inherit;font-weight:650}
-.mt-test-btn:hover{border-color:var(--accent)}
-.mt-test-btn:disabled{opacity:.55;cursor:wait}
-@media(max-width:1000px){.ops,.ops-wide,.models-panel,.side-note,.recent-panel,.logs-panel,.modeltest-panel{grid-column:span 12}.kpi{grid-template-columns:repeat(2,1fr)}}
+.section-title{grid-column:span 12;font-size:12px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;padding:6px 2px 0;display:flex;align-items:center;gap:8px}
+.section-title::after{content:'';flex:1;height:1px;background:var(--border-soft)}
+@media(max-width:1000px){.span4,.span5,.span6,.span7,.span8{grid-column:span 12}.kpi{grid-template-columns:repeat(2,1fr)}.viewnav .nav-hint{display:none}}
 @media(max-width:560px){.kpi{grid-template-columns:1fr}.brand .sub{display:none}.content{padding:12px 12px 24px}.chart-wrap{height:220px}}
 @media(prefers-reduced-motion:reduce){.spinner{animation:none}}
 </style>
@@ -137,12 +176,19 @@ table.mini tr:last-child td{border-bottom:none}
 <div class="top-right">
 <span class="pill bad" id="healthPill"><span class="dot"></span><span id="healthText">Menghubungkan…</span></span>
 <span class="pill info" id="relayPill"><span class="dot"></span><span id="relayText">Relay: …</span></span>
+<span class="pill info" id="proxyPill"><span class="dot"></span><span id="proxyText">Proxy: …</span></span>
 <span class="pill" id="sessionPill" title="Sisa sesi login"><span id="sessionText">Sesi: …</span></span>
 <span class="pill" id="clockPill"><span id="clock">…</span></span>
 <a class="logout" href="/monitor/logout">Keluar</a>
 </div>
 </header>
-<div class="toolbar" role="toolbar" aria-label="Periode dan refresh">
+<nav class="viewnav" aria-label="Navigasi halaman">
+<button class="nav-btn active" data-view="monitoring"><span class="ico">📊</span>Monitoring</button>
+<button class="nav-btn" data-view="config"><span class="ico">⚙️</span>Konfigurasi</button>
+<button class="nav-btn" data-view="test"><span class="ico">🧪</span>Uji Model</button>
+<span class="nav-hint">Monitoring = baca status · Konfigurasi = ubah relay/proxy/egress · tanpa restart</span>
+</nav>
+<div class="toolbar" id="monitorToolbar" role="toolbar" aria-label="Periode dan refresh">
 <div class="seg" role="group" aria-label="Periode">
 <button class="period-btn active" data-period="today">Today</button>
 <button class="period-btn" data-period="1d">24H</button>
@@ -160,6 +206,8 @@ table.mini tr:last-child td{border-bottom:none}
 <button class="btn" id="autoBtn" aria-pressed="false">Auto 30s: OFF</button>
 </div>
 <main class="content">
+<!-- ==================== VIEW: MONITORING (read-only) ==================== -->
+<div class="view" id="view-monitoring">
 <section class="kpi" aria-label="Ringkasan">
 <div class="kpi-card a"><div class="kpi-label">Requests <span class="badge" id="periodBadge">TODAY</span></div><div class="kpi-val" id="kReq">–</div></div>
 <div class="kpi-card g"><div class="kpi-label">Prompt tokens</div><div class="kpi-val" id="kPrompt">–</div></div>
@@ -175,61 +223,124 @@ table.mini tr:last-child td{border-bottom:none}
 <div class="loading" id="chartEmpty" style="display:none">Belum ada data pada periode ini.</div>
 </div>
 </section>
-<section class="panel recent-panel" aria-label="Recent requests">
-<div class="panel-head"><h3>Recent requests</h3><span style="display:flex;gap:6px;align-items:center"><button class="btn" id="recentBtn">Refresh</button><span class="badge blue" id="recentBadge">–</span></span></div>
+<section class="panel span5" aria-label="Recent requests">
+<div class="panel-head"><h3>Recent requests</h3><span class="actions"><button class="btn sm" id="recentBtn">Refresh</button><span class="badge blue" id="recentBadge">–</span></span></div>
 <div class="panel-body" style="overflow-x:auto"><table class="mini"><thead><tr><th>When</th><th>Model</th><th style="text-align:right">In</th><th style="text-align:right">Out</th><th style="text-align:right">Total</th><th style="text-align:right" title="Completion tokens per detik wall-time">TPS</th></tr></thead><tbody id="recentBody"><tr><td colspan="6" class="loading"><span class="spinner"></span>Memuat…</td></tr></tbody></table></div>
 </section>
-<section class="panel logs-panel" aria-label="Live logs">
+<section class="panel span7" aria-label="Live logs">
 <div class="panel-head"><h3>Live logs</h3><span class="badge blue" id="logCount">0</span></div>
 <div class="panel-body">
 <div class="log-toolbar">
 <select id="logLevel" aria-label="Level log"><option value="">ALL</option><option>INFO</option><option>WARN</option><option>ERROR</option><option>RELAY</option><option>STREAM</option></select>
 <input type="search" id="logSearch" placeholder="Cari teks…" aria-label="Cari log">
-<button class="btn on" id="logScrollBtn">Auto-scroll ON</button>
-<button class="btn" id="logPauseBtn">Pause</button>
-<button class="btn" id="logClearBtn">Clear</button>
+<button class="btn sm on" id="logScrollBtn">Auto-scroll ON</button>
+<button class="btn sm" id="logPauseBtn">Pause</button>
+<button class="btn sm" id="logClearBtn">Clear</button>
 <span class="log-status" id="logStatus"><span class="dot"></span><span id="logStatusText">connecting…</span></span>
 </div>
 <div class="log-box" id="logBox" role="log" aria-live="off"><div class="loading"><span class="spinner"></span>Menghubungkan live logs…</div></div>
 </div>
 </section>
-<section class="panel models-panel" aria-label="Usage per model">
+<section class="panel span5" aria-label="Usage per model">
 <div class="panel-head"><h3>Usage per model</h3><span class="badge" id="modelBadge">–</span></div>
 <div class="panel-body" style="overflow-x:auto"><table class="mini"><thead><tr><th>Model</th><th style="text-align:right">Req</th><th style="text-align:right">Prompt</th><th style="text-align:right">Compl</th><th style="text-align:right">Total</th></tr></thead><tbody id="modelBody"><tr><td colspan="5" class="loading"><span class="spinner"></span>Memuat…</td></tr></tbody></table></div>
 </section>
-<section class="panel side-note" aria-label="Kesehatan">
-<div class="panel-head"><h3>Kesehatan &amp; API</h3><span class="badge blue" id="healthBadge">–</span></div>
+<section class="panel span7" aria-label="Status egress (ringkas)">
+<div class="panel-head"><h3>Status egress</h3><span class="actions"><button class="btn sm" id="statusRefreshBtn">Refresh</button><span class="badge blue" id="healthBadge">–</span></span></div>
 <div class="panel-body" id="healthBody"><div class="loading"><span class="spinner"></span>Memuat…</div></div>
 </section>
-<section class="panel ops" aria-label="Relay">
-<div class="panel-head"><h3>Relay status</h3><span style="display:flex;gap:6px;align-items:center"><button class="btn" id="relayCheckBtn">Check</button><button class="btn" id="relayResetBtn" title="Hapus 429-cooldown + stream-broken (wajib setelah redeploy relay)">Reset</button><span class="badge" id="relayBadge">–</span></span></div>
-<div class="panel-body" id="relayBody"><div class="loading"><span class="spinner"></span>Memuat relay…</div></div>
+<section class="panel span6" aria-label="Relay live">
+<div class="panel-head"><h3>Relay — hasil probe live</h3><span class="actions"><button class="btn sm" id="relayCheckBtn">Check</button><span class="badge" id="relayBadge">–</span></span></div>
+<div class="panel-body" id="relayBody"><div class="loading"><span class="spinner"></span>Tekan Check untuk probe relay…</div></div>
 </section>
-<section class="panel ops" aria-label="Relay IPs">
+<section class="panel span6" aria-label="Relay IPs">
 <div class="panel-head"><h3>Relay IPs</h3><span class="badge" id="relayIpsBadge">–</span></div>
 <div class="panel-body" id="relayIpsBody"><div class="loading"><span class="spinner"></span>Menunggu check relay…</div></div>
 </section>
-<section class="panel ops" aria-label="Config">
-<div class="panel-head"><h3>Configuration</h3><span class="badge" id="cfgBadge">–</span></div>
-<div class="panel-body" id="cfgBody"><div class="loading"><span class="spinner"></span>Memuat config…</div></div>
+</div>
+<!-- ==================== VIEW: KONFIGURASI ==================== -->
+<div class="view" id="view-config" hidden>
+<div class="section-title">Jalur egress — tentukan traffic lewat mana</div>
+<section class="panel span12" aria-label="Egress">
+<div class="panel-head"><h3>Egress &amp; prioritas</h3><span class="actions"><span class="badge" id="egBadge">–</span></span></div>
+<div class="panel-body">
+<div class="hint">Sebelumnya proxy <b>tidak kepakai</b> karena relay selalu dicoba duluan dan direct hanya fallback terakhir. Atur di sini <b>tanpa restart, tanpa edit .env</b>: matikan relay untuk memakai proxy penuh, atau pilih <b>proxy dulu</b> agar pool proxy benar-benar dilewati tiap request.</div>
+<div class="route-preview" id="routePreview"><span class="hop">relay</span><span class="arrow">→</span><span class="hop">proxy</span><span class="arrow">→</span><span class="hop">direct</span></div>
+<div class="egress-toggles">
+<div class="toggle-card"><input type="checkbox" class="switch" id="egUseRelay" checked aria-label="Relay aktif"><div><div class="tt">Relay Vercel</div><div class="dd">Round-robin + masking IP. Matikan untuk mode proxy/direct murni.</div></div></div>
+<div class="toggle-card"><input type="checkbox" class="switch" id="egFallback" checked aria-label="Fallback direct"><div><div class="tt">Fallback direct</div><div class="dd">Bila semua relay/proxy gagal, coba direct mentah. Matikan = relay-only.</div></div></div>
+<div class="toggle-card"><input type="checkbox" class="switch" id="egUseProxy" checked aria-label="Proxy aktif"><div><div class="tt">Proxy egress</div><div class="dd">Pool SOCKS/HTTP untuk direct. Matikan = abaikan semua proxy.</div></div></div>
+</div>
+<div class="hint" style="margin-bottom:8px"><b>Urutan coba:</b></div>
+<div class="seg-order" style="margin-bottom:12px">
+<button class="order-btn active" id="orderRelayFirst"><b>Relay dulu (default)</b>relay → proxy → direct. Masking IP maksimal.</button>
+<button class="order-btn" id="orderProxyFirst"><b>Proxy dulu</b>proxy → relay → direct. Pool proxy benar-benar kepakai.</button>
+</div>
+<div class="form-actions">
+<button class="btn primary" id="egSaveBtn">Simpan egress</button>
+<span class="hint" style="margin:0" id="egSavedHint">Perubahan langsung berlaku untuk request berikutnya.</span>
+</div>
+</div>
 </section>
-<section class="panel ops" aria-label="Security">
+<div class="section-title">Pool relay — kelola tanpa hardcoded</div>
+<section class="panel span12" aria-label="Relay pool">
+<div class="panel-head"><h3>Relay pool (Vercel)</h3><span class="actions"><button class="btn sm" id="rlRefreshBtn">Refresh</button><button class="btn sm" id="rlResetBtn" title="Hapus 429-cooldown + stream-broken (wajib setelah redeploy relay)">Reset cooldown</button><span class="badge" id="rlBadge">–</span></span></div>
+<div class="panel-body">
+<div class="hint">Tambah/hapus/aktifkan relay dari sini — tersimpan di <b>relays.json</b>, langsung dipakai rotasi request berikutnya. Hostname telanjang diterima (<i>relay-x.vercel.app</i> → <i>https://…/api/relay</i>).</div>
+<div class="form-grid" style="grid-template-columns:1fr auto auto">
+<label class="field">URL relay<input id="rlUrl" placeholder="https://relay-baru.vercel.app/api/relay" autocomplete="off"></label>
+<div class="field">Test dulu<label style="visibility:hidden">x</label><div class="form-actions"><button class="btn" id="rlTestAdhocBtn" title="Test koneksi tanpa menyimpan">Test</button></div></div>
+<div class="field">Simpan<label style="visibility:hidden">x</label><div class="form-actions"><button class="btn primary" id="rlAddBtn">Add</button></div></div>
+</div>
+<div class="result" id="rlResult">Belum ada test. Tambahkan relay lalu tekan Test per baris — atau Check di halaman Monitoring untuk probe semua sekaligus.</div>
+<div style="overflow-x:auto"><table class="mini"><thead><tr><th>Relay</th><th style="text-align:right">State</th><th style="text-align:right">Test</th><th style="text-align:right">Aktif</th><th style="text-align:right">Aksi</th></tr></thead><tbody id="rlBody"><tr><td colspan="5" class="loading"><span class="spinner"></span>Memuat relay…</td></tr></tbody></table></div>
+</div>
+</section>
+<div class="section-title">Pool proxy — egress tambahan</div>
+<section class="panel span12" aria-label="Outbound proxy">
+<div class="panel-head"><h3>Outbound proxy (SOCKS / HTTP)</h3><span class="actions"><button class="btn sm" id="pxRefreshBtn">Refresh</button><button class="btn sm" id="pxTestAllBtn">Test All</button><button class="btn sm" id="pxSeedBtn" title="Tambah 127.0.0.1:40001-40010 (warp-socks lokal) sekaligus">Seed Warp</button><button class="btn sm" id="pxResetBtn" title="Hapus cooldown semua proxy">Reset</button><button class="btn sm primary" id="pxGlobalBtn">ON/OFF</button><span class="badge" id="pxBadge">–</span></span></div>
+<div class="panel-body">
+<div class="hint">Egress tambahan selain relay: request DIRECT keluar via proxy ini (round-robin; gagal otomatis ke proxy berikut lalu direct mentah). Kosong = perilaku lama. Relay tidak pernah lewat proxy. Password tidak pernah ditampilkan kembali.</div>
+<div class="form-grid" style="grid-template-columns:130px 1fr 100px 130px 150px auto auto">
+<label class="field">Scheme<select id="pxScheme" aria-label="Scheme"><option value="socks5h" selected>socks5h (warp)</option><option value="socks5">socks5</option><option value="http">http</option><option value="https">https</option></select></label>
+<label class="field">Host<input id="pxHost" value="127.0.0.1" placeholder="127.0.0.1"></label>
+<label class="field">Port<input id="pxPort" type="number" value="40001" min="1" max="65535"></label>
+<label class="field">Username (opsional)<input id="pxUser" placeholder="" autocomplete="off"></label>
+<label class="field">Password (opsional)<input id="pxPass" type="password" placeholder="" autocomplete="new-password"></label>
+<div class="field">Test dulu<label style="visibility:hidden">x</label><div class="form-actions"><button class="btn" id="pxTestAdhocBtn" title="Test koneksi tanpa menyimpan">Test</button></div></div>
+<div class="field">Simpan<label style="visibility:hidden">x</label><div class="form-actions"><button class="btn primary" id="pxAddBtn">Add</button></div></div>
+</div>
+<div class="result" id="pxResult">Belum ada test. Tambahkan proxy lalu tekan Test All — atau Seed Warp untuk 10 warp-socks lokal sekaligus.</div>
+<div style="overflow-x:auto"><table class="mini"><thead><tr><th>Proxy</th><th style="text-align:right">Auth</th><th style="text-align:right">State</th><th style="text-align:right">Test</th><th style="text-align:right">Aktif</th><th style="text-align:right">Aksi</th></tr></thead><tbody id="pxBody"><tr><td colspan="6" class="loading"><span class="spinner"></span>Memuat proxy…</td></tr></tbody></table></div>
+</div>
+</section>
+<div class="section-title">Keamanan &amp; snapshot</div>
+<section class="panel span6" aria-label="Security">
 <div class="panel-head"><h3>ScanGuard</h3><span class="badge" id="secBadge">–</span></div>
 <div class="panel-body" id="secBody"><div class="loading"><span class="spinner"></span>Memuat security…</div></div>
 </section>
-<section class="panel modeltest-panel" aria-label="Model test">
-<div class="panel-head"><h3>Model test</h3><span style="display:flex;gap:6px;align-items:center"><button class="btn" id="mtRefreshBtn">Models</button><button class="btn primary" id="mtTestAllBtn">Test All</button><span class="badge" id="mtBadge">–</span></span></div>
-<div class="panel-body">
-<div class="mt-controls">
-<label class="mt-field">Model<select id="mtModel" aria-label="Model"></select></label>
-<label class="mt-field">Prompt<textarea id="mtPrompt" rows="2">jawab tepat satu kata: pong</textarea></label>
-<label class="mt-field">Max tokens<input id="mtMax" type="number" value="128" min="1" max="512" style="width:90px"></label>
-<button class="btn primary" id="mtTestBtn">Test</button>
+<section class="panel span6" aria-label="Snapshot">
+<div class="panel-head"><h3>Konfigurasi efektif</h3><span class="actions"><button class="btn sm" id="cfgRefreshBtn">Refresh</button><span class="badge" id="cfgBadge">–</span></span></div>
+<div class="panel-body" id="cfgBody"><div class="loading"><span class="spinner"></span>Memuat config…</div></div>
+</section>
 </div>
-<div class="mt-result" id="mtResult">Pilih model lalu tekan Test. Naikkan max tokens bila output kosong (reasoning memakan token).</div>
+<!-- ==================== VIEW: UJI MODEL ==================== -->
+<div class="view" id="view-test" hidden>
+<section class="panel span12" aria-label="Model test">
+<div class="panel-head"><h3>Model test</h3><span class="actions"><button class="btn sm" id="mtRefreshBtn">Models</button><button class="btn sm primary" id="mtTestAllBtn">Test All</button><span class="badge" id="mtBadge">–</span></span></div>
+<div class="panel-body">
+<div class="hint">Uji tiap model satu-per-satu lewat pipeline yang sama dengan traffic asli (tercatat di usage). Test All meminta konfirmasi dulu.</div>
+<div class="form-grid" style="grid-template-columns:minmax(220px,1fr) minmax(220px,2fr) 110px auto">
+<label class="field">Model<select id="mtModel" aria-label="Model"></select></label>
+<label class="field">Prompt<textarea id="mtPrompt" rows="2">jawab tepat satu kata: pong</textarea></label>
+<label class="field">Max tokens<input id="mtMax" type="number" value="128" min="1" max="512"></label>
+<div class="field">Jalankan<label style="visibility:hidden">x</label><div class="form-actions"><button class="btn primary" id="mtTestBtn">Test</button></div></div>
+</div>
+<div class="result" id="mtResult">Pilih model lalu tekan Test. Naikkan max tokens bila output kosong (reasoning memakan token).</div>
 <div style="overflow-x:auto"><table class="mini"><thead><tr><th>Model</th><th style="text-align:right">Context</th><th style="text-align:right">API</th><th style="text-align:right">Status</th><th style="text-align:right">Latency</th><th>Output</th><th style="text-align:right">Aksi</th></tr></thead><tbody id="mtBody"><tr><td colspan="7" class="loading"><span class="spinner"></span>Memuat model…</td></tr></tbody></table></div>
 </div>
 </section>
+</div>
 <div class="footer"><a href="/health">/health</a><a href="/v1/props">/v1/props</a><a href="/v1/usage?period=today">/v1/usage</a><a href="/relay/status">/relay/status</a><span id="ver">Sinug Gateway Monitor</span></div>
 </main>
 <div id="toast" aria-live="polite"></div>
@@ -246,6 +357,11 @@ async function fetchJSON(url,opts){try{var r=await fetch(url,Object.assign({cred
 function buildQuery(){if(period==='custom'&&customS&&customE)return 'period=custom&start='+encodeURIComponent(customS)+'&end='+encodeURIComponent(customE);return 'period='+encodeURIComponent(period);}
 function tickClock(){var n=new Date();$('clock').textContent=n.toLocaleString('id-ID',{hour12:false});}
 setInterval(tickClock,1000);tickClock();
+/* ---- view nav: monitoring vs konfigurasi vs test ---- */
+var currentView='monitoring';
+function showView(name,push){currentView=name;['monitoring','config','test'].forEach(function(v){var el=$('view-'+v);if(el)el.hidden=(v!==name);});document.querySelectorAll('.nav-btn').forEach(function(b){b.classList.toggle('active',b.dataset.view===name);});var tb=$('monitorToolbar');if(tb)tb.style.display=(name==='monitoring'?'':'none');if(name==='config'){refreshRelayPool();refreshProxy();refreshCfgSnapshot();refreshSecurity();}if(name==='test'&&!mtModels.length){refreshMtModels();}if(push!==false){try{history.replaceState(null,'','#'+name);}catch(e){}}if(name==='monitoring'){refreshUsage();refreshRecent();}}
+document.querySelectorAll('.nav-btn').forEach(function(b){b.addEventListener('click',function(){showView(b.dataset.view);});});
+(function(){var h=(location.hash||'').replace('#','');if(h==='config'||h==='test'||h==='monitoring')currentView=h;})();
 /* ---- period ---- */
 document.querySelectorAll('.period-btn').forEach(function(b){b.addEventListener('click',function(){document.querySelectorAll('.period-btn').forEach(function(x){x.classList.remove('active');});b.classList.add('active');period=b.dataset.period;customS='';customE='';$('dateStart').value='';$('dateEnd').value='';$('dateErr').style.display='none';refreshUsage();});});
 $('applyDate').addEventListener('click',function(){var s=$('dateStart').value,e=$('dateEnd').value;if(!s||!e){$('dateErr').style.display='inline';return;}$('dateErr').style.display='none';document.querySelectorAll('.period-btn').forEach(function(x){x.classList.remove('active');});period='custom';customS=s;customE=e;refreshUsage();});
@@ -254,7 +370,7 @@ $('autoBtn').addEventListener('click',function(){autoOn=!autoOn;$('autoBtn').tex
 /* ---- usage (fast path, tanpa relay) ---- */
 async function refreshUsage(){if(refreshingUsage)return;refreshingUsage=true;try{var q=buildQuery();var u=await fetchJSON('/monitor/api/usage?'+q);var h=await fetchJSON('/monitor/api/usage/history?'+q);if(!u&&!h)return;if(u){$('kReq').textContent=FMT.format(u.request_count);$('kPrompt').textContent=FMT.format(u.prompt_tokens);$('kComp').textContent=FMT.format(u.completion_tokens);$('kTotal').textContent=FMT.format(u.total_tokens);$('periodBadge').textContent=String(u.period||period).toUpperCase();renderModels(u);}$('chartEmpty').style.display='none';buckets=(h&&h.buckets)||[];renderChart();}finally{refreshingUsage=false;}}
 function renderModels(u){var tb=$('modelBody');var m=u.by_model||{};var keys=Object.keys(m);$('modelBadge').textContent=keys.length+' model';if(!keys.length){tb.innerHTML='<tr><td colspan="5" class="loading">Belum ada usage</td></tr>';return;}var html='';keys.forEach(function(k){var s=m[k];html+='<tr><td class="mono">'+esc(k)+'</td><td style="text-align:right">'+FMT.format(s.request_count)+'</td><td style="text-align:right">'+FMT.format(s.prompt_tokens)+'</td><td style="text-align:right">'+FMT.format(s.completion_tokens)+'</td><td style="text-align:right">'+FMT.format(s.total_tokens)+'</td></tr>';});tb.innerHTML=html;}
-/* ---- recent requests: model + token in/out + when ---- */
+/* ---- recent requests ---- */
 var recentCache=[];
 function timeAgo(ts){var s=Math.max(0,Math.floor(Date.now()/1000-ts));if(s<10)return'just now';if(s<60)return s+'s ago';var m=Math.floor(s/60);if(m<60)return m+' min ago';var h=Math.floor(m/60);if(h<24)return h+'h ago';var d=Math.floor(h/24);if(d<30)return d+'d ago';return new Date(ts*1000).toLocaleDateString('id-ID');}
 function fmtTps(r){var v=parseFloat(r.tps);if(!isFinite(v)||v<=0)return'–';return (Math.round(v*10)/10).toFixed(1);}
@@ -263,20 +379,48 @@ function refreshAgoLabels(){document.querySelectorAll('.ago[data-ts]').forEach(f
 setInterval(refreshAgoLabels,15000);
 async function refreshRecent(){var d=await fetchJSON('/monitor/api/requests/recent?limit=20');if(!d)return;recentCache=d.requests||[];renderRecent();}
 $('recentBtn').addEventListener('click',refreshRecent);
-/* ---- chart: Prompt+Completion stacked (Total TIDAK di-stack) ---- */
+/* ---- chart ---- */
 function chartColors(){return{promptBg:'rgba(87,148,242,.55)',promptBd:'#5794f2',compBg:'rgba(248,209,108,.55)',compBd:'#f8d16c',req:'#5794f2',reqFill:'rgba(87,148,242,.15)',grid:'#28292f',tick:'#9a9ca3'};}
-function baseOpts(){return{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#9a9ca3',boxWidth:12,boxHeight:12,usePointStyle:true,pointStyle:'circle',font:{size:11}}},tooltip:{backgroundColor:'#212226',borderColor:'#3a3b42',borderWidth:1,titleColor:'#f0f1f2',bodyColor:'#d8d9da',padding:10,cornerRadius:6}},scales:{x:{stacked:chartKind==='tokens',grid:{color:'#28292f'},ticks:{color:'#9a9ca3',font:{size:10},maxTicksLimit:10}},y:{stacked:chartKind==='tokens',beginAtZero:true,grid:{color:'#28292f'},ticks:{color:'#9a9ca3',font:{size:10},callback:function(v){return COMPACT.format(v);}}}}};}
+function baseOpts(){return{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:'#9a9ca3',boxWidth:12,boxHeight:12,usePointStyle:true,pointStyle:'circle',font:{size:11}}},tooltip:{backgroundColor:'#222329',borderColor:'#3a3b42',borderWidth:1,titleColor:'#f0f1f2',bodyColor:'#d8d9da',padding:10,cornerRadius:6}},scales:{x:{stacked:chartKind==='tokens',grid:{color:'#28292f'},ticks:{color:'#9a9ca3',font:{size:10},maxTicksLimit:10}},y:{stacked:chartKind==='tokens',beginAtZero:true,grid:{color:'#28292f'},ticks:{color:'#9a9ca3',font:{size:10},callback:function(v){return COMPACT.format(v);}}}}};}
 function renderChart(){var cv=$('mainChart');if(!buckets.length){if(chart){chart.destroy();chart=null;}$('chartEmpty').style.display='block';$('fallbackTable').style.display='none';return;}$('chartEmpty').style.display='none';if(typeof window.Chart==='undefined'){if(chart){chart.destroy();chart=null;}var tb=$('fallbackBody');var rows=buckets.slice(-10).map(function(b){return '<tr><td>'+esc(b.label)+'</td><td>'+FMT.format(b.prompt_tokens)+'</td><td>'+FMT.format(b.completion_tokens)+'</td><td>'+FMT.format(b.request_count)+'</td></tr>';});tb.innerHTML=rows.join('');$('fallbackTable').style.display='table';return;}$('fallbackTable').style.display='none';var labels=buckets.map(function(b){return b.label;});var C=chartColors();var datasets=chartKind==='tokens'?[{label:'Prompt',data:buckets.map(function(b){return b.prompt_tokens;}),backgroundColor:C.promptBg,borderColor:C.promptBd,borderWidth:1,borderRadius:2},{label:'Completion',data:buckets.map(function(b){return b.completion_tokens;}),backgroundColor:C.compBg,borderColor:C.compBd,borderWidth:1,borderRadius:2}]:[{label:'Requests',data:buckets.map(function(b){return b.request_count;}),borderColor:C.req,backgroundColor:C.reqFill,fill:true,tension:.3,pointRadius:2,borderWidth:1.5}];if(chart){chart.destroy();}chart=new Chart(cv.getContext('2d'),{type:chartKind==='tokens'?'bar':'line',data:{labels:labels,datasets:datasets},options:baseOpts()});}
 $('tabTokens').addEventListener('click',function(){chartKind='tokens';$('tabTokens').classList.add('active');$('tabReqs').classList.remove('active');renderChart();});
 $('tabReqs').addEventListener('click',function(){chartKind='requests';$('tabReqs').classList.add('active');$('tabTokens').classList.remove('active');renderChart();});
 /* ---- meta: props+health (sekali + 5 mnt) ---- */
-async function refreshMeta(){var c=await fetchJSON('/monitor/api/props');var h=await fetchJSON('/monitor/api/health');var ok=!!(h&&h.status==='ok');var pill=$('healthPill');pill.classList.toggle('ok',ok);pill.classList.toggle('bad',!ok);$('healthText').textContent=ok?'Online':'Offline';$('healthBadge').textContent=ok?'OK':'OFFLINE';$('healthBadge').className='badge '+(ok?'green':'red');if(c){$('subtitle').textContent='Model: '+(c.model||'-')+' | v'+(c.version||'?');$('ver').textContent='v'+(c.version||'?');var rows='';rows+='<div class="row"><span class="k">Relay</span><span class="v '+(c.relay&&c.relay.enabled?'green':'red')+'">'+((c.relay&&c.relay.enabled)?'ENABLED':'DISABLED')+'</span></div>';rows+='<div class="row"><span class="k">Fallback</span><span class="v">'+((c.relay&&c.relay.fallback)?'ON':'OFF')+'</span></div>';rows+='<div class="row"><span class="k">Stream attempts</span><span class="v">'+esc(c.max_relay_stream_attempts!=null?c.max_relay_stream_attempts:2)+'</span></div>';rows+='<div class="row"><span class="k">Request timeout</span><span class="v">'+esc(c.request_timeout)+'s</span></div>';rows+='<div class="row"><span class="k">Cache TTL</span><span class="v">'+esc(c.models_cache_ttl||300)+'s</span></div>';$('cfgBody').innerHTML=rows;$('cfgBadge').textContent=(c.relay_urls||[]).length+' relay';}if(h){$('healthBody').innerHTML='<div class="row"><span class="k">Status</span><span class="v green">'+esc(h.status)+'</span></div><div class="row"><span class="k">Model</span><span class="v mono">'+esc(h.model)+'</span></div><div class="row"><span class="k">Relay enabled</span><span class="v">'+(h.relay_enabled?'YES':'NO')+'</span></div><div class="row"><span class="k">Hermes compat</span><span class="v">'+(h.hermes_compatible?'ON':'OFF')+'</span></div>';}}
-/* ---- infra: relay+security (lambat, terpisah) ---- */
+async function refreshMeta(){var c=await fetchJSON('/monitor/api/props');var h=await fetchJSON('/monitor/api/health');var ok=!!(h&&h.status==='ok');var pill=$('healthPill');pill.classList.toggle('ok',ok);pill.classList.toggle('bad',!ok);$('healthText').textContent=ok?'Online':'Offline';$('healthBadge').textContent=ok?'OK':'OFFLINE';$('healthBadge').className='badge '+(ok?'green':'red');if(c){$('subtitle').textContent='Model: '+(c.model||'-')+' · v'+(c.version||'?')+' · '+(c.egress_order==='proxy_first'?'proxy dulu':'relay dulu');$('ver').textContent='v'+(c.version||'?');var rp=(c.relay_pool&&c.relay_pool.relays)||[];var enN=rp.filter(function(x){return x.enabled;}).length;var rows='';rows+='<div class="row"><span class="k">Egress aktif</span><span class="v mono">'+esc(egressLabel(c))+'</span></div>';rows+='<div class="row"><span class="k">Relay</span><span class="v '+((c.relay&&c.relay.enabled)?'green':'red')+'">'+((c.relay&&c.relay.enabled)?('ON · '+enN+'/'+rp.length):'OFF')+'</span></div>';rows+='<div class="row"><span class="k">Fallback direct</span><span class="v">'+((c.relay&&c.relay.fallback)?'ON':'OFF')+'</span></div>';rows+='<div class="row"><span class="k">Proxy</span><span class="v '+((c.proxy&&c.proxy.enabled_global)?'green':'yellow')+'">'+esc(proxyLabel(c))+'</span></div>';rows+='<div class="row"><span class="k">Request timeout</span><span class="v">'+esc(c.request_timeout)+'s</span></div>';rows+='<div class="row"><span class="k">Ubah jalur</span><span class="v"><a href="#config" id="gotoConfig">buka Konfigurasi →</a></span></div>';$('healthBody').innerHTML=rows;var gl=document.getElementById('gotoConfig');if(gl)gl.addEventListener('click',function(){showView('config');});refreshEgressUI(c);}if(h){}}
+function egressLabel(c){var parts=[];var order=c.egress_order||'relay_first';var relayOn=c.relay&&c.relay.enabled;var pxOn=c.proxy&&c.proxy.enabled_global;if(!relayOn&&!pxOn)return'direct mentah';if(!relayOn&&pxOn)return'proxy → direct';if(relayOn&&!pxOn)return order==='proxy_first'?'relay → direct':'relay → direct';return order==='proxy_first'?'proxy → relay → direct':'relay → proxy → direct';}
+function proxyLabel(c){if(!c.proxy)return'–';var en=(c.proxy.proxies||[]).filter(function(p){return p.enabled;}).length;var tot=(c.proxy.proxies||[]).length;return (c.proxy.enabled_global?en+'/'+tot+' ON':(tot?('OFF ('+tot+')'):'0'));}
+$('statusRefreshBtn').addEventListener('click',function(){refreshMeta();refreshInfra(true);});
+async function refreshCfgSnapshot(){var c=await fetchJSON('/monitor/api/props');if(!c)return;var rp=(c.relay_pool&&c.relay_pool.relays)||[];var rows='';rows+='<div class="row"><span class="k">Egress</span><span class="v mono">'+esc(egressLabel(c))+'</span></div>';rows+='<div class="row"><span class="k">Relay</span><span class="v '+((c.relay&&c.relay.enabled)?'green':'red')+'">'+((c.relay&&c.relay.enabled)?'ENABLED':'DISABLED')+'</span></div>';rows+='<div class="row"><span class="k">Relay pool</span><span class="v">'+rp.filter(function(x){return x.enabled;}).length+'/'+rp.length+' aktif</span></div>';rows+='<div class="row"><span class="k">Fallback</span><span class="v">'+((c.relay&&c.relay.fallback)?'ON':'OFF')+'</span></div>';rows+='<div class="row"><span class="k">Proxy</span><span class="v">'+esc(proxyLabel(c))+'</span></div>';rows+='<div class="row"><span class="k">Stream attempts</span><span class="v">'+esc(c.max_relay_stream_attempts!=null?c.max_relay_stream_attempts:2)+'</span></div>';rows+='<div class="row"><span class="k">Request timeout</span><span class="v">'+esc(c.request_timeout)+'s</span></div>';rows+='<div class="row"><span class="k">Cache TTL</span><span class="v">'+esc(c.models_cache_ttl||300)+'s</span></div>';$('cfgBody').innerHTML=rows;$('cfgBadge').textContent=(c.relay_urls||[]).length+' relay';}
+$('cfgRefreshBtn').addEventListener('click',refreshCfgSnapshot);
+/* ---- egress config (website, tanpa .env) ---- */
+var egOrder='relay_first';
+function refreshEgressUI(c){var rp=c.relay_pool||c;var useR=(rp.use_relay!=null?rp.use_relay:(c.relay&&c.relay.enabled));var fb=(rp.relay_fallback!=null?rp.relay_fallback:(c.relay&&c.relay.fallback));var useP=(rp.use_proxy!=null?rp.use_proxy:(c.proxy&&c.proxy.enabled_global));egOrder=c.egress_order||rp.egress_order||'relay_first';$('egUseRelay').checked=!!useR;$('egFallback').checked=!!fb;$('egUseProxy').checked=!!useP;$('orderRelayFirst').classList.toggle('active',egOrder!=='proxy_first');$('orderProxyFirst').classList.toggle('active',egOrder==='proxy_first');$('egBadge').textContent=egressLabel(c);renderRoutePreview();}
+function renderRoutePreview(){var relayOn=$('egUseRelay').checked,pxOn=$('egUseProxy').checked,fb=$('egFallback').checked;var hops=[];if(egOrder==='proxy_first'){if(pxOn)hops.push(['proxy',true]);if(relayOn)hops.push(['relay',true]);}else{if(relayOn)hops.push(['relay',true]);if(pxOn)hops.push(['proxy',true]);}if(fb||(!relayOn&&!pxOn))hops.push(['direct',true]);if(!hops.length)hops.push(['direct(buntu)',false]);var html=hops.map(function(h,i){return (i?'<span class="arrow">→</span>':'')+'<span class="hop'+(h[1]?'':' off')+'">'+esc(h[0])+'</span>';}).join('');$('routePreview').innerHTML=html;}
+['egUseRelay','egFallback','egUseProxy'].forEach(function(id){$(id).addEventListener('change',renderRoutePreview);});
+$('orderRelayFirst').addEventListener('click',function(){egOrder='relay_first';$('orderRelayFirst').classList.add('active');$('orderProxyFirst').classList.remove('active');renderRoutePreview();});
+$('orderProxyFirst').addEventListener('click',function(){egOrder='proxy_first';$('orderProxyFirst').classList.add('active');$('orderRelayFirst').classList.remove('active');renderRoutePreview();});
+$('egSaveBtn').addEventListener('click',async function(){var b=this;b.disabled=true;var old=b.textContent;b.textContent='…';try{var r=await fetch('/monitor/api/relays/config',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({use_relay:$('egUseRelay').checked,relay_fallback:$('egFallback').checked,use_proxy:$('egUseProxy').checked,egress_order:egOrder})});if(r.status===401){toLogin();return;}var d=r.ok?await r.json():null;if(r.ok&&d){toast('Egress tersimpan — berlaku langsung','ok');refreshEgressUI({relay:{enabled:d.use_relay,fallback:d.relay_fallback},proxy:{enabled_global:d.use_proxy},relay_pool:d,egress_order:d.egress_order});refreshMeta();refreshCfgSnapshot();}else{toast('Gagal simpan: '+((d&&d.detail)||('HTTP '+r.status)),'err');}}catch(e){toast('Network error','err');}finally{b.disabled=false;b.textContent=old;}});
+/* ---- relay pool CRUD ---- */
+var rlCache=[];
+async function rlPost(url,body){try{var r=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):'{}'});if(r.status===401){toLogin();return null;}try{return {status:r.status,data:await r.json()};}catch(e){return {status:r.status,data:null};}}catch(e){return {status:0,data:null};}}
 function shortHost(u){try{return u.split('//')[1].split('/')[0];}catch(e){return u;}}
-async function refreshInfra(){if(refreshingInfra)return;refreshingInfra=true;try{var results=await Promise.all([fetchJSON('/monitor/api/relay'),fetchJSON('/monitor/api/security')]);var r=results[0],s=results[1];lastInfraAt=Date.now();if(r){var okCount=(r.all_relays||[]).filter(function(x){return x.ok;}).length;var total=(r.all_relays||[]).length;$('relayBadge').textContent=okCount+'/'+total+' OK';$('relayBadge').className='badge '+(r.success?'green':'red');$('relayText').textContent='Relay: '+okCount+'/'+total+(r.is_masked?' • masked':' • direct');var html='<div class="row"><span class="k">Status</span><span class="v '+(r.success?'green':'red')+'">'+(r.success?'OK':'OFFLINE')+'</span></div>';html+='<div class="row"><span class="k">Masked</span><span class="v '+(r.is_masked?'green':'yellow')+'">'+(r.is_masked?'YES':'NO')+'</span></div>';html+='<div class="row"><span class="k">Direct IP</span><span class="v mono">'+esc(r.direct_ip||'-')+'</span></div>';html+='<div class="row"><span class="k">Relay IP</span><span class="v mono">'+esc(r.relay_ip||'-')+'</span></div>';html+='<div class="row"><span class="k">Check time</span><span class="v">'+esc(r.response_time_ms!=null?r.response_time_ms+' ms':'-')+'</span></div>';$('relayBody').innerHTML=html;var ips=$('relayIpsBody');if(r.all_relays&&r.all_relays.length){$('relayIpsBadge').textContent=okCount+'/'+total;$('relayIpsBadge').className='badge '+(okCount===total?'green':(okCount>0?'yellow':'red'));var ih='<table class="mini"><thead><tr><th>Relay</th><th>IP</th><th style="text-align:right">State</th></tr></thead><tbody>';r.all_relays.forEach(function(x){ih+='<tr><td class="mono">'+esc(shortHost(x.url))+'</td><td class="mono">'+esc(x.ip||'-')+'</td><td style="text-align:right"><span class="tag '+(x.ok?'ok':'fail')+'">'+(x.ok?'OK':'FAIL')+'</span></td></tr>';});ih+='</tbody></table>';ips.innerHTML=ih;}else{ips.innerHTML='<div class="loading">No relay data</div>';}}if(s){$('secBadge').textContent=(s.enabled?'ON • ':'OFF • ')+(s.banned_count||0)+' banned';$('secBadge').className='badge '+((s.banned_count||0)>0?'yellow':'green');var sh='<div class="row"><span class="k">Enabled</span><span class="v '+(s.enabled?'green':'red')+'">'+(s.enabled?'YES':'NO')+'</span></div>';sh+='<div class="row"><span class="k">Threshold</span><span class="v">'+esc(s.threshold)+'/'+esc(s.window_seconds)+'s</span></div>';sh+='<div class="row"><span class="k">Watched IPs</span><span class="v">'+esc(s.watched_ips)+'</span></div>';if(s.banned&&s.banned.length){sh+='<table class="mini" style="margin-top:8px"><thead><tr><th>IP</th><th style="text-align:right">Expires</th><th></th></tr></thead><tbody>';s.banned.slice(0,20).forEach(function(b){sh+='<tr><td class="mono">'+esc(b.ip)+'</td><td style="text-align:right">'+esc(b.expires_in)+'s</td><td style="text-align:right"><button class="unban" data-ip="'+esc(b.ip)+'">Unban</button></td></tr>';});sh+='</tbody></table>';}else{sh+='<div class="loading" style="margin-top:8px">Tidak ada IP di-ban.</div>';}$('secBody').innerHTML=sh;document.querySelectorAll('.unban').forEach(function(btn){btn.addEventListener('click',function(){unban(btn.dataset.ip,btn);});});}}finally{refreshingInfra=false;}}
+function rlRender(){var tb=$('rlBody');if(!rlCache.length){tb.innerHTML='<tr><td colspan="5" class="loading">Belum ada relay — tambah di atas</td></tr>';$('rlBadge').textContent='0';return;}var enN=rlCache.filter(function(x){return x.enabled;}).length;$('rlBadge').textContent=enN+'/'+rlCache.length+' aktif';$('rlBadge').className='badge '+(enN?'green':'yellow');var html='';rlCache.forEach(function(x){var state=x.stream_broken?'<span class="tag fail">BROKEN</span>':(x.penalized?'<span class="tag fail">COOLDOWN</span>':(x.enabled?'<span class="tag ok">READY</span>':'<span class="badge">OFF</span>'));var test=x._test?(x._test.ok?'<span class="tag ok">OK '+(x._test.latency_ms||0)+'ms</span>':'<span class="tag fail">FAIL</span>'):'<span class="badge">–</span>';var tip=x._test?esc((x._test.ip?('IP '+x._test.ip+' • '):'')+(x._test.error||((x._test.latency_ms||0)+' ms'))):'';html+='<tr><td class="mono" title="'+esc(x.url)+'">'+esc(shortHost(x.url))+'<div style="color:var(--faint);font-size:10px">'+esc(x.url)+'</div></td><td style="text-align:right">'+state+'</td><td style="text-align:right" title="'+tip+'">'+test+'</td><td style="text-align:right"><input type="checkbox" class="switch rl-toggle" data-id="'+esc(x.id)+'"'+(x.enabled?' checked':'')+' aria-label="Aktif"></td><td style="text-align:right;white-space:nowrap"><button class="rl-test-btn" data-id="'+esc(x.id)+'">Test</button> <button class="rl-del" data-id="'+esc(x.id)+'">Hapus</button></td></tr>';});tb.innerHTML=html;tb.querySelectorAll('.rl-test-btn').forEach(function(b){b.addEventListener('click',function(){rlTestOne(b.dataset.id,b);});});tb.querySelectorAll('.rl-del').forEach(function(b){b.addEventListener('click',function(){rlRemove(b.dataset.id,b);});});tb.querySelectorAll('.rl-toggle').forEach(function(el){el.addEventListener('change',function(){rlSetEnabled(el.dataset.id,el.checked,el);});});}
+async function refreshRelayPool(){var d=await fetchJSON('/monitor/api/relays');if(!d)return;var keep={};rlCache.forEach(function(x){if(x._test)keep[x.id]=x._test;});rlCache=(d.relays||[]).slice();rlCache.forEach(function(x){if(keep[x.id])x._test=keep[x.id];});rlRender();}
+async function rlAdd(){var url=$('rlUrl').value.trim();if(!url){toast('URL relay wajib diisi','err');return;}var b=$('rlAddBtn');b.disabled=true;var old=b.textContent;b.textContent='…';try{var r=await rlPost('/monitor/api/relays',{url:url});if(!r)return;if(r.status!==200||!r.data||!r.data.relay){toast('Gagal: '+((r.data&&r.data.detail)||('HTTP '+r.status)),'err');return;}$('rlUrl').value='';toast('Relay ditambah','ok');await refreshRelayPool();refreshMeta();}finally{b.disabled=false;b.textContent=old;}}
+async function rlRemove(id,btn){if(!confirm('Hapus relay ini?'))return;if(btn)btn.disabled=true;var r=await rlPost('/monitor/api/relays/remove',{id:id});if(!r)return;if(r.status===200){toast('Relay dihapus','ok');await refreshRelayPool();refreshMeta();}else{toast('Gagal: '+((r.data&&r.data.detail)||('HTTP '+r.status)),'err');if(btn)btn.disabled=false;}}
+async function rlSetEnabled(id,en,el){if(el)el.disabled=true;var r=await rlPost('/monitor/api/relays/enable',{id:id,enabled:en});if(!r)return;if(r.status===200){await refreshRelayPool();refreshMeta();}else{toast('Gagal: '+((r.data&&r.data.detail)||('HTTP '+r.status)),'err');await refreshRelayPool();}}
+async function rlTestOne(id,btn){if(btn){btn.disabled=true;btn.textContent='…';}try{var r=await rlPost('/monitor/api/relays/test',{id:id});if(!r)return;var res=r.data||{ok:false,error:'no response'};rlCache.forEach(function(x){if(x.id===id)x._test=res;});rlRender();var box=$('rlResult');if(res.ok){box.innerHTML='<span class="tag ok">OK</span> <span class="mono">'+esc(shortHost(res.url||id))+'</span><div class="mt-out">IP '+esc(res.ip||'-')+'</div><div class="mt-meta">latency '+FMT.format(res.latency_ms||0)+' ms</div>';}else{box.innerHTML='<span class="tag fail">FAIL</span> <span class="mono">'+esc(shortHost(res.url||id))+'</span><div class="mt-out">'+esc(res.error||'unknown')+'</div>';}}finally{if(btn){var f=document.querySelector('.rl-test-btn[data-id="'+String(id).replace(/"/g,'')+'"]');if(f){f.disabled=false;f.textContent='Test';}}}}
+async function rlTestAdhoc(){var url=$('rlUrl').value.trim();if(!url){toast('Isi URL dulu','err');return;}var b=$('rlTestAdhocBtn');b.disabled=true;var old=b.textContent;b.textContent='…';try{var r=await rlPost('/monitor/api/relays/test',{url:url});if(!r)return;var res=r.data||{ok:false,error:'no response'};var box=$('rlResult');if(res.ok){box.innerHTML='<span class="tag ok">OK (belum disimpan)</span><div class="mt-out">IP '+esc(res.ip||'-')+'</div><div class="mt-meta">latency '+FMT.format(res.latency_ms||0)+' ms • tekan Add untuk menyimpan</div>';}else{box.innerHTML='<span class="tag fail">FAIL (belum disimpan)</span><div class="mt-out">'+esc(res.error||'unknown')+'</div>';}}finally{b.disabled=false;b.textContent=old;}}
+$('rlRefreshBtn').addEventListener('click',refreshRelayPool);
+$('rlAddBtn').addEventListener('click',rlAdd);
+$('rlTestAdhocBtn').addEventListener('click',rlTestAdhoc);
+$('rlResetBtn').addEventListener('click',async function(){var b=this;b.disabled=true;var old=b.textContent;b.textContent='…';try{var r=await fetch('/monitor/api/relays/reset',{method:'POST',credentials:'same-origin'});if(r.status===401){toLogin();return;}toast(r.ok?'Relay cooldown direset':'Reset gagal',r.ok?'ok':'err');refreshRelayPool();}catch(e){toast('Network error','err');}finally{b.disabled=false;b.textContent=old;}});
+/* ---- infra: relay probe + security (lambat, terpisah) ---- */
+async function refreshInfra(force){if(refreshingInfra)return;refreshingInfra=true;try{var results=await Promise.all([fetchJSON('/monitor/api/relay'),fetchJSON('/monitor/api/security')]);var r=results[0],s=results[1];lastInfraAt=Date.now();if(r){var okCount=(r.all_relays||[]).filter(function(x){return x.ok;}).length;var total=(r.all_relays||[]).length;$('relayBadge').textContent=okCount+'/'+total+' OK';$('relayBadge').className='badge '+(r.success?'green':'red');$('relayText').textContent='Relay: '+okCount+'/'+total+(r.is_masked?' • masked':' • direct');$('relayPill').className='pill '+(r.success?'ok info':'bad');var html='<div class="row"><span class="k">Status</span><span class="v '+(r.success?'green':'red')+'">'+(r.success?'OK':'OFFLINE')+'</span></div>';html+='<div class="row"><span class="k">Masked</span><span class="v '+(r.is_masked?'green':'yellow')+'">'+(r.is_masked?'YES':'NO')+'</span></div>';html+='<div class="row"><span class="k">Direct IP</span><span class="v mono">'+esc(r.direct_ip||'-')+'</span></div>';html+='<div class="row"><span class="k">Relay IP</span><span class="v mono">'+esc(r.relay_ip||'-')+'</span></div>';html+='<div class="row"><span class="k">Check time</span><span class="v">'+esc(r.response_time_ms!=null?r.response_time_ms+' ms':'-')+'</span></div>';$('relayBody').innerHTML=html;var ips=$('relayIpsBody');if(r.all_relays&&r.all_relays.length){$('relayIpsBadge').textContent=okCount+'/'+total;$('relayIpsBadge').className='badge '+(okCount===total?'green':(okCount>0?'yellow':'red'));var ih='<table class="mini"><thead><tr><th>Relay</th><th>IP</th><th style="text-align:right">State</th></tr></thead><tbody>';r.all_relays.forEach(function(x){ih+='<tr><td class="mono">'+esc(shortHost(x.url))+'</td><td class="mono">'+esc(x.ip||'-')+'</td><td style="text-align:right"><span class="tag '+(x.ok?'ok':'fail')+'">'+(x.ok?'OK':'FAIL')+'</span></td></tr>';});ih+='</tbody></table>';ips.innerHTML=ih;}else{ips.innerHTML='<div class="loading">No relay data</div>';}}if(s){renderSecurity(s);}}finally{refreshingInfra=false;}}
+function renderSecurity(s){$('secBadge').textContent=(s.enabled?'ON • ':'OFF • ')+(s.banned_count||0)+' banned';$('secBadge').className='badge '+(s.banned_count?'red':'green');var html='<div class="row"><span class="k">Status</span><span class="v '+(s.enabled?'green':'red')+'">'+(s.enabled?'ENABLED':'DISABLED')+'</span></div>';html+='<div class="row"><span class="k">Threshold</span><span class="v">'+esc(s.threshold)+' / '+esc(s.window_seconds)+'s</span></div>';html+='<div class="row"><span class="k">Ban</span><span class="v">'+esc(s.ban_seconds)+'s</span></div>';html+='<div class="row"><span class="k">Watched IPs</span><span class="v">'+esc(s.watched_ips)+'</span></div>';if(s.banned&&s.banned.length){html+='<table class="mini"><thead><tr><th>IP</th><th style="text-align:right">Expires</th><th style="text-align:right">Aksi</th></tr></thead><tbody>';s.banned.forEach(function(b){html+='<tr><td class="mono">'+esc(b.ip)+'</td><td style="text-align:right">'+esc(b.expires_in)+'s</td><td style="text-align:right"><button class="unban" data-ip="'+esc(b.ip)+'">Unban</button></td></tr>';});html+='</tbody></table>';}else{html+='<div class="loading">Tidak ada IP di-ban</div>';}$('secBody').innerHTML=html;document.querySelectorAll('.unban').forEach(function(btn){btn.addEventListener('click',function(){unban(btn.dataset.ip,btn);});});}
+async function refreshSecurity(){var s=await fetchJSON('/monitor/api/security');if(s)renderSecurity(s);}
 async function unban(ip,btn){btn.disabled=true;try{var r=await fetch('/monitor/api/security/unban',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:ip})});if(r.status===401){toLogin();return;}var d=r.ok?await r.json():null;if(d&&d.unbanned){toast('Unbanned '+ip,'ok');refreshInfra();}else{toast('Unban gagal: '+ip,'err');btn.disabled=false;}}catch(e){toast('Network error','err');btn.disabled=false;}}
-$('relayCheckBtn').addEventListener('click',refreshInfra);
-$('relayResetBtn').addEventListener('click',async function(){var b=this;b.disabled=true;var old=b.textContent;b.textContent='…';try{var r=await fetch('/monitor/api/relays/reset',{method:'POST',credentials:'same-origin'});if(r.status===401){toLogin();return;}toast(r.ok?'Relay state direset':'Reset gagal',r.ok?'ok':'err');refreshInfra();}catch(e){toast('Network error','err');}finally{b.disabled=false;b.textContent=old;}});
+$('relayCheckBtn').addEventListener('click',function(){refreshInfra(true);});
 /* ---- session countdown ---- */
 async function refreshSession(){var s=await fetchJSON('/monitor/api/session');if(!s)return;var t=s.ttl_seconds;var h=Math.floor(t/3600),m=Math.floor((t%3600)/60);$('sessionText').textContent='Sesi: '+h+'h'+m+'m';}
 /* ---- logs ---- */
@@ -293,7 +437,7 @@ async function logCatchupKeep(keep){var lvl=$('logLevel').value;var d=await fetc
 $('logPauseBtn').addEventListener('click',function(){logPaused=!logPaused;this.textContent=logPaused?'Resume':'Pause';this.classList.toggle('on',logPaused);if(logPaused){closeLogs();setLogStatus('paused','paused');}else{connectLogs();}});
 $('logScrollBtn').addEventListener('click',function(){logAutoScroll=!logAutoScroll;this.textContent=logAutoScroll?'Auto-scroll ON':'Auto-scroll OFF';this.classList.toggle('on',logAutoScroll);});
 $('logClearBtn').addEventListener('click',async function(){try{var r=await fetch('/monitor/api/logs/clear',{method:'POST',credentials:'same-origin'});if(r.status===401){toLogin();return;}var d=r.ok?await r.json():null;if(d&&d.latest_id!=null)logLatestId=d.latest_id;}catch(e){}$('logBox').innerHTML='';logShown=0;$('logCount').textContent='0';});
-/* ---- model test: uji tiap model satu-per-satu dari web ---- */
+/* ---- model test ---- */
 var mtModels=[],mtTesting=false,mtStopReq=false,mtResults={};
 function mtCtx(m){var v=m.context_length||m.context_window||m.max_input_tokens||0;return v;}
 function mtFmtCtx(v){if(!v)return'–';if(v>=1048576)return(Math.round(v/1048576*100)/100)+'M';if(v>=1000)return(Math.round(v/1000*10)/10)+'K';return String(v);}
@@ -307,8 +451,32 @@ async function mtTestAll(){if(mtTesting){mtStopReq=true;return;}if(!mtModels.len
 $('mtRefreshBtn').addEventListener('click',refreshMtModels);
 $('mtTestBtn').addEventListener('click',function(){var m=$('mtModel').value;if(!m){toast('Pilih model dulu','err');return;}mtTestOne(m,null);});
 $('mtTestAllBtn').addEventListener('click',mtTestAll);
-/* ---- boot: decoupled agar usage cepat, relay tidak memblokir ---- */
-refreshUsage();refreshRecent();refreshMeta();refreshInfra();refreshSession();connectLogs();refreshMtModels();
+/* ---- outbound proxy ---- */
+var pxCache=[],pxGlobal=true,pxTesting=false;
+async function pxPost(url,body){try{var r=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):'{}'});if(r.status===401){toLogin();return null;}try{return {status:r.status,data:await r.json()};}catch(e){return {status:r.status,data:null};}}catch(e){return {status:0,data:null};}}
+function pxReadForm(){var port=parseInt($('pxPort').value||'0',10);return {scheme:$('pxScheme').value||'socks5h',host:($('pxHost').value||'').trim(),port:port,username:($('pxUser').value||'').trim(),password:$('pxPass').value||''};}
+function pxRender(){var tb=$('pxBody');if(!pxCache.length){tb.innerHTML='<tr><td colspan="6" class="loading">Belum ada proxy — tambah manual atau Seed Warp</td></tr>';$('pxBadge').textContent='0';$('pxBadge').className='badge';$('proxyText').textContent='Proxy: OFF (0)';return;}var enN=pxCache.filter(function(p){return p.enabled;}).length;$('pxBadge').textContent=enN+'/'+pxCache.length+(pxGlobal?' ON':' OFF');$('pxBadge').className='badge '+(pxGlobal&&enN?'green':'yellow');$('proxyText').textContent='Proxy: '+(pxGlobal?enN+'/'+pxCache.length+' ON':'OFF');$('proxyPill').className='pill '+((pxGlobal&&enN)?'ok info':'info');var html='';pxCache.forEach(function(p){var state=p.flagged?'<span class="tag fail" title="Egress IP di-flag upstream 403 — proxy SEHAT, test OK">FLAGGED</span>':(p.penalized?'<span class="tag fail" title="Transport gagal (connect/timeout) — blip sesaat hanya disisihkan 15 dtk">DOWN</span>':(p.enabled?'<span class="tag ok">READY</span>':'<span class="badge">OFF</span>'));var test=p._test?(p._test.ok?'<span class="tag ok">OK '+(p._test.latency_ms||0)+'ms</span>':'<span class="tag fail">FAIL</span>'):'<span class="badge">–</span>';var testTip=p._test?esc((p._test.ip?('IP '+p._test.ip+' • '):'')+(p._test.error||p._test.latency_ms+' ms')):'';html+='<tr><td class="mono" title="'+esc(p.display||'')+'">'+esc(p.display||'')+(p.source==='env'?' <span class="badge">env</span>':'')+'</td><td style="text-align:right">'+(p.has_auth?'yes':'–')+'</td><td style="text-align:right">'+state+'</td><td style="text-align:right" title="'+testTip+'">'+test+'</td><td style="text-align:right"><input type="checkbox" class="switch px-toggle" data-id="'+esc(p.id)+'"'+(p.enabled?' checked':'')+' aria-label="Aktif"></td><td style="text-align:right;white-space:nowrap"><button class="px-test-btn" data-id="'+esc(p.id)+'"'+(pxTesting?' disabled':'')+'>Test</button> <button class="px-del" data-id="'+esc(p.id)+'">Hapus</button></td></tr>';});tb.innerHTML=html;tb.querySelectorAll('.px-test-btn').forEach(function(b){b.addEventListener('click',function(){pxTestOne(b.dataset.id,b);});});tb.querySelectorAll('.px-del').forEach(function(b){b.addEventListener('click',function(){pxRemove(b.dataset.id,b);});});tb.querySelectorAll('.px-toggle').forEach(function(el){el.addEventListener('change',function(){pxSetEnabled(el.dataset.id,el.checked,el);});});}
+async function refreshProxy(){var d=await fetchJSON('/monitor/api/proxies');if(!d)return;pxGlobal=!!d.enabled_global;pxCache=(d.proxies||[]).slice().sort(function(a,b){return String(a.host).localeCompare(String(b.host))||((a.port||0)-(b.port||0));});var keep={};pxCache.forEach(function(p){if(p._test)keep[p.id]=p._test;});pxRender();$('pxGlobalBtn').textContent='Global: '+(pxGlobal?'ON':'OFF');$('pxGlobalBtn').classList.toggle('on',!pxGlobal);}
+async function pxAdd(){var f=pxReadForm();if(!f.host){toast('Host wajib diisi','err');return;}if(!(f.port>=1&&f.port<=65535)){toast('Port 1-65535','err');return;}var b=$('pxAddBtn');b.disabled=true;var old=b.textContent;b.textContent='…';try{var r=await pxPost('/monitor/api/proxies',f);if(!r)return;if(r.status!==200||!r.data||!r.data.proxy){toast('Gagal: '+((r.data&&r.data.detail)||('HTTP '+r.status)),'err');return;}$('pxPass').value='';toast('Proxy ditambah','ok');await refreshProxy();}finally{b.disabled=false;b.textContent=old;}}
+async function pxRemove(id,btn){if(!confirm('Hapus proxy ini?'))return;if(btn)btn.disabled=true;var r=await pxPost('/monitor/api/proxies/remove',{id:id});if(!r)return;if(r.status===200){toast('Proxy dihapus','ok');await refreshProxy();}else{toast('Gagal: '+((r.data&&r.data.detail)||('HTTP '+r.status)),'err');if(btn)btn.disabled=false;}}
+async function pxSetEnabled(id,en,el){if(el)el.disabled=true;var r=await pxPost('/monitor/api/proxies/enable',{id:id,enabled:en});if(!r)return;if(r.status===200){await refreshProxy();}else{toast('Gagal: '+((r.data&&r.data.detail)||('HTTP '+r.status)),'err');await refreshProxy();}}
+async function pxGlobalToggle(){var r=await pxPost('/monitor/api/proxies/global',{enabled:!pxGlobal});if(!r)return;await refreshProxy();toast('Proxy global '+(pxGlobal?'ON':'OFF'),'ok');}
+async function pxTestOne(id,btn){if(btn){btn.disabled=true;btn.textContent='…';}try{var r=await pxPost('/monitor/api/proxies/test',{id:id});if(!r)return;var res=r.data||{ok:false,error:'no response'};pxCache.forEach(function(p){if(p.id===id)p._test=res;});pxRender();var box=$('pxResult');if(res.ok){box.innerHTML='<span class="tag ok">OK</span> <span class="mono">'+esc(id)+'</span><div class="mt-out">IP '+esc(res.ip||'-')+'</div><div class="mt-meta">latency '+FMT.format(res.latency_ms||0)+' ms</div>';}else{box.innerHTML='<span class="tag fail">FAIL</span> <span class="mono">'+esc(id)+'</span><div class="mt-out">'+esc(res.error||'unknown')+'</div>';}}finally{if(btn){var f=document.querySelector('.px-test-btn[data-id="'+String(id).replace(/"/g,'')+'"]');if(f){f.disabled=false;f.textContent='Test';}}}}
+async function pxTestAdhoc(){var f=pxReadForm();if(!f.host||!(f.port>=1&&f.port<=65535)){toast('Host/port belum valid','err');return;}var b=$('pxTestAdhocBtn');b.disabled=true;var old=b.textContent;b.textContent='…';try{var r=await pxPost('/monitor/api/proxies/test',f);if(!r)return;var res=r.data||{ok:false,error:'no response'};var box=$('pxResult');if(res.ok){box.innerHTML='<span class="tag ok">OK (adhoc)</span><div class="mt-out">IP '+esc(res.ip||'-')+'</div><div class="mt-meta">latency '+FMT.format(res.latency_ms||0)+' ms • belum disimpan, tekan Add</div>';}else{box.innerHTML='<span class="tag fail">FAIL (adhoc)</span><div class="mt-out">'+esc(res.error||'unknown')+'</div>';}}finally{b.disabled=false;b.textContent=old;}}
+async function pxTestAll(){if(pxTesting)return;if(!pxCache.length){toast('Belum ada proxy','err');return;}pxTesting=true;var b=$('pxTestAllBtn');b.disabled=true;b.textContent='…';$('pxResult').innerHTML='<span class="spinner"></span>Menguji '+pxCache.length+' proxy…';try{var r=await pxPost('/monitor/api/proxies/test-all',{});if(!r)return;var map={};(r.data&&r.data.results||[]).forEach(function(x){map[x.id]=x;});pxCache.forEach(function(p){if(map[p.id])p._test=map[p.id];});pxRender();var okN=(r.data&&r.data.ok)||0,tot=(r.data&&r.data.total)||pxCache.length;$('pxResult').innerHTML='Test All selesai: <b>'+okN+'/'+tot+' OK</b>'+(okN<tot?' — proxy FAIL otomatis di-cooldown saat dipakai, tekan Reset setelah diperbaiki':'');toast('Test All: '+okN+'/'+tot+' OK',okN===tot?'ok':'');}finally{pxTesting=false;b.disabled=false;b.textContent='Test All';pxRender();}}
+async function pxSeed(){if(!confirm('Tambah 127.0.0.1:40001-40010 (warp-socks) sekaligus? Duplikat dilewati.'))return;var b=$('pxSeedBtn');b.disabled=true;var old=b.textContent;b.textContent='…';try{var r=await pxPost('/monitor/api/proxies/seed-warp',{host:'127.0.0.1',base_port:40001,count:10,scheme:'socks5h'});if(!r)return;toast('Seed: +'+((r.data&&r.data.added)||0)+' baru, '+(r.data&&r.data.skipped||0)+' sudah ada','ok');await refreshProxy();}finally{b.disabled=false;b.textContent=old;}}
+async function pxReset(){var b=$('pxResetBtn');b.disabled=true;var old=b.textContent;b.textContent='…';try{var r=await pxPost('/monitor/api/proxies/reset',{});if(r.status===401){toLogin();return;}toast(r.status===200?'Proxy cooldown direset':'Reset gagal',r.status===200?'ok':'err');await refreshProxy();}catch(e){toast('Network error','err');}finally{b.disabled=false;b.textContent=old;}}
+$('pxRefreshBtn').addEventListener('click',refreshProxy);
+$('pxAddBtn').addEventListener('click',pxAdd);
+$('pxTestAdhocBtn').addEventListener('click',pxTestAdhoc);
+$('pxTestAllBtn').addEventListener('click',pxTestAll);
+$('pxSeedBtn').addEventListener('click',pxSeed);
+$('pxResetBtn').addEventListener('click',pxReset);
+$('pxGlobalBtn').addEventListener('click',pxGlobalToggle);
+/* ---- boot ---- */
+showView(currentView,false);
+refreshUsage();refreshRecent();refreshMeta();refreshSession();connectLogs();refreshMtModels();refreshProxy();refreshRelayPool();refreshCfgSnapshot();
+setTimeout(function(){refreshInfra(true);},800);
 setInterval(refreshMeta,300000);setInterval(refreshSession,60000);
 </script>
 </body>

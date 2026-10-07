@@ -25,6 +25,18 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Isolasi pool proxy: test ini memock HTTP layer dan harus deterministik
+# tanpa tergantung proxies.json di CWD (bila pool terisi, expansion
+# menambah target proxy nyata -> network asli -> flaky).
+try:
+    import app.services.outbound_proxy as _op_iso
+    with _op_iso._store_lock:
+        _op_iso._proxies.clear()
+        _op_iso._proxies_order.clear()
+        _op_iso._loaded = True
+except (ImportError, AttributeError):
+    pass
+
 import asyncio
 import inspect
 import traceback

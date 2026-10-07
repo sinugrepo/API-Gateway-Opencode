@@ -4,6 +4,10 @@ usage.db-shm
 usage.db-wal
 *.db
 .env
+proxies.json
+proxies.json.tmp
+relays.json
+relays.json.tmp
 OPENCODE_API_KEY*
 
 # Log & debug lokal.

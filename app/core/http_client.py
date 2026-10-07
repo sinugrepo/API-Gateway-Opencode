@@ -52,6 +52,87 @@ async def _close_http() -> None:
             await _shared_http.aclose()
             _shared_http = None
             _shared_http_closed.set()
+    # Tutup juga semua pooled proxy clients (hindari leak fd saat shutdown).
+    await _close_all_proxy_clients()
+
+
+# ---- Pooled proxy clients (satu AsyncClient per proxy URL) ----
+# httpx mengikat `proxy=` pada level client, bukan request — jadi tiap proxy
+# butuh client sendiri agar connection-pooling tetap jalan. Dict di-cache
+# selamanya (masa hidup proses); entri dihapus saat proxy dihapus via UI
+# (_close_proxy_client) atau saat shutdown (_close_all_proxy_clients).
+_proxy_clients: Dict[str, httpx.AsyncClient] = {}
+
+_proxy_clients_lock = threading.Lock()
+
+
+def _get_proxy_client(proxy_url: str) -> httpx.AsyncClient:
+    """Return pooled client yang request-nya keluar via `proxy_url`.
+
+    Melempar ImportError bila skema socks dipakai tanpa `socksio` terpasang
+    (pemanggil request-path WAJIB menangkap dan failover ke direct).
+    Melempar ValueError bila proxy_url kosong/invalid.
+    """
+    cleaned = (proxy_url or "").strip()
+    if not cleaned:
+        raise ValueError("empty proxy url")
+    with _proxy_clients_lock:
+        existing = _proxy_clients.get(cleaned)
+        if existing is not None:
+            return existing
+        # Konstruksi di dalam lock agar dua thread tak membuat ganda.
+        # ImportError socksio muncul DI SINI (bukan saat request) — biarkan
+        # naik agar pemanggil bisa menandai proxy gagal + pakai direct.
+        client = httpx.AsyncClient(
+            proxy=cleaned,
+            timeout=httpx.Timeout(
+                connect=10.0,
+                read=float(REQUEST_TIMEOUT),
+                write=10.0,
+                pool=10.0,
+            ),
+            limits=_HTTP_LIMITS,
+        )
+        _proxy_clients[cleaned] = client
+        return client
+
+
+def _pick_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
+    """Pilih pooled client: via proxy bila diminta, else direct shared.
+
+    Helper kecil agar 4 generator tidak mengulang try/except yang sama.
+    TIDAK pernah melempar untuk proxy kosong/None (kembali direct).
+    Untuk proxy non-kosong yang gagal konstruksi (mis. socksio hilang),
+    ImportError/ValueError DIBIARKAN naik agar pemanggil failover eksplisit.
+    """
+    if proxy_url:
+        return _get_proxy_client(proxy_url)
+    return _get_http()
+
+
+async def _close_proxy_client(proxy_url: str) -> None:
+    """Tutup + buang pooled client satu proxy (dipakai saat proxy dihapus)."""
+    cleaned = (proxy_url or "").strip()
+    if not cleaned:
+        return
+    with _proxy_clients_lock:
+        client = _proxy_clients.pop(cleaned, None)
+    if client is not None:
+        try:
+            await client.aclose()
+        except (RuntimeError, OSError, AttributeError):
+            pass
+
+
+async def _close_all_proxy_clients() -> None:
+    with _proxy_clients_lock:
+        clients = list(_proxy_clients.values())
+        _proxy_clients.clear()
+    for client in clients:
+        try:
+            await client.aclose()
+        except (RuntimeError, OSError, AttributeError):
+            pass
 
 
 _dns_cache: Dict[str, Tuple[float, str]] = {}

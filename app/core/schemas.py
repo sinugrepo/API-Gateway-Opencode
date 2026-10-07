@@ -38,6 +38,10 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = 65536
     stream: bool = False
     use_relay: Optional[bool] = None
+    # Lapisan proxy SOCKS/HTTP per-request (seperti use_relay):
+    # None = ikut global USE_PROXY, True/False = paksa on/off request ini.
+    # Dicabut sebelum diteruskan ke upstream (bukan field OpenAI).
+    use_proxy: Optional[bool] = None
 
     # Tool calling required by Hermes.
     tools: Optional[List[Dict[str, Any]]] = None
@@ -165,7 +169,6 @@ class PropsRelay(BaseModel):
     enabled: bool
     fallback: bool
 
-
 class PropsDefaults(BaseModel):
     """Default values applied when the client omits optional parameters."""
 
@@ -193,3 +196,8 @@ class PropsInfo(BaseModel):
     supported_parameters: List[str]
     defaults: PropsDefaults
     endpoints: List[PropsEndpoint]
+    # Lapisan proxy SOCKS/HTTP (default kosong = nonaktif, backward-compat).
+    proxy_enabled: bool = False
+    proxy_urls: List[str] = Field(default_factory=list)
+    # Urutan egress efektif (relay_first/proxy_first), diatur via website.
+    egress_order: str = "relay_first"

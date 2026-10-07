@@ -17,6 +17,16 @@ from starlette.status import (
     HTTP_504_GATEWAY_TIMEOUT,
 )
 from app.core.config import API_KEY, OPENCODE_RESPONSES_URL, STREAM_BYPASS_RELAY, USE_RELAY, _is_responses_only_model
+
+
+def _default_use_relay() -> bool:
+    """Default use_relay efektif: override website > env. Tak melempar."""
+    try:
+        from app.services.relay_store import get_effective_use_relay
+
+        return bool(get_effective_use_relay())
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return bool(USE_RELAY)
 from app.core.errors import UpstreamEmptyResponse, UpstreamError
 from app.core.logging_utils import _log
 from app.services.collect import collect_chat_completion
@@ -44,7 +54,8 @@ async def chat_completions_via_responses(
     dengan wire `stream:true` lalu hasilnya di-buffer menjadi satu
     chat completion. Stream: terjemahkan SSE Responses ke SSE chat.
     """
-    use_relay = req.use_relay if req.use_relay is not None else USE_RELAY
+    use_relay = req.use_relay if req.use_relay is not None else _default_use_relay()
+    use_proxy = req.use_proxy  # None = ikut global (di-resolve generator)
     responses_payload = build_responses_payload_from_chat(req)
     _log(
         "RESP",
@@ -73,6 +84,7 @@ async def chat_completions_via_responses(
                 background_tasks=background_tasks,
                 use_relay=bool(stream_use_relay),
                 opencode_headers=opencode_headers,
+                use_proxy=use_proxy,
             ),
             media_type="text/event-stream",
             headers={
@@ -93,6 +105,7 @@ async def chat_completions_via_responses(
                 background_tasks=background_tasks,
                 use_relay=bool(use_relay),
                 opencode_headers=opencode_headers,
+                use_proxy=use_proxy,
             ),
             client_model=client_model,
         )
@@ -170,7 +183,7 @@ async def chat_completions(
 
         # Streaming kini menghormati use_relay per-request, sama seperti
         # path non-streaming. STREAM_BYPASS_RELAY hanya untuk debugging.
-        stream_use_relay = req.use_relay if req.use_relay is not None else USE_RELAY
+        stream_use_relay = req.use_relay if req.use_relay is not None else _default_use_relay()
         if STREAM_BYPASS_RELAY:
             stream_use_relay = False
 
@@ -186,6 +199,7 @@ async def chat_completions(
                 background_tasks=background_tasks,
                 use_relay=stream_use_relay,
                 opencode_headers=oc_headers,
+                use_proxy=req.use_proxy,
             ),
             media_type="text/event-stream",
             headers={
@@ -195,7 +209,7 @@ async def chat_completions(
             },
         )
 
-    use_relay = req.use_relay if req.use_relay is not None else USE_RELAY
+    use_relay = req.use_relay if req.use_relay is not None else _default_use_relay()
     # Free-tier gate: upstream HANYA menerima stream:true (403 bila tidak).
     # Jalankan generator streaming internal dengan wire stream:true lalu
     # buffer menjadi satu chat completion untuk klien non-stream.
@@ -214,6 +228,7 @@ async def chat_completions(
             background_tasks=background_tasks,
             use_relay=use_relay,
             opencode_headers=oc_headers,
+            use_proxy=req.use_proxy,
         ),
         client_model=client_model,
     )

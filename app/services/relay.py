@@ -223,6 +223,36 @@ def _is_relay_timeout(response: httpx.Response) -> bool:
     )
 
 
+def _effective_relay_urls() -> List[str]:
+    """Daftar relay efektif: runtime store (website) > env/defaults.
+
+    Tidak pernah melempar; fallback ke RELAY_URLS statis bila store gagal.
+    """
+    try:
+        from app.services.relay_store import get_effective_relays
+
+        urls = get_effective_relays()
+        if urls:
+            return urls
+        # Store kosong (semua dimatikan via website) = hormati: tanpa relay.
+        # Bedakan dari store gagal: cek apakah store punya data.
+        try:
+            from app.services import relay_store as _rs
+
+            _rs.ensure_loaded()
+            with _rs._store_lock:
+                if _rs._loaded and len(_rs._relays_order) == 0 and _rs._config_path().is_file():
+                    return []
+        except (ImportError, AttributeError, TypeError, ValueError, OSError):
+            pass
+        # Store belum diinisiasi / gagal: fallback env agar backward-compat.
+        if not urls:
+            return list(RELAY_URLS)
+        return urls
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return list(RELAY_URLS)
+
+
 def _relay_batch_for_request(for_stream: bool = False) -> List[str]:
     """Susun daftar relay untuk SATU request, dengan titik awal dirotasi.
 
@@ -238,13 +268,14 @@ def _relay_batch_for_request(for_stream: bool = False) -> List[str]:
     langsung memakai jalur yang mampu (biasanya direct).
     """
     global _relay_index
-    if not RELAY_URLS:
+    urls_all = _effective_relay_urls()
+    if not urls_all:
         return []
-    num_relays = len(RELAY_URLS)
+    num_relays = len(urls_all)
     with _relay_index_lock:
         start = _relay_index % num_relays
         _relay_index += 1
-    urls = [RELAY_URLS[(start + i) % num_relays] for i in range(num_relays)]
+    urls = [urls_all[(start + i) % num_relays] for i in range(num_relays)]
 
     def _deprioritized(url: str) -> bool:
         if _is_relay_penalized(url):
@@ -338,14 +369,18 @@ def _with_relay_headers(target_url: str, base_headers: Dict[str, str]) -> Dict[s
     return {**base_headers, "x-relay-target": origin, "x-relay-path": path}
 
 
-async def test_relay_connection(relay_url: str = RELAY_URLS[0]) -> Dict[str, Any]:
-    """Cek semua relay SECARA PARALEL dengan timeout pendek.
+async def test_relay_connection(relay_url: Optional[str] = None) -> Dict[str, Any]:
+    """Cek semua relay EFEKTIF (website) SECARA PARALEL dengan timeout pendek.
 
     Perbaikan performance kritis: versi lama melakukan GET relay SATU PER SATU
     memakai shared client (read timeout 120s), sehingga /relay/status dan
     /monitor/api/relay bisa menggantung bermenit-menit dan memblokir refresh
     dashboard. Versi ini memakai asyncio.gather + timeout 8s per probe, jadi
-    worst-case ~8s total untuk 14 relay, bukan 14x120s.
+    worst-case ~8s total untuk N relay, bukan Nx120s.
+
+    `relay_url` opsional (backward-compat): bila diisi dipakai sebagai label
+    `relay_url` di respons; bila kosong dipakai relay efektif pertama.
+    Daftar yang di-probe SELALU daftar efektif website (bukan hardcoded).
     """
     direct_ip = relay_ip = None
     start = time.time()
@@ -389,16 +424,17 @@ async def test_relay_connection(relay_url: str = RELAY_URLS[0]) -> Dict[str, Any
             return {"url": url, "ip": None, "ok": False}
 
     direct_ip, *results = await asyncio.gather(
-        _fetch_direct(), *(_probe(u) for u in RELAY_URLS)
+        _fetch_direct(), *(_probe(u) for u in _effective_relay_urls())
     )
     results = list(results)
 
     relay_ip = next((r["ip"] for r in results if r["ok"]), None)
 
     elapsed = (time.time() - start) * 1000
+    label = relay_url or (results[0]["url"] if results else "")
     return {
         "success": relay_ip is not None,
-        "relay_url": relay_url,
+        "relay_url": label,
         "direct_ip": direct_ip,
         "relay_ip": relay_ip,
         "is_masked": relay_ip is not None and relay_ip != direct_ip,

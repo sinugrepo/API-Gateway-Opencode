@@ -29,6 +29,16 @@ from app.core.config import (
 from app.core.errors import TimeoutError_, UpstreamError
 from app.core.logging_utils import _log
 from app.services.opencode import _fresh_request_headers, _oc_session_tag
+
+
+def _eff_fallback() -> bool:
+    """Fallback efektif: override website (relays.json) > env. Tak melempar."""
+    try:
+        from app.services.relay_store import get_effective_fallback
+
+        return bool(get_effective_fallback())
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return bool(RELAY_FALLBACK)
 from app.services.relay import (
     _is_giant_payload,
     _is_relay_timeout,
@@ -38,7 +48,7 @@ from app.services.relay import (
     _stream_request_headers,
 )
 from app.core.schemas import ChatCompletionRequest
-from app.core.http_client import _get_http
+from app.core.http_client import _get_http, _get_proxy_client
 
 
 def _resolve_request_model(req: ChatCompletionRequest) -> str:
@@ -259,6 +269,7 @@ async def call_upstream(
     use_relay: bool,
     target_url: Optional[str] = None,
     extra_headers: Optional[Dict[str, str]] = None,
+    use_proxy: Optional[bool] = None,
 ) -> Tuple[httpx.Response, str]:
     """Call upstream through round-robin relay, with optional direct fallback.
 
@@ -266,6 +277,11 @@ async def call_upstream(
     Responses API memakai OPENCODE_RESPONSES_URL). Seluruh logika
     relay 429-cooldown + fallback direct dipakai ulang apa adanya.
     `extra_headers` (identitas CLI) dikirim baik direct maupun via relay.
+
+    Lapisan proxy SOCKS/HTTP (no-op bila pool kosong): request DIRECT
+    dicoba via tiap proxy round-robin SEBELUM direct mentah. Relay tidak
+    pernah lewat proxy lokal. `use_proxy=False` menonaktifkan lapisan ini
+    untuk panggilan ini saja.
     """
 
     if not API_KEY:
@@ -288,6 +304,72 @@ async def call_upstream(
     )
 
     async def direct_request() -> Tuple[httpx.Response, str]:
+        # Lapisan proxy: coba tiap proxy round-robin dulu, direct mentah
+        # terakhir. Transport error pada satu proxy -> lanjut ke proxy
+        # berikut (bukan langsung gagal). 429/403 dikembalikan ke pemanggil
+        # (pemanggil yang memutuskan retry/backoff) TAPI proxy dicatat
+        # cooldown agar panggilan berikut memakai egress lain.
+        try:
+            from app.services.outbound_proxy import (
+                is_proxy_layer_active as _proxy_active,
+                mark_proxy_conn_failed as _markp,
+                proxy_batch_for_request as _pbatch,
+                proxy_connection_url as _pconn,
+            )
+            _proxy_on = _proxy_active(use_proxy)
+        except (ImportError, AttributeError, TypeError, ValueError):
+            _proxy_on, _pbatch, _pconn, _markp = False, None, None, None
+        if _proxy_on and _pbatch is not None:
+            try:
+                _batch = _pbatch()
+            except (TypeError, ValueError, AttributeError):
+                _batch = []
+            for _entry in _batch:
+                try:
+                    _conn = _pconn(_entry)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if not _conn:
+                    continue
+                try:
+                    from app.core.http_client import _get_proxy_client as _gpc
+                    _client = _gpc(_conn)
+                except (ImportError, ValueError):
+                    try:
+                        _markp(_conn)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                    continue
+                try:
+                    # Request ID fresh per attempt ala CLI asli.
+                    r = await _client.post(
+                        upstream_url,
+                        headers=_fresh_request_headers(headers),
+                        json=payload,
+                    )
+                    await r.aread()
+                except (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError):
+                    try:
+                        _markp(_conn)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                    _log("RELAY", "PROXY direct failover -> proxy berikutnya")
+                    continue
+                if r.status_code == 403:
+                    # 403 = egress IP proxy di-flag upstream (proxy SEHAT,
+                    # test OK). Tandai FLAGGED (bukan DOWN) + lanjut egress
+                    # berikut. 429 = IP panas -> cooldown transport biasa.
+                    try:
+                        from app.services.outbound_proxy import mark_proxy_flagged as _markf
+                        _markf(_conn)
+                    except (ImportError, AttributeError, TypeError, ValueError):
+                        pass
+                elif r.status_code == 429:
+                    try:
+                        _markp(_conn)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                return r, upstream_url
         client = _get_http()
         # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
         r = await client.post(upstream_url, headers=_fresh_request_headers(headers), json=payload)
@@ -370,8 +452,31 @@ async def call_upstream(
     # Batasi seperti streaming (0 = langsung direct).
     # Vision: direct DULU (biner base64 rawan 413/504 relay); relay HANYA
     # bila direct 429 (satu retry same-route dulu untuk spurious-429).
+    _fb = _eff_fallback()
+    try:
+        from app.services.relay_store import get_egress_order as _get_order
+
+        _order = _get_order()
+    except (ImportError, AttributeError, TypeError, ValueError):
+        _order = "relay_first"
+    # proxy_first (diatur via website): coba proxy-direct DULU sebelum relay
+    # agar pool proxy benar-benar kepakai walau relay sehat. Sukses (200)
+    # langsung kembali; gagal (429/5xx/exception) lanjut ke loop relay di
+    # bawah yang diakhiri fallback direct ber-retry.
+    if use_relay and _fb and _order == "proxy_first" and not _payload_has_media(payload):
+        try:
+            _pre_resp, _pre_used = await direct_request()
+            if _pre_resp.status_code == 200:
+                _log("RELAY", f"PROXY-FIRST OK {_pre_used}")
+                return _pre_resp, _pre_used
+            _log(
+                "RELAY",
+                f"PROXY-FIRST {_pre_used} -> { _pre_resp.status_code}, lanjut relay",
+            )
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as exc:
+            _log("RELAY", f"PROXY-FIRST failover ({type(exc).__name__}) -> relay")
     vision_direct_first = (
-        use_relay and RELAY_FALLBACK and _payload_has_media(payload)
+        use_relay and _fb and _payload_has_media(payload)
     )
     if vision_direct_first:
         try:
@@ -433,7 +538,7 @@ async def call_upstream(
         try:
             response, used_url = await relay_request(url)
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
-            if attempt == num_relays - 1 and not RELAY_FALLBACK:
+            if attempt == num_relays - 1 and not _fb:
                 if isinstance(exc, httpx.TimeoutException):
                     raise TimeoutError_("All relays timed out") from exc
                 raise UpstreamError(
@@ -501,7 +606,7 @@ async def call_upstream(
 
         _log("RELAY", f"FAIL {url} | upstream-status={response.status_code}")
 
-        if attempt == num_relays - 1 and not RELAY_FALLBACK:
+        if attempt == num_relays - 1 and not _fb:
             if response.status_code == 429:
                 _log(
                     "RELAY",
@@ -519,7 +624,7 @@ async def call_upstream(
             )
 
     # All relays failed, fall back to direct
-    if RELAY_FALLBACK:
+    if _fb:
         _log("RELAY", f"FALLBACK all relays failed -> direct {upstream_url}")
         try:
             resp, used = await direct_request()

@@ -24,10 +24,28 @@ from app.core.config import USAGE_DB_PATH
 async def lifespan(app: FastAPI):
     _get_usage_db()
     _get_http()
+    try:
+        from app.services.outbound_proxy import ensure_loaded, get_proxy_overview
+        ensure_loaded()
+        _ov = get_proxy_overview()
+        _log("INFO", f"Outbound proxy: {'ON' if _ov.get('enabled_global') else 'OFF'} ({_ov.get('enabled_count', 0)}/{_ov.get('count', 0)} enabled)")
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
+    try:
+        from app.services.relay_store import ensure_loaded as _relay_load, get_relay_overview
+        _relay_load()
+        _rov = get_relay_overview()
+        _log("INFO", f"Relay pool: {_rov.get('enabled_count', 0)}/{_rov.get('count', 0)} enabled, order={_rov.get('egress_order')}")
+    except (ImportError, AttributeError, TypeError, ValueError):
+        _rov = {}
     _log("INFO", f"Usage DB ready at {os.path.abspath(USAGE_DB_PATH)}")
     _log("INFO", "Backend API ready at http://0.0.0.0:8000")
     _log("INFO", f"Model: {MODEL}")
-    _log("INFO", f"Relay: {'ON' if USE_RELAY else 'OFF'}")
+    try:
+        _eff_relay = bool(_rov.get("use_relay", USE_RELAY)) if _rov else USE_RELAY
+    except (TypeError, ValueError, AttributeError):
+        _eff_relay = USE_RELAY
+    _log("INFO", f"Relay: {'ON' if _eff_relay else 'OFF'}")
     _log("INFO", f"Hermes compatibility: {'ON' if HERMES_COMPAT else 'OFF'}")
     if GATEWAY_AUTH_ENABLED:
         _log("INFO", "Gateway API-key auth: ON (/v1/* + /relay/status wajib Bearer/x-api-key)")

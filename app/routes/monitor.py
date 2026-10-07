@@ -158,17 +158,436 @@ async def monitor_api_relay(request: Request):
     return await test_relay_connection()
 
 
+# ==================== RELAY POOL + EGRESS (website, tanpa hardcoded) ====================
+# Daftar relay Vercel + saklar egress (use_relay / fallback / use_proxy /
+# egress_order) dikelola penuh dari website, tersimpan di relays.json.
+# Env (.env) hanya menjadi default awal; override website menang selama di-set
+# (None = kembali ikut env). Semua endpoint butuh cookie monitor yang valid.
+
+@router.get("/monitor/api/relays")
+async def monitor_api_relays_list(request: Request):
+    """Ringkasan pool relay + saklar egress efektif (untuk halaman Konfigurasi)."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    from app.services.relay_store import get_relay_overview
+    return get_relay_overview()
+
+
+@router.post("/monitor/api/relays")
+async def monitor_api_relays_add(request: Request):
+    """Tambah satu relay. Body: {url} (hostname telanjang diterima)."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    url = str(body.get("url") or "").strip()
+    if len(url) > 512:
+        raise HTTPException(HTTP_400_BAD_REQUEST, "URL terlalu panjang")
+    if not url:
+        raise HTTPException(HTTP_400_BAD_REQUEST, "Field 'url' is required")
+    from app.services.relay_store import add_relay
+    entry, err = add_relay(url)
+    if err:
+        raise HTTPException(HTTP_400_BAD_REQUEST, err)
+    return {"added": True, "relay": entry}
+
+
+@router.post("/monitor/api/relays/remove")
+async def monitor_api_relays_remove(request: Request):
+    """Hapus satu relay. Body: {id}."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    pid = str((body.get("id") if isinstance(body, dict) else "") or "").strip()
+    if not pid:
+        raise HTTPException(HTTP_400_BAD_REQUEST, "Field 'id' is required")
+    from app.services.relay_store import remove_relay
+    if not remove_relay(pid):
+        raise HTTPException(HTTP_400_BAD_REQUEST, "relay tidak ditemukan")
+    return {"removed": True, "id": pid}
+
+
+@router.post("/monitor/api/relays/enable")
+async def monitor_api_relays_enable(request: Request):
+    """Aktif/nonaktif satu relay. Body: {id, enabled: bool}."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    pid = str(body.get("id") or "").strip()
+    if not pid:
+        raise HTTPException(HTTP_400_BAD_REQUEST, "Field 'id' is required")
+    enabled = body.get("enabled")
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in ("1", "true", "on", "yes")
+    enabled = bool(enabled)
+    from app.services.relay_store import set_relay_enabled
+    if not set_relay_enabled(pid, enabled):
+        raise HTTPException(HTTP_400_BAD_REQUEST, "relay tidak ditemukan")
+    return {"id": pid, "enabled": enabled}
+
+
+@router.post("/monitor/api/relays/config")
+async def monitor_api_relays_config(request: Request):
+    """Simpan saklar egress. Body parsial, mis. {use_relay, relay_fallback,
+    use_proxy, egress_order}. Key yang TIDAK dikirim = tidak diubah.
+    Nilai null = kembali ikut env. egress_order: relay_first|proxy_first."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    kwargs: Dict[str, Any] = {}
+    for key in ("use_relay", "relay_fallback", "use_proxy", "egress_order"):
+        if key in body:
+            kwargs[key] = body.get(key)
+    if "egress_order" in kwargs and kwargs["egress_order"] is not None:
+        order = str(kwargs["egress_order"] or "").strip().lower()
+        if order not in ("relay_first", "proxy_first"):
+            raise HTTPException(HTTP_400_BAD_REQUEST, "egress_order harus relay_first|proxy_first")
+    from app.services.relay_store import set_egress_settings
+    return {"saved": True, **set_egress_settings(**kwargs)}
+
+
+@router.post("/monitor/api/relays/test")
+async def monitor_api_relays_test_one(request: Request):
+    """Test satu relay (fetch ipify via relay itu). Body: {id} atau {url}.
+
+    Selalu 200 + {ok, ip, latency_ms, error} agar UI tidak crash.
+    """
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    target_url = ""
+    pid = str(body.get("id") or "").strip()
+    if pid:
+        from app.services.relay_store import list_relays
+        for r in list_relays():
+            if r.get("id") == pid:
+                target_url = str(r.get("url") or "")
+                break
+        if not target_url:
+            return {"ok": False, "ip": None, "latency_ms": 0, "error": "relay tidak ditemukan"}
+    else:
+        raw = str(body.get("url") or "").strip()
+        if not raw:
+            raise HTTPException(HTTP_400_BAD_REQUEST, "Field 'id' atau 'url' is required")
+        if len(raw) > 512:
+            return {"ok": False, "ip": None, "latency_ms": 0, "error": "URL terlalu panjang"}
+        from app.services.relay_store import _normalize
+        target_url = _normalize(raw)
+        if not target_url:
+            return {"ok": False, "ip": None, "latency_ms": 0, "error": "URL relay tidak valid"}
+    import time as _t
+    started = _t.time()
+    try:
+        from app.core.config import RELAY_STATUS_TIMEOUT
+        from app.core.http_client import _get_http
+        headers = {
+            "x-relay-target": "https://api.ipify.org",
+            "x-relay-path": "/?format=json",
+            "Accept": "application/json",
+        }
+        client = _get_http()
+        resp = await asyncio.wait_for(
+            client.get(target_url, headers=headers),
+            timeout=float(RELAY_STATUS_TIMEOUT),
+        )
+        latency = int((_t.time() - started) * 1000)
+        if resp.status_code != 200:
+            return {"ok": False, "ip": None, "latency_ms": latency,
+                    "url": target_url, "error": f"HTTP {resp.status_code}"}
+        try:
+            ip = resp.json().get("ip") if isinstance(resp.json(), dict) else None
+        except (ValueError, TypeError, AttributeError):
+            ip = None
+        if not ip:
+            return {"ok": False, "ip": None, "latency_ms": latency,
+                    "url": target_url, "error": "respons tanpa IP"}
+        return {"ok": True, "ip": ip, "latency_ms": latency, "url": target_url, "error": None}
+    except (asyncio.TimeoutError, httpx.TimeoutException):
+        return {"ok": False, "ip": None, "latency_ms": int((_t.time() - started) * 1000),
+                "url": target_url, "error": "timeout"}
+    except (httpx.RequestError, OSError) as exc:
+        return {"ok": False, "ip": None, "latency_ms": int((_t.time() - started) * 1000),
+                "url": target_url, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    except Exception as exc:  # noqa: BLE001 — test tak boleh melempar
+        return {"ok": False, "ip": None, "latency_ms": int((_t.time() - started) * 1000),
+                "url": target_url, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+
+
 @router.get("/monitor/api/props")
 async def monitor_api_props(request: Request):
     if not _check_monitor(request):
         raise HTTPException(status_code=401)
     props = await get_props()
+    try:
+        from app.services.outbound_proxy import get_proxy_overview
+        proxy_ov = get_proxy_overview()
+    except (ImportError, AttributeError, TypeError, ValueError):
+        proxy_ov = {"enabled_global": False, "count": 0, "proxies": []}
+    try:
+        from app.services.relay_store import get_relay_overview
+        relay_ov = get_relay_overview()
+    except (ImportError, AttributeError, TypeError, ValueError):
+        relay_ov = {"count": 0, "relays": []}
     extra = {
         "models_cache_ttl": MODELS_CACHE_TTL_SECONDS,
         "max_relay_stream_attempts": MAX_RELAY_STREAM_ATTEMPTS,
         "relay_stream_broken_cooldown": RELAY_STREAM_BROKEN_COOLDOWN,
+        "proxy": proxy_ov,
+        "relay_pool": relay_ov,
     }
     return {**props.model_dump(), **extra}
+
+
+# ==================== OUTBOUND PROXY (SOCKS/HTTP) ====================
+# Konfigurasi pool proxy egress via website (tanpa restart / tanpa edit .env).
+# Semua endpoint butuh cookie monitor yang valid. Password proxy TIDAK PERNAH
+# dikembalikan ke klien (hanya flag has_auth).
+
+@router.get("/monitor/api/proxies")
+async def monitor_api_proxies_list(request: Request):
+    """Ringkasan pool proxy (tanpa password) + status cooldown."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    from app.services.outbound_proxy import get_proxy_overview
+    return get_proxy_overview()
+
+
+@router.post("/monitor/api/proxies")
+async def monitor_api_proxies_add(request: Request):
+    """Tambah satu proxy. Body: {scheme, host, port, username?, password?}."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    scheme = str(body.get("scheme") or "").strip()
+    host = str(body.get("host") or "").strip()
+    port = body.get("port")
+    username = str(body.get("username") or "")
+    password = str(body.get("password") or "")
+    # Batas panjang body-level (lapis kedua selain validasi service).
+    if len(host) > 253 or len(username) > 128 or len(password) > 256 or len(scheme) > 16:
+        raise HTTPException(HTTP_400_BAD_REQUEST, "Field terlalu panjang")
+    from app.services.outbound_proxy import add_proxy
+    entry, err = add_proxy(scheme, host, port, username, password)
+    if err:
+        raise HTTPException(HTTP_400_BAD_REQUEST, err)
+    return {"added": True, "proxy": entry}
+
+
+@router.post("/monitor/api/proxies/remove")
+async def monitor_api_proxies_remove(request: Request):
+    """Hapus satu proxy. Body: {id}."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    pid = str((body.get("id") if isinstance(body, dict) else "") or "").strip()
+    if not pid:
+        raise HTTPException(HTTP_400_BAD_REQUEST, "Field 'id' is required")
+    from app.services.outbound_proxy import remove_proxy
+    if not remove_proxy(pid):
+        raise HTTPException(HTTP_400_BAD_REQUEST, "proxy tidak ditemukan")
+    return {"removed": True, "id": pid}
+
+
+@router.post("/monitor/api/proxies/enable")
+async def monitor_api_proxies_enable(request: Request):
+    """Aktif/nonaktif satu proxy. Body: {id, enabled: bool}."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    pid = str(body.get("id") or "").strip()
+    if not pid:
+        raise HTTPException(HTTP_400_BAD_REQUEST, "Field 'id' is required")
+    enabled = body.get("enabled")
+    # Terima bool / 0-1 / string true-false (toleran form dashboard).
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in ("1", "true", "on", "yes")
+    enabled = bool(enabled)
+    from app.services.outbound_proxy import set_proxy_enabled
+    if not set_proxy_enabled(pid, enabled):
+        raise HTTPException(HTTP_400_BAD_REQUEST, "proxy tidak ditemukan")
+    return {"id": pid, "enabled": enabled}
+
+
+@router.post("/monitor/api/proxies/global")
+async def monitor_api_proxies_global(request: Request):
+    """Saklar global lapisan proxy. Body: {enabled: bool}."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    enabled = (body.get("enabled") if isinstance(body, dict) else True)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in ("1", "true", "on", "yes")
+    enabled = bool(enabled)
+    from app.services.outbound_proxy import set_global_enabled
+    return {"enabled_global": set_global_enabled(enabled)}
+
+
+@router.post("/monitor/api/proxies/test")
+async def monitor_api_proxies_test(request: Request):
+    """Test satu proxy (fetch ipify via proxy, timeout pendek).
+
+    Body: {id} untuk proxy tersimpan, ATAU {scheme, host, port, username?,
+    password?} untuk test ad-hoc SEBELUM disimpan (tidak menyimpan).
+    Selalu 200 + {ok, ip, latency_ms, error} agar UI tidak crash.
+    """
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    from app.services.outbound_proxy import (
+        normalize_proxy_url,
+        proxy_connection_url,
+        test_proxy_by_id,
+        test_proxy_connection,
+    )
+    if body.get("id"):
+        result = await test_proxy_by_id(str(body.get("id") or ""))
+        return result
+    # Ad-hoc: rakit URL dari field, validasi via normalizer (tanpa simpan).
+    scheme = str(body.get("scheme") or "socks5h").strip()
+    host = str(body.get("host") or "").strip()
+    port = body.get("port")
+    username = str(body.get("username") or "")
+    password = str(body.get("password") or "")
+    if len(host) > 253 or len(username) > 128 or len(password) > 256:
+        return {"ok": False, "ip": None, "latency_ms": 0, "error": "Field terlalu panjang"}
+    try:
+        port_n = int(port)
+    except (TypeError, ValueError):
+        return {"ok": False, "ip": None, "latency_ms": 0, "error": "port harus 1-65535"}
+    auth = ""
+    if username:
+        if ":" in username:
+            return {"ok": False, "ip": None, "latency_ms": 0, "error": "username tidak boleh mengandung ':'"}
+        auth = username + (f":{password}" if password else "") + "@"
+    candidate = normalize_proxy_url(f"{scheme}://{auth}{host}:{port_n}")
+    if not candidate:
+        return {"ok": False, "ip": None, "latency_ms": 0, "error": "skema/host/port tidak valid"}
+    return await test_proxy_connection(candidate)
+
+
+@router.post("/monitor/api/proxies/test-all")
+async def monitor_api_proxies_test_all(request: Request):
+    """Test SEMUA proxy tersimpan secara paralel (timeout pendek per proxy).
+
+    Worst-case ~PROXY_TEST_TIMEOUT detik total (bukan N x timeout) karena
+    asyncio.gather. Return per-proxy {id, ok, ip, latency_ms, error}.
+    """
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    from app.services.outbound_proxy import (
+        list_proxies_masked,
+        proxy_connection_url,
+        test_proxy_connection,
+    )
+    from app.services import outbound_proxy as _op
+    # Ambil snapshot FULL (termasuk password, server-side only).
+    _op.ensure_loaded()
+    with _op._store_lock:
+        entries = [dict(v) for v in _op._proxies.values() if isinstance(v, dict)]
+    order = {p.get("id"): i for i, p in enumerate(list_proxies_masked())}
+
+    async def _one(entry: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            conn = proxy_connection_url(entry)
+            res = await test_proxy_connection(conn)
+            res["id"] = entry.get("id")
+            return res
+        except (TypeError, ValueError, AttributeError) as exc:
+            return {"id": entry.get("id"), "ok": False, "ip": None,
+                    "latency_ms": 0, "error": str(exc)[:200]}
+
+    results = await asyncio.gather(*(_one(e) for e in entries))
+    try:
+        results = sorted(results, key=lambda r: order.get(r.get("id"), 999))
+    except (TypeError, ValueError, AttributeError):
+        pass
+    ok_n = sum(1 for r in results if r.get("ok"))
+    return {"results": results, "ok": ok_n, "total": len(results)}
+
+
+@router.post("/monitor/api/proxies/reset")
+async def monitor_api_proxies_reset(request: Request):
+    """Hapus cooldown semua proxy (wajib setelah proxy diperbaiki)."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    from app.services.outbound_proxy import reset_proxy_state
+    return {"reset": True, **reset_proxy_state()}
+
+
+@router.post("/monitor/api/proxies/seed-warp")
+async def monitor_api_proxies_seed_warp(request: Request):
+    """Satu-klik tambah pool warp-socks lokal (default 127.0.0.1:40001-40010).
+
+    Body opsional: {host, base_port, count, scheme}. Idempoten (duplikat
+    dilewati). Berguna di VM ini tanpa mengetik 10x.
+    """
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    host = str(body.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    scheme = str(body.get("scheme") or "socks5h").strip() or "socks5h"
+    try:
+        base_port = int(body.get("base_port", 40001))
+    except (TypeError, ValueError):
+        base_port = 40001
+    try:
+        count = int(body.get("count", 10))
+    except (TypeError, ValueError):
+        count = 10
+    if len(host) > 253 or len(scheme) > 16:
+        raise HTTPException(HTTP_400_BAD_REQUEST, "Field terlalu panjang")
+    from app.services.outbound_proxy import seed_warp_pool
+    result = seed_warp_pool(base_port=base_port, count=count, host=host, scheme=scheme)
+    from app.services.outbound_proxy import get_proxy_overview
+    return {**result, "overview": get_proxy_overview()}
 
 
 @router.get("/monitor/api/security")

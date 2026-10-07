@@ -28,8 +28,18 @@ from app.core.config import (
     STREAM_BYPASS_RELAY,
     USE_RELAY,
 )
+
+
+def _eff_fallback() -> bool:
+    """Fallback efektif: override website (relays.json) > env. Tak melempar."""
+    try:
+        from app.services.relay_store import get_effective_fallback
+
+        return bool(get_effective_fallback())
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return bool(RELAY_FALLBACK)
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
-from app.core.http_client import _get_http
+from app.core.http_client import _get_http, _pick_http_client
 from app.core.logging_utils import _log
 from app.services.opencode import _fresh_request_headers, _fresh_retry_targets, _oc_session_tag
 from app.core.sse import _sse
@@ -72,6 +82,7 @@ async def stream_generator(
     background_tasks: BackgroundTasks,
     use_relay: bool,
     opencode_headers: Optional[Dict[str, str]] = None,
+    use_proxy: Optional[bool] = None,
 ):
     """Translate upstream SSE into clean OpenAI-compatible SSE for Hermes.
 
@@ -210,16 +221,18 @@ async def stream_generator(
 
     # Susun daftar kandidat target: semua relay (round-robin), lalu opsional
     # fallback direct. Path non-streaming tetap memakai call_upstream.
+    # Saklar + urutan egress (relay_first/proxy_first) diatur via website.
     targets: List[Tuple[str, Dict[str, str]]] = []
+    _fallback_on = _eff_fallback()
     if use_relay:
         for relay_url in _relay_batch_for_request(for_stream=True):
             targets.append((relay_url, _relay_stream_headers(base_headers)))
-        if RELAY_FALLBACK:
+        if _fallback_on:
             targets.append((OPENCODE_URL, dict(base_headers)))
     else:
         targets.append((OPENCODE_URL, dict(base_headers)))
     targets = _limit_stream_targets(targets)
-    vision_direct_first = use_relay and RELAY_FALLBACK and _payload_has_media(payload)
+    vision_direct_first = use_relay and _fallback_on and _payload_has_media(payload)
     if vision_direct_first:
         # Vision: direct DULU; relay HANYA fallback bila direct 429
         # (lihat guard di loop). Biner base64 rawan 413/504 relay.
@@ -227,6 +240,22 @@ async def stream_generator(
         relays = [t for t in targets if "x-relay-target" in t[1]]
         targets = direct + relays
         _log("STREAM", f"VISION model={client_model}: direct dulu, relay khusus 429")
+    # Lapisan proxy SOCKS/HTTP (no-op bila pool kosong / USE_PROXY off):
+    # direct (tanpa x-relay-target) disisip proxy-direct SEBELUM direct
+    # mentah; relay tidak tersentuh. Urutan akhir relay -> proxy -> direct.
+    try:
+        from app.services.outbound_proxy import expand_targets_with_proxy as _expand_proxy
+        targets = _expand_proxy(targets, use_proxy)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
+    # Egress order via website: proxy_first menaikkan proxy-direct ke depan
+    # relay agar pool proxy benar-benar kepakai (bukan cuma fallback).
+    try:
+        from app.services.relay_store import reorder_targets_proxy_first as _reorder
+
+        targets = _reorder(targets)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
     # Kebijakan relay-first: non-vision WAJIB lewat relay dulu, direct hanya
     # fallback terakhir setelah SEMUA relay gagal (429/5xx/timeout/
     # relay.error). Direct-first untuk slow/giant dihapus — operator meminta
@@ -258,8 +287,13 @@ async def stream_generator(
         while True:
             target_index = 0
             while target_index < len(targets):
-                target_url, headers = targets[target_index]
+                try:
+                    from app.services.outbound_proxy import unpack_target as _unpack
+                    target_url, headers, proxy_url = _unpack(targets[target_index])
+                except (ImportError, AttributeError, TypeError, ValueError):
+                    target_url, headers, proxy_url = targets[target_index][0], targets[target_index][1], None
                 is_relay = "x-relay-target" in headers
+                is_proxy = proxy_url is not None
                 if vision_direct_first and is_relay and not last_rate_limited:
                     # Relay vision hanya untuk 429 direct; kegagalan lain
                     # selesai di direct (last_error sudah terisi).
@@ -267,14 +301,34 @@ async def stream_generator(
                 # Request ID fresh per attempt ala CLI asli (msg_ unik per POST);
                 # memakai ulang satu ID di semua attempt terlihat seperti replay.
                 headers = _fresh_request_headers(headers)
+                _route = "RELAY" if is_relay else ("PROXY" if is_proxy else "DIRECT")
                 _log("STREAM",
                     f"ATTEMPT {target_index + 1}/{len(targets)} "
-                    f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}"
+                    f"{_route} target={target_url}"
                 )
                 try:
                     target_termination_seen = False
                     relay_target_failed = False
-                    client = _get_http()
+                    if proxy_url:
+                        try:
+                            client = _pick_http_client(proxy_url)
+                        except (ImportError, ValueError) as _proxy_exc:
+                            # socksio hilang / URL rusak: tandai proxy gagal, lanjut.
+                            try:
+                                from app.services.outbound_proxy import mark_proxy_conn_failed as _markp
+                                _markp(proxy_url)
+                            except (ImportError, AttributeError, TypeError, ValueError):
+                                pass
+                            last_error = f"Proxy unavailable: {_proxy_exc}"
+                            saw_non_403_failure = True
+                            target_index += 1
+                            _log("STREAM", f"PROXY-UNAVAILABLE {target_url} ({type(_proxy_exc).__name__}) -> lanjut")
+                            continue
+                    else:
+                        # Jalur direct/relay tanpa proxy memakai _get_http()
+                        # level-modul (bukan via _pick) agar test yang
+                        # memonkeypatch s._get_http tetap berlaku.
+                        client = _get_http()
                     async with client.stream(
                         "POST", target_url, json=payload, headers=headers
                     ) as response:
@@ -314,8 +368,11 @@ async def stream_generator(
                                 # sehat) lalu pindah ke target berikutnya.
                                 # PENGECUALIAN bug spam-429 muse-spark: retry 1x
                                 # same-route dulu sebelum rotasi/cooldown.
-                                if _should_retry_same_route_429(client_model) and target_url not in spurious_429_retried:
-                                    spurious_429_retried.add(target_url)
+                                # Kunci same-route mencakup proxy (satu URL direct
+                                # bisa muncul N kali via proxy berbeda).
+                                _spurious_key = f"{target_url}|{proxy_url or ''}"
+                                if _should_retry_same_route_429(client_model) and _spurious_key not in spurious_429_retried:
+                                    spurious_429_retried.add(_spurious_key)
                                     _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
                                     _log(
                                         "STREAM",
@@ -328,22 +385,29 @@ async def stream_generator(
                                 last_retry_after = _retry_after_seconds(
                                     response, RATE_LIMIT_BACKOFF
                                 )
-                                _mark_relay_rate_limited(
-                                    target_url,
-                                    time.time() + _relay_cooldown_seconds(response),
-                                )
+                                if is_relay:
+                                    _mark_relay_rate_limited(
+                                        target_url,
+                                        time.time() + _relay_cooldown_seconds(response),
+                                    )
+                                if is_proxy and proxy_url:
+                                    try:
+                                        from app.services.outbound_proxy import mark_proxy_conn_failed as _markp2
+                                        _markp2(proxy_url)
+                                    except (ImportError, AttributeError, TypeError, ValueError):
+                                        pass
                                 last_error = f"Rate limited (429): {detail}"
                                 last_rate_limited = True
                                 saw_non_403_failure = True
                                 _log(
                                     "STREAM",
-                                    f"RATE-LIMITED {target_url} | "
-                                    f"{rate_cls['description']} | IP relay dirotasi "
+                                    f"RATE-LIMITED {_route} {target_url} | "
+                                    f"{rate_cls['description']} | IP dirotasi "
                                     f"terus -> target berikutnya | detail={detail[:300]!r}",
                                 )
                                 target_index += 1
                                 _log("STREAM",
-                                    f"FAIL {target_url} | upstream-status=429 detail={detail[:300]!r}"
+                                    f"FAIL {_route} {target_url} | upstream-status=429 detail={detail[:300]!r}"
                                 )
                                 continue  # target berikutnya
                             last_error = (
@@ -372,9 +436,23 @@ async def stream_generator(
                                     f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s, "
                                     f"lanjut ke target berikutnya"
                                 )
+                            if response.status_code == 403 and is_proxy and not sent_payload and proxy_url:
+                                # 403 via proxy = egress IP proxy di-flag upstream,
+                                # BUKAN proxy rusak (test-ipify tetap OK). Tandai
+                                # FLAGGED agar request berikut pakai egress lain.
+                                try:
+                                    from app.services.outbound_proxy import mark_proxy_flagged as _markp3
+                                    _markp3(proxy_url)
+                                except (ImportError, AttributeError, TypeError, ValueError):
+                                    pass
+                                _log("STREAM",
+                                    f"FORBIDDEN PROXY {target_url} | upstream 403 "
+                                    f"(proxy SEHAT, egress IP di-flag — bukan salah proxy) "
+                                    f"-> disisihkan sementara, lanjut ke target berikutnya"
+                                )
                             target_index += 1
                             _log("STREAM",
-                                f"FAIL {target_url} "
+                                f"FAIL {_route} {target_url} "
                                 f"| upstream-status={response.status_code} detail={detail[:300]!r}"
                             )
                             continue  # target berikutnya
@@ -674,7 +752,13 @@ async def stream_generator(
                 ) as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
                     saw_non_403_failure = True
-                    _log("STREAM", f"FAIL {target_url} ({type(exc).__name__})")
+                    if is_proxy and proxy_url:
+                        try:
+                            from app.services.outbound_proxy import mark_proxy_conn_failed as _markp4
+                            _markp4(proxy_url)
+                        except (ImportError, AttributeError, TypeError, ValueError):
+                            pass
+                    _log("STREAM", f"FAIL {_route} {target_url} ({type(exc).__name__})")
                     if sent_payload:
                         # Sudah ada konten sampai ke klien; retry akan
                         # menduplikasi teks. Akhiri dengan error yang jelas.

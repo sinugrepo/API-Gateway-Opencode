@@ -77,13 +77,65 @@ async def _fetch_opencode_free_models() -> List[ModelInfo]:
             return cached_models
 
     try:
-        client = _get_http()
-        response = await client.get(
-            OPENCODE_MODELS_URL,
-            headers={"Accept": "application/json"},
-        )
-        response.raise_for_status()
-        payload = response.json()
+        # Fast path: direct dulu (perilaku lama). Bila direct gagal total
+        # (timeout/connect) DAN pool proxy ada, coba tiap proxy sekali
+        # sebelum menyerah — dashboard /v1/models tetap hidup saat egress
+        # direct diblokir tapi warp-socks sehat.
+        try:
+            client = _get_http()
+            response = await client.get(
+                OPENCODE_MODELS_URL,
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError):
+            try:
+                from app.services.outbound_proxy import (
+                    is_proxy_layer_active as _proxy_active,
+                    mark_proxy_conn_failed as _markp,
+                    proxy_batch_for_request as _pbatch,
+                    proxy_connection_url as _pconn,
+                )
+                from app.core.http_client import _get_proxy_client as _gpc
+                _batch = _pbatch() if _proxy_active(None) else []
+            except (ImportError, AttributeError, TypeError, ValueError):
+                _batch = []
+            _proxied_ok = False
+            _last_exc: Optional[Exception] = None
+            for _entry in _batch:
+                try:
+                    _conn = _pconn(_entry)
+                    _pclient = _gpc(_conn)
+                    _resp = await _pclient.get(
+                        OPENCODE_MODELS_URL,
+                        headers={"Accept": "application/json"},
+                    )
+                    _resp.raise_for_status()
+                    payload = _resp.json()
+                    response = _resp
+                    _proxied_ok = True
+                    break
+                except (ImportError, ValueError):
+                    try:
+                        _markp(_conn)
+                    except (TypeError, ValueError, AttributeError, NameError):
+                        pass
+                    continue
+                except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.HTTPStatusError) as _pe:
+                    try:
+                        _markp(_conn)
+                    except (TypeError, ValueError, AttributeError, NameError):
+                        pass
+                    _last_exc = _pe
+                    continue
+            if not _proxied_ok:
+                if isinstance(_last_exc, httpx.TimeoutException):
+                    raise _last_exc
+                raise UpstreamError(
+                    "OpenCode model discovery is unavailable",
+                    status_code=HTTP_503_SERVICE_UNAVAILABLE,
+                )
     except httpx.TimeoutException as exc:
         raise UpstreamError(
             "OpenCode model discovery timed out",

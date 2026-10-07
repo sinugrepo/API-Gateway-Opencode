@@ -464,3 +464,54 @@ SCAN_GUARD_MAX_IPS = int(os.getenv("SCAN_GUARD_MAX_IPS", "20000"))
 # 8MB menutupi vision maksimal (3MB media + overhead JSON/tools) dengan
 # headroom, namun jauh di bawah zona bahaya OOM.
 MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(8 * 1024 * 1024)))
+
+
+# ==================== OUTBOUND PROXY (SOCKS/HTTP) ====================
+# Lapisan egress TAMBAHAN selain relay Vercel: daftar proxy SOCKS5/HTTP yang
+# dipakai untuk request DIRECT ke upstream (opencode.ai). Tujuannya memberi
+# IP egress berbeda per request (anti-429) tanpa tergantung Vercel, mis.
+# pool warp-socks lokal di 127.0.0.1:40001-40010.
+#
+# - Konfigurasi via env `OUTBOUND_PROXIES` (koma-dipisah, mis.
+#   "socks5h://127.0.0.1:40001,socks5h://127.0.0.1:40002") DAN/ATAU via
+#   dashboard /monitor (tersimpan di `proxies.json`, bisa tambah/hapus/test
+#   tanpa restart).
+# - `USE_PROXY=true` (default) mengaktifkan lapisan ini BILA daftar proxy
+#   tidak kosong. Kosong = no-op total (perilaku lama 100% dipertahankan).
+# - Urutan target SELALU: relay (bila USE_RELAY) -> proxy-direct -> direct
+#   mentah. Proxy TIDAK PERNAH menggantikan relay; ia hanya menyisip SEBELUM
+#   fallback direct sehingga IP tetap ter-masking.
+# - Per-request override: body `{"use_proxy": false}` menonaktifkan proxy
+#   untuk request itu saja (seperti `use_relay`).
+USE_PROXY = os.getenv("USE_PROXY", "true").lower() == "true"
+
+
+OUTBOUND_PROXIES_ENV = os.getenv("OUTBOUND_PROXIES", "")
+
+
+# Berapa lama proxy yang gagal (timeout/connect/429/403) di-skip dari rotasi.
+PROXY_COOLDOWN = float(os.getenv("PROXY_COOLDOWN", "60"))
+
+
+# Berapa lama proxy yang kena 403 FreeTierError (egress IP di-flag upstream)
+# disisihkan dari rotasi. Analog dengan RELAY_403_COOLDOWN (300s): flag IP
+# bukan kondisi transien detik. 403 membuktikan proxy SEHAT (koneksi OK, test
+# OK) — yang ditolak upstream adalah egress IP-nya, bukan proxy-nya.
+PROXY_403_COOLDOWN = float(os.getenv("PROXY_403_COOLDOWN", "180"))
+
+
+# Timeout (detik) untuk tombol Test di dashboard (fetch ipify via proxy).
+PROXY_TEST_TIMEOUT = float(os.getenv("PROXY_TEST_TIMEOUT", "10"))
+
+
+# File persistensi konfigurasi proxy runtime (ditulis dashboard).
+# Default: <root-project>/proxies.json (sama level dengan .env).
+try:
+    _PROXY_DEFAULT_PATH = str(Path(__file__).resolve().parents[2] / "proxies.json")
+except (IndexError, OSError, ValueError):
+    _PROXY_DEFAULT_PATH = "./proxies.json"
+PROXY_CONFIG_PATH = os.getenv("PROXY_CONFIG_PATH", _PROXY_DEFAULT_PATH)
+
+
+# Batas jumlah proxy (anti-abuse: dashboard tidak bisa menumpuk ribuan).
+PROXY_MAX_COUNT = int(os.getenv("PROXY_MAX_COUNT", "32"))

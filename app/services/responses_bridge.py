@@ -29,7 +29,7 @@ from app.core.config import (
     USE_RELAY,
 )
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
-from app.core.http_client import _get_http
+from app.core.http_client import _get_http, _pick_http_client
 from app.core.logging_utils import _log
 from app.services.opencode import _fresh_request_headers, _fresh_retry_targets, _oc_session_tag
 from app.services.relay import (
@@ -55,6 +55,31 @@ from app.services.upstream import (
     _should_retry_same_route_429,
     call_upstream,
 )
+
+
+def _eff_fallback() -> bool:
+    """Fallback efektif: override website (relays.json) > env. Tak melempar."""
+    try:
+        from app.services.relay_store import get_effective_fallback
+
+        return bool(get_effective_fallback())
+    except (ImportError, AttributeError, TypeError, ValueError):
+        try:
+            from app.core.config import RELAY_FALLBACK as _FB
+
+            return bool(_FB)
+        except (ImportError, AttributeError, TypeError, ValueError):
+            return True
+
+
+def _apply_egress_order(targets):  # type: ignore[no-untyped-def]
+    """Terapkan proxy_first bila diatur via website. Tak melempar."""
+    try:
+        from app.services.relay_store import reorder_targets_proxy_first as _reorder
+
+        return _reorder(targets)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return targets
 
 
 def _extract_responses_usage(obj: Any) -> Optional[Dict[str, int]]:
@@ -720,6 +745,7 @@ async def responses_stream_generator(
     background_tasks: BackgroundTasks,
     use_relay: bool,
     opencode_headers: Optional[Dict[str, str]] = None,
+    use_proxy: Optional[bool] = None,
 ):
     """Teruskan SSE Responses API upstream ke klien mentah (pass-through).
 
@@ -749,15 +775,24 @@ async def responses_stream_generator(
 
     base_headers = _stream_request_headers(opencode_headers)
     targets: List[Tuple[str, Dict[str, str]]] = []
+    _fb = _eff_fallback()
     if use_relay:
         for relay_url in _relay_batch_for_request(for_stream=True):
             targets.append((relay_url, _with_relay_headers(OPENCODE_RESPONSES_URL, base_headers)))
-        if RELAY_FALLBACK:
+        if _fb:
             targets.append((OPENCODE_RESPONSES_URL, dict(base_headers)))
     else:
         targets.append((OPENCODE_RESPONSES_URL, dict(base_headers)))
     targets = _limit_stream_targets(targets)
-    vision_direct_first = use_relay and RELAY_FALLBACK and _payload_has_media(payload)
+    # Lapisan proxy SOCKS/HTTP (no-op bila pool kosong / USE_PROXY off):
+    # direct disisip proxy-direct SEBELUM direct mentah; relay tak tersentuh.
+    try:
+        from app.services.outbound_proxy import expand_targets_with_proxy as _expand_proxy
+        targets = _expand_proxy(targets, use_proxy)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
+    targets = _apply_egress_order(targets)
+    vision_direct_first = use_relay and _fb and _payload_has_media(payload)
     if vision_direct_first:
         # Vision: direct DULU; relay HANYA fallback bila direct 429
         # (lihat guard di loop). Biner base64 rawan 413/504 relay.
@@ -790,21 +825,44 @@ async def responses_stream_generator(
         while True:
             target_index = 0
             while target_index < len(targets):
-                target_url, headers = targets[target_index]
+                try:
+                    from app.services.outbound_proxy import unpack_target as _unpack
+                    target_url, headers, proxy_url = _unpack(targets[target_index])
+                except (ImportError, AttributeError, TypeError, ValueError):
+                    target_url, headers, proxy_url = targets[target_index][0], targets[target_index][1], None
                 is_relay = "x-relay-target" in headers
+                is_proxy = proxy_url is not None
                 if vision_direct_first and is_relay and not last_rate_limited:
                     # Relay vision hanya untuk 429 direct; kegagalan lain
                     # selesai di direct (last_error sudah terisi).
                     break
                 # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
                 headers = _fresh_request_headers(headers)
+                _route = "RELAY" if is_relay else ("PROXY" if is_proxy else "DIRECT")
                 _log(
                     "RESP",
                     f"ATTEMPT {target_index + 1}/{len(targets)} "
-                    f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}",
+                    f"{_route} target={target_url}",
                 )
                 try:
-                    client = _get_http()
+                    if proxy_url:
+                        try:
+                            client = _pick_http_client(proxy_url)
+                        except (ImportError, ValueError) as _proxy_exc:
+                            try:
+                                from app.services.outbound_proxy import mark_proxy_conn_failed as _markp
+                                _markp(proxy_url)
+                            except (ImportError, AttributeError, TypeError, ValueError):
+                                pass
+                            last_error = f"Proxy unavailable: {_proxy_exc}"
+                            saw_non_403_failure = True
+                            target_index += 1
+                            _log("RESP", f"PROXY-UNAVAILABLE {target_url} ({type(_proxy_exc).__name__}) -> lanjut")
+                            continue
+                    else:
+                        # Tanpa proxy: _get_http() level-modul agar monkeypatch
+                        # test (rb._get_http) tetap berlaku.
+                        client = _get_http()
                     async with client.stream(
                         "POST", target_url, json=payload, headers=headers
                     ) as response:
@@ -861,8 +919,9 @@ async def responses_stream_generator(
                             if response.status_code == 429 and not sent_first_byte:
                                 # PENGECUALIAN bug spam-429 muse-spark: retry 1x
                                 # same-route dulu sebelum rotasi/cooldown.
-                                if _should_retry_same_route_429(client_model) and target_url not in spurious_429_retried:
-                                    spurious_429_retried.add(target_url)
+                                _spurious_key = f"{target_url}|{proxy_url or ''}"
+                                if _should_retry_same_route_429(client_model) and _spurious_key not in spurious_429_retried:
+                                    spurious_429_retried.add(_spurious_key)
                                     _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
                                     _log(
                                         "RESP",
@@ -875,16 +934,23 @@ async def responses_stream_generator(
                                 last_retry_after = _retry_after_seconds(
                                     response, RATE_LIMIT_BACKOFF
                                 )
-                                _mark_relay_rate_limited(
-                                    target_url,
-                                    time.time() + _relay_cooldown_seconds(response),
-                                )
+                                if is_relay:
+                                    _mark_relay_rate_limited(
+                                        target_url,
+                                        time.time() + _relay_cooldown_seconds(response),
+                                    )
+                                if is_proxy and proxy_url:
+                                    try:
+                                        from app.services.outbound_proxy import mark_proxy_conn_failed as _markp2
+                                        _markp2(proxy_url)
+                                    except (ImportError, AttributeError, TypeError, ValueError):
+                                        pass
                                 last_error = f"Rate limited (429): {detail}"
                                 last_rate_limited = True
                                 saw_non_403_failure = True
                                 _log(
                                     "RESP",
-                                    f"RATE-LIMITED {target_url} | "
+                                    f"RATE-LIMITED {_route} {target_url} | "
                                     f"{rate_cls['description']} | detail={detail[:300]!r}",
                                 )
                                 target_index += 1
@@ -911,15 +977,27 @@ async def responses_stream_generator(
                                     f"(IP relay di-flag, bukan salah fingerprint) "
                                     f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s",
                                 )
+                            if response.status_code == 403 and is_proxy and not sent_first_byte and proxy_url:
+                                # 403 via proxy = egress IP di-flag (proxy SEHAT).
+                                try:
+                                    from app.services.outbound_proxy import mark_proxy_flagged as _markp3
+                                    _markp3(proxy_url)
+                                except (ImportError, AttributeError, TypeError, ValueError):
+                                    pass
+                                _log(
+                                    "RESP",
+                                    f"FORBIDDEN PROXY {target_url} | upstream 403 "
+                                    f"(proxy SEHAT, egress IP di-flag — bukan salah proxy)",
+                                )
                             target_index += 1
                             _log(
                                 "RESP",
-                                f"FAIL {target_url} | upstream-status={response.status_code} "
+                                f"FAIL {_route} {target_url} | upstream-status={response.status_code} "
                                 f"detail={detail[:300]!r}",
                             )
                             continue
 
-                        _log("RESP", f"OK {target_url}")
+                        _log("RESP", f"OK {_route} {target_url}")
                         relay_target_failed = False
                         line_iter = response.aiter_lines()
                         pending_line_task: Optional[asyncio.Task[str]] = None
@@ -1093,7 +1171,13 @@ async def responses_stream_generator(
                 ) as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
                     saw_non_403_failure = True
-                    _log("RESP", f"FAIL {target_url} ({type(exc).__name__})")
+                    if is_proxy and proxy_url:
+                        try:
+                            from app.services.outbound_proxy import mark_proxy_conn_failed as _markp4
+                            _markp4(proxy_url)
+                        except (ImportError, AttributeError, TypeError, ValueError):
+                            pass
+                    _log("RESP", f"FAIL {_route} {target_url} ({type(exc).__name__})")
                     if sent_first_byte:
                         if last_usage:
                             try:
@@ -1236,6 +1320,7 @@ async def responses_to_chat_stream_generator(
     background_tasks: BackgroundTasks,
     use_relay: bool,
     opencode_headers: Optional[Dict[str, str]] = None,
+    use_proxy: Optional[bool] = None,
 ):
     """Jembatani SSE Responses upstream menjadi SSE chat untuk klien chat-only.
 
@@ -1340,15 +1425,24 @@ async def responses_to_chat_stream_generator(
 
     base_headers = _stream_request_headers(opencode_headers)
     targets: List[Tuple[str, Dict[str, str]]] = []
+    _fb2 = _eff_fallback()
     if use_relay:
         for relay_url in _relay_batch_for_request(for_stream=True):
             targets.append((relay_url, _with_relay_headers(OPENCODE_RESPONSES_URL, base_headers)))
-        if RELAY_FALLBACK:
+        if _fb2:
             targets.append((OPENCODE_RESPONSES_URL, dict(base_headers)))
     else:
         targets.append((OPENCODE_RESPONSES_URL, dict(base_headers)))
     targets = _limit_stream_targets(targets)
-    vision_direct_first = use_relay and RELAY_FALLBACK and _payload_has_media(payload)
+    # Lapisan proxy SOCKS/HTTP (no-op bila pool kosong / USE_PROXY off):
+    # direct disisip proxy-direct SEBELUM direct mentah; relay tak tersentuh.
+    try:
+        from app.services.outbound_proxy import expand_targets_with_proxy as _expand_proxy
+        targets = _expand_proxy(targets, use_proxy)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
+    targets = _apply_egress_order(targets)
+    vision_direct_first = use_relay and _fb2 and _payload_has_media(payload)
     if vision_direct_first:
         # Vision: direct DULU; relay HANYA fallback bila direct 429
         # (lihat guard di loop). Biner base64 rawan 413/504 relay.
@@ -1383,23 +1477,44 @@ async def responses_to_chat_stream_generator(
         while True:
             target_index = 0
             while target_index < len(targets):
-                target_url, headers = targets[target_index]
+                try:
+                    from app.services.outbound_proxy import unpack_target as _unpack2
+                    target_url, headers, proxy_url = _unpack2(targets[target_index])
+                except (ImportError, AttributeError, TypeError, ValueError):
+                    target_url, headers, proxy_url = targets[target_index][0], targets[target_index][1], None
                 is_relay = "x-relay-target" in headers
+                is_proxy = proxy_url is not None
                 if vision_direct_first and is_relay and not last_rate_limited:
                     # Relay vision hanya untuk 429 direct; kegagalan lain
                     # selesai di direct (last_error sudah terisi).
                     break
                 # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
                 headers = _fresh_request_headers(headers)
+                _route = "RELAY" if is_relay else ("PROXY" if is_proxy else "DIRECT")
                 _log(
                     "RESP",
                     f"ATTEMPT {target_index + 1}/{len(targets)} "
-                    f"{'RELAY' if is_relay else 'DIRECT'} target={target_url}",
+                    f"{_route} target={target_url}",
                 )
                 try:
                     termination_seen = False
                     relay_target_failed = False
-                    client = _get_http()
+                    if proxy_url:
+                        try:
+                            client = _pick_http_client(proxy_url)
+                        except (ImportError, ValueError) as _proxy_exc:
+                            try:
+                                from app.services.outbound_proxy import mark_proxy_conn_failed as _markp
+                                _markp(proxy_url)
+                            except (ImportError, AttributeError, TypeError, ValueError):
+                                pass
+                            last_error = f"Proxy unavailable: {_proxy_exc}"
+                            saw_non_403_failure = True
+                            target_index += 1
+                            _log("RESP", f"PROXY-UNAVAILABLE {target_url} ({type(_proxy_exc).__name__}) -> lanjut")
+                            continue
+                    else:
+                        client = _get_http()
                     # Konteks panjang butuh TTFB lama: read-timeout per-request
                     # BRIDGE_REQUEST_TIMEOUT (bukan global 120s). Heartbeat relay
                     # 10 detik menjaga wire tetap aktif, jadi read-timeout hanya
@@ -1442,8 +1557,9 @@ async def responses_to_chat_stream_generator(
                             if response.status_code == 429 and not sent_payload:
                                 # PENGECUALIAN bug spam-429 muse-spark: retry 1x
                                 # same-route dulu sebelum rotasi/cooldown.
-                                if _should_retry_same_route_429(client_model) and target_url not in spurious_429_retried:
-                                    spurious_429_retried.add(target_url)
+                                _spurious_key = f"{target_url}|{proxy_url or ''}"
+                                if _should_retry_same_route_429(client_model) and _spurious_key not in spurious_429_retried:
+                                    spurious_429_retried.add(_spurious_key)
                                     _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
                                     _log(
                                         "RESP",
@@ -1456,16 +1572,23 @@ async def responses_to_chat_stream_generator(
                                 last_retry_after = _retry_after_seconds(
                                     response, RATE_LIMIT_BACKOFF
                                 )
-                                _mark_relay_rate_limited(
-                                    target_url,
-                                    time.time() + _relay_cooldown_seconds(response),
-                                )
+                                if is_relay:
+                                    _mark_relay_rate_limited(
+                                        target_url,
+                                        time.time() + _relay_cooldown_seconds(response),
+                                    )
+                                if is_proxy and proxy_url:
+                                    try:
+                                        from app.services.outbound_proxy import mark_proxy_conn_failed as _markp2
+                                        _markp2(proxy_url)
+                                    except (ImportError, AttributeError, TypeError, ValueError):
+                                        pass
                                 last_error = f"Rate limited (429): {detail}"
                                 last_rate_limited = True
                                 saw_non_403_failure = True
                                 _log(
                                     "RESP",
-                                    f"RATE-LIMITED {target_url} | "
+                                    f"RATE-LIMITED {_route} {target_url} | "
                                     f"{rate_cls['description']} | detail={detail[:300]!r}",
                                 )
                                 target_index += 1
@@ -1490,15 +1613,27 @@ async def responses_to_chat_stream_generator(
                                     f"(IP relay di-flag, bukan salah fingerprint) "
                                     f"-> relay di-cooldown {RELAY_403_COOLDOWN:.0f}s",
                                 )
+                            if response.status_code == 403 and is_proxy and not sent_payload and proxy_url:
+                                # 403 via proxy = egress IP di-flag (proxy SEHAT).
+                                try:
+                                    from app.services.outbound_proxy import mark_proxy_flagged as _markp3b
+                                    _markp3b(proxy_url)
+                                except (ImportError, AttributeError, TypeError, ValueError):
+                                    pass
+                                _log(
+                                    "RESP",
+                                    f"FORBIDDEN PROXY {target_url} | upstream 403 "
+                                    f"(proxy SEHAT, egress IP di-flag — bukan salah proxy)",
+                                )
                             target_index += 1
                             _log(
                                 "RESP",
-                                f"FAIL {target_url} | upstream-status={response.status_code} "
+                                f"FAIL {_route} {target_url} | upstream-status={response.status_code} "
                                 f"detail={detail[:300]!r}",
                             )
                             continue
 
-                        _log("RESP", f"OK {target_url} (bridge)")
+                        _log("RESP", f"OK {_route} {target_url} (bridge)")
                         content_type = (response.headers.get("content-type") or "").lower()
                         if "text/event-stream" not in content_type:
                             # Relay/CDN men-buffer SSE menjadi SATU body JSON utuh
@@ -2030,7 +2165,13 @@ async def responses_to_chat_stream_generator(
                 ) as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
                     saw_non_403_failure = True
-                    _log("RESP", f"FAIL {target_url} ({type(exc).__name__})")
+                    if is_proxy and proxy_url:
+                        try:
+                            from app.services.outbound_proxy import mark_proxy_conn_failed as _markp4b
+                            _markp4b(proxy_url)
+                        except (ImportError, AttributeError, TypeError, ValueError):
+                            pass
+                    _log("RESP", f"FAIL {_route} {target_url} ({type(exc).__name__})")
                     if sent_payload:
                         record_final_usage()
                         log_summary("lost")

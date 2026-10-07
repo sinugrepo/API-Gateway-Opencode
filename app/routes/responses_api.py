@@ -17,6 +17,14 @@ from starlette.status import (
     HTTP_504_GATEWAY_TIMEOUT,
 )
 from app.core.config import API_KEY, MODEL, OPENCODE_RESPONSES_URL, RESPONSES_REVERSE_BRIDGE, STREAM_BYPASS_RELAY, USE_RELAY
+
+
+def _default_use_relay() -> bool:
+    try:
+        from app.services.relay_store import get_effective_use_relay
+        return bool(get_effective_use_relay())
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return bool(USE_RELAY)
 from app.core.logging_utils import _log
 from app.core.errors import UpstreamEmptyResponse, UpstreamError
 from app.services.chat_bridge import (
@@ -64,10 +72,16 @@ async def create_response_via_chat(
         f"-> chat pipeline (native endpoint bukan Responses)",
     )
     use_relay_req = body.pop("use_relay", None)
+    use_proxy_req = body.pop("use_proxy", None)
     chat_req = build_chat_request_from_responses(body, client_model)
     chat_req.stream = stream
     if use_relay_req is not None:
         chat_req.use_relay = bool(use_relay_req)
+    if use_proxy_req is not None:
+        try:
+            chat_req.use_proxy = bool(use_proxy_req)
+        except (TypeError, ValueError, AttributeError):
+            pass
     if stream:
         if not API_KEY:
             raise UpstreamError(
@@ -156,7 +170,8 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
         )
 
     use_relay_req = body.pop("use_relay", None)
-    stream_use_relay = use_relay_req if use_relay_req is not None else USE_RELAY
+    use_proxy_req = body.pop("use_proxy", None)
+    stream_use_relay = use_relay_req if use_relay_req is not None else _default_use_relay()
     if STREAM_BYPASS_RELAY:
         stream_use_relay = False
     # Free-tier fingerprint gate (403 bila hilang, diverifikasi live
@@ -192,6 +207,7 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
                 background_tasks=background_tasks,
                 use_relay=bool(stream_use_relay),
                 opencode_headers=oc_headers,
+                use_proxy=bool(use_proxy_req) if use_proxy_req is not None else None,
             ),
             media_type="text/event-stream",
             headers={
@@ -214,6 +230,7 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
             background_tasks=background_tasks,
             use_relay=bool(stream_use_relay),
             opencode_headers=oc_headers,
+            use_proxy=bool(use_proxy_req) if use_proxy_req is not None else None,
         ),
         client_model=client_model,
     )

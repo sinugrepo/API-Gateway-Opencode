@@ -24,6 +24,16 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Isolasi pool proxy: lihat test_forbidden_fresh_retry.py (alasan sama).
+try:
+    import app.services.outbound_proxy as _op_iso
+    with _op_iso._store_lock:
+        _op_iso._proxies.clear()
+        _op_iso._proxies_order.clear()
+        _op_iso._loaded = True
+except (ImportError, AttributeError):
+    pass
+
 import httpx  # noqa: E402
 
 PASS, FAIL = "PASS", "FAIL"

@@ -17,9 +17,32 @@ from starlette.status import (
     HTTP_504_GATEWAY_TIMEOUT,
 )
 from app.core.config import HERMES_COMPAT, MODEL, RELAY_FALLBACK, RELAY_URLS, REQUEST_TIMEOUT, USE_RELAY
+
+
+def _eff_relay_snapshot():
+    """Snapshot relay efektif (website) + fallback ke env. Tak melempar."""
+    try:
+        from app.services.relay_store import (
+            get_effective_fallback,
+            get_effective_relays,
+            get_effective_use_relay,
+        )
+
+        return list(get_effective_relays()), bool(get_effective_use_relay()), bool(get_effective_fallback())
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return list(RELAY_URLS), bool(USE_RELAY), bool(RELAY_FALLBACK)
 from app.services.models_cache import _enrich_model, _fetch_opencode_free_models
 from app.services.relay import test_relay_connection
 from app.core.schemas import HealthResponse, ModelList, PropsCapability, PropsDefaults, PropsEndpoint, PropsInfo, PropsRelay, RelayStatus
+
+
+def _proxy_overview() -> Dict[str, Any]:
+    """Ringkasan proxy tanpa import cycle di level modul (lazy)."""
+    try:
+        from app.services.outbound_proxy import get_proxy_overview
+        return get_proxy_overview()
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return {"enabled_global": False, "proxies": []}
 
 router = APIRouter()
 
@@ -48,11 +71,12 @@ async def favicon():
 
 @router.get("/health", response_model=HealthResponse)
 async def health():
+    _urls, _use, _fb = _eff_relay_snapshot()
     return HealthResponse(
         status="ok",
         model=MODEL or "(selected per request)",
-        relay=",".join(RELAY_URLS),
-        relay_enabled=USE_RELAY,
+        relay=",".join(_urls),
+        relay_enabled=_use,
         hermes_compatible=HERMES_COMPAT,
         version="2.0.0",
     )
@@ -134,18 +158,31 @@ async def get_props():
     - which OpenAI-compatible parameters are forwarded
     - which HTTP endpoints are exposed
     """
+    _urls, _use, _fb = _eff_relay_snapshot()
+    try:
+        from app.services.relay_store import get_egress_order as _get_order
+
+        _order = _get_order()
+    except (ImportError, AttributeError, TypeError, ValueError):
+        _order = "relay_first"
     return PropsInfo(
         model=MODEL or "(selected per request)",
         version="2.0.0",
         request_timeout=REQUEST_TIMEOUT,
         relay=PropsRelay(
-            url=RELAY_URLS[0],
-            enabled=USE_RELAY,
-            fallback=RELAY_FALLBACK,
+            url=_urls[0] if _urls else "",
+            enabled=_use,
+            fallback=_fb,
         ),
-        relay_urls=RELAY_URLS,
+        relay_urls=_urls,
         hermes_compatible=HERMES_COMPAT,
         usage_tracking=True,
+        proxy_enabled=_proxy_overview().get("enabled_global", False),
+        proxy_urls=[
+            str(p.get("display") or "")
+            for p in _proxy_overview().get("proxies", [])
+        ],
+        egress_order=_order,
         capabilities=[
             PropsCapability(
                 name="chat_completions",
@@ -182,6 +219,11 @@ async def get_props():
                 supported=True,
                 description="Token usage persisted in SQLite.",
             ),
+            PropsCapability(
+                name="outbound_proxy",
+                supported=True,
+                description="SOCKS5/HTTP egress pool untuk direct upstream (anti-429, konfigurasi via /monitor).",
+            ),
         ],
         supported_parameters=[
             "temperature",
@@ -198,6 +240,8 @@ async def get_props():
             "tools",
             "tool_choice",
             "parallel_tool_calls",
+            "use_relay",
+            "use_proxy",
         ],
         defaults=PropsDefaults(temperature=0.7, max_tokens=32768),
         endpoints=[

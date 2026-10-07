@@ -1,9 +1,11 @@
 # Sinug Gateway — OpenAI-Compatible API Gateway
 
 Proxy FastAPI yang kompatibel OpenAI untuk upstream `opencode.ai/zen/v1`, dengan
-relay round-robin Vercel (masking IP), bridge Chat → Responses untuk model
-Responses-only (cth. `muse-spark`), tracking usage SQLite, dan dashboard
-monitoring di `/monitor`.
+relay round-robin Vercel (masking IP), pool proxy SOCKS/HTTP (egress tambahan),
+bridge Chat → Responses untuk model Responses-only (cth. `muse-spark`),
+tracking usage SQLite, dan dashboard `/monitor` yang terbagi menjadi
+Monitoring / Konfigurasi / Uji Model. Relay, proxy, dan jalur egress
+**dikonfigurasi penuh via website** (tanpa hardcoded, tanpa restart).
 
 Entry point: `main.py` → package `app/` (`app:create_app`).
 
@@ -18,12 +20,25 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
   Responses API untuk Muse Spark & sejenisnya.
 - Bridge otomatis: model Responses-only yang diminta via chat dijembatani
   `chat → Responses → chat` agar klien chat-only tetap jalan.
-- Relay: 11 deployment Vercel di-rotasi per-request, 429-cooldown 60 dtk,
+- Relay: pool deployment Vercel di-rotasi per-request, 429-cooldown 60 dtk,
   penanda stream-broken 1800 dtk untuk timeout platform, giant-payload guard
   (>32 KB / >100 item tidak menandai relay rusak), `MAX_RELAY_STREAM_ATTEMPTS=2`.
-  Kebijakan relay-first: non-vision WAJIB relay dulu, direct hanya fallback
-  terakhir setelah SEMUA relay gagal; vision tetap direct-first (biner base64
+  Daftar relay + saklar `use_relay` / `relay_fallback` dikelola via website
+  (tersimpan di `relays.json`); env (`RELAY_URLS`, `USE_RELAY`,
+  `RELAY_FALLBACK`) hanya default awal. Vision tetap direct-first (biner base64
   rawan 413/504 relay). `DIRECT_FIRST_SLOW` deprecated (no-op).
+- Egress (jalur keluar, diatur via website tanpa restart): `relay_first`
+  (`relay → proxy → direct`, default, masking IP maksimal) atau `proxy_first`
+  (`proxy → relay → direct`, pool proxy benar-benar dilewati tiap request).
+  Matikan relay untuk mode proxy/direct murni; matikan fallback untuk relay-only.
+- Outbound proxy: pool SOCKS5/HTTP untuk request DIRECT (round-robin per-request,
+  relay tidak pernah lewat proxy; kosong = no-op, perilaku lama dipertahankan).
+  Dikelola via website (`proxies.json`; password tidak pernah dikembalikan ke UI).
+  Status per-proxy: `READY` / `DOWN` (transport gagal) / `FLAGGED` (egress IP
+  ditolak upstream 403 — proxy SEHAT/test OK, yang di-flag IP-nya). Blip transport
+  tunggal hanya disisihkan 15 dtk; gagal beruntun memakai `PROXY_COOLDOWN`;
+  403 memakai `PROXY_403_COOLDOWN`. Per-request override `use_proxy` seperti
+  `use_relay`.
 - Rate-limit: retry + backoff, hormati `Retry-After` upstream; 429 bersih +
   header `Retry-After` ke klien. Penanganan khusus spurious-429 muse-spark.
 - Free-tier 403: relay yang kena 403 di-cooldown 300 dtk; bila SEMUA target
@@ -41,8 +56,10 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
 - Hardening: `BodyLimitMiddleware` 413 via `Content-Length` (>8 MB),
   `ScanGuardMiddleware` ala fail2ban untuk probe `/.env` dkk, HMAC cookie
   monitor, tanpa GZip (merusak SSE).
-- Dashboard `/monitor`: KPI, grafik token/request, Recent Requests + Live Logs
-  (SSE), Relay status/IPs, ScanGuard bans + Unban, Config mini.
+- Dashboard `/monitor` — tiga halaman terpisah: **Monitoring** (KPI, grafik
+  token/request, Recent Requests + Live Logs SSE, status egress ringkas, hasil
+  probe relay — read-only), **Konfigurasi** (egress + preview rute, pool relay,
+  pool proxy, ScanGuard, snapshot konfigurasi efektif), **Uji Model**.
 
 ## Syarat
 
@@ -75,8 +92,14 @@ contoh siap salin di `.env.example`. Environment yang sudah ada menang atas `.en
 | `OPENCODE_MODELS_URL` | `.../zen/v1/models` | Daftar model |
 | `RESPONSES_ONLY_MODELS` | `muse-spark` | Substring model yang hanya via Responses |
 | `MODEL` | `` (kosong) | Tidak ada default diam-diam; klien wajib kirim model |
-| `RELAY_URLS` / `RELAY_URL` | 11 relay bawaan | Koma-dipisah; hostname telanjang dinormalisasi ke `/api/relay` |
-| `USE_RELAY` / `RELAY_FALLBACK` | `true` | Relay + fallback direct |
+| `RELAY_URLS` / `RELAY_URL` | 11 relay bawaan | Default awal pool; hostname telanjang dinormalisasi ke `/api/relay`. Daftar efektif dikelola via website (`relays.json`) |
+| `USE_RELAY` / `RELAY_FALLBACK` | `true` | Default saklar relay + fallback direct; override via website (null = ikut env) |
+| `USE_PROXY` | `true` | Default saklar proxy; override via website (`relays.json`) + toggle file (`proxies.json`) |
+| `OUTBOUND_PROXIES` | `` (kosong) | Seed awal pool proxy koma-dipisah (tanpa skema = `socks5h`); kelola via website |
+| `PROXY_COOLDOWN` | `60` | Detik proxy DOWN (transport gagal beruntun) disisihkan; blip tunggal hanya 15 dtk |
+| `PROXY_403_COOLDOWN` | `180` | Detik proxy FLAGGED (egress IP ditolak upstream 403) disisihkan |
+| `PROXY_TEST_TIMEOUT` | `10` | Timeout tombol Test proxy di dashboard (dtk) |
+| `PROXY_CONFIG_PATH` / `RELAY_CONFIG_PATH` | `./proxies.json` / `./relays.json` | File persistensi konfigurasi website (di-gitignore) |
 | `REQUEST_TIMEOUT` | `120` | Idle timeout non-bridge (dtk) |
 | `BRIDGE_REQUEST_TIMEOUT` | `300` | Idle/read timeout bridge muse-spark |
 | `RATE_LIMIT_RETRIES/BACKOFF/COOLDOWN` | `2/2.0/60` | Retry 429 upstream |
@@ -130,11 +153,26 @@ Monitor (cookie `monitor_token`, 24 jam):
   `GET /monitor/logout`
 - API: `/monitor/api/health`, `/monitor/api/session`,
   `/monitor/api/usage`, `/monitor/api/usage/history`,
-  `/monitor/api/requests/recent?limit=20`, `/monitor/api/relay`,
-  `/monitor/api/props`, `/monitor/api/security`,
+  `/monitor/api/requests/recent?limit=20`, `/monitor/api/relay` (probe semua relay),
+  `/monitor/api/props` (termasuk `relay_pool` + `egress_order`), `/monitor/api/security`,
   `POST /monitor/api/security/unban`, `/monitor/api/logs`,
   `POST /monitor/api/logs/clear`, `POST /monitor/api/relays/reset`,
   `/monitor/api/logs/stream` (SSE)
+- Relay pool + egress (halaman Konfigurasi, tanpa restart):
+  `GET /monitor/api/relays` (daftar + saklar efektif),
+  `POST /monitor/api/relays` (`{url}` tambah),
+  `POST /monitor/api/relays/remove` (`{id}`),
+  `POST /monitor/api/relays/enable` (`{id, enabled}`),
+  `POST /monitor/api/relays/config`
+  (`{use_relay, relay_fallback, use_proxy, egress_order}` parsial; `null` = ikut env),
+  `POST /monitor/api/relays/test` (`{id}` atau `{url}`, ad-hoc tanpa menyimpan)
+- Outbound proxy (halaman Konfigurasi, tanpa restart):
+  `GET /monitor/api/proxies` (ringkasan tanpa password),
+  `POST /monitor/api/proxies` (tambah `{scheme, host, port, username?, password?}`),
+  `POST /monitor/api/proxies/remove`, `POST /monitor/api/proxies/enable`,
+  `POST /monitor/api/proxies/global`, `POST /monitor/api/proxies/test`
+  (`{id}` atau ad-hoc), `POST /monitor/api/proxies/test-all`,
+  `POST /monitor/api/proxies/reset`, `POST /monitor/api/proxies/seed-warp`
 - Model Test (panel dashboard, manual saja — tidak ada auto-test):
   `GET /monitor/api/models` (daftar free + context window),
   `POST /monitor/api/models/test`
@@ -156,24 +194,30 @@ app/__init__.py          # create_app, lifespan, middleware, router
 app/core/                # config, schemas, errors, sse, http_client,
                          # logging_utils, error_handlers
 app/security/            # body_limit, scan_guard, monitor_auth
-app/services/            # relay, upstream, streaming, responses_bridge,
+app/services/            # relay (+ relay_store: pool & egress runtime),
+                         # outbound_proxy (pool SOCKS/HTTP + DOWN/FLAGGED),
+                         # upstream, streaming, responses_bridge,
                          # chat_bridge (reverse bridge), opencode,
                          # models_cache, model_context, model_endpoints,
                          # tools_dsml, usage
 app/routes/              # chat, responses_api, misc, usage_routes, monitor
-app/web/templates/       # login.html, dashboard.html (vanilla, tanpa build)
+app/web/templates/       # login.html, dashboard.html (vanilla, tanpa build;
+                         # 3 view: Monitoring / Konfigurasi / Uji Model)
 test/                    # test_long_stream_fixes.py, test_live_requests.py,
                          # test_reverse_bridge.py, test_forbidden_fresh_retry.py,
                          # test_direct_first_slow.py, test_output_item_done.py,
-                         # test_tool_choice_coerce.py
+                         # test_tool_choice_coerce.py, test_outbound_proxy.py
 plans/                   # docs lokal, di-gitignore
 usage.db*                # runtime SQLite, di-gitignore
+proxies.json             # pool proxy website, di-gitignore
+relays.json              # pool relay + egress website, di-gitignore
 ```
 
 ## Test
 
 ```bash
 python -m compileall -q app main.py test
+python test/test_outbound_proxy.py   # offline, 8 case (pool proxy + flap/flag + expand)
 python test/test_long_stream_fixes.py   # offline, 34 case, harus ALL PASSED
 python test/test_reverse_bridge.py      # offline, 15 case (routing endpoint + reverse bridge)
 python test/test_forbidden_fresh_retry.py  # offline, 7 case (retry sesi-baru all-403)
