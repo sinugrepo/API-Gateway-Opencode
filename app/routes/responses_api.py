@@ -174,17 +174,16 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
     stream_use_relay = use_relay_req if use_relay_req is not None else _default_use_relay()
     if STREAM_BYPASS_RELAY:
         stream_use_relay = False
-    # Free-tier fingerprint gate (403 bila hilang, diverifikasi live
-    # 2026-09-18): kuartet tools + store=false + max_output_tokens.
-    # Berlaku untuk stream MAUPUN non-stream.
-    ensure_responses_wire_fields(body)
-    stream = bool(body.get("stream", False))
     # Identitas CLI untuk free tier (dibagi ke semua upstream attempt).
     # Sesi dibuat STABIL per-percakapan (bukan acak per-request): konten
     # reasoning `encrypted_content` yang direplay klien stateless di-turn
     # berikutnya di-issuance ke caller identity turn pertama. Sesi acak baru
     # tiap request membuat upstream menolaknya (400 "encrypted_content was
     # not issued to this caller") dan percakapan brick permanen.
+    # URUTAN PENTING: sesi stabil dihitung dari body ASLI klien SEBELUM
+    # ensure_responses_wire_fields menyintesis prompt_cache_key — bila
+    # sesudah, fingerprint melihat key sintesis (hash-dari-hash) sehingga
+    # sesi tidak lagi selaras dengan identitas percakapan klien.
     oc_headers = _resolve_opencode_headers(request.headers)
     # _resolve_opencode_headers mengisi sesi acak bila klien tidak mengirim
     # x-opencode-session; ganti dengan sesi stabil per-percakapan.
@@ -193,6 +192,11 @@ async def create_response(request: Request, background_tasks: BackgroundTasks):
     )
     if not client_sent_session:
         oc_headers["x-opencode-session"] = _stable_opencode_session(body)
+    # Free-tier fingerprint gate (403 bila hilang, diverifikasi live
+    # 2026-09-18): kuartet tools + store=false + max_output_tokens.
+    # Berlaku untuk stream MAUPUN non-stream.
+    ensure_responses_wire_fields(body)
+    stream = bool(body.get("stream", False))
 
     if stream:
         if not API_KEY:

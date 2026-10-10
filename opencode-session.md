@@ -234,6 +234,14 @@ curl localhost:4096/session
 * `muse-spark-*`: `reasoning.effort` **selalu `xhigh`** di proxy
   (`ensure_spark_reasoning_xhigh`) — nilai klien (`low`/`medium`/hilang)
   di-override di SEMUA jalur. Model non-spark tidak disentuh.
+* 12 hex pertama suffix `ses_`/`msg_` **meng-encode timestamp**
+  (`ms*0x1000+counter`, §4) — BUKAN hex bebas. ID stabil per-percakapan
+  gateway di-generate SEKALI per fingerprint lalu di-cache (bukan hash
+  menjadi prefix: hash acak ter-decode sebagai timestamp acak/kuno/
+  masa-depan dan terdeteksi fake → 403 di semua egress). TTL cache 7 hari.
+* Sesi stabil dihitung dari body ASLI klien SEBELUM `prompt_cache_key`
+  disintesis (bila sesudah = hash-dari-hash, tidak selaras dengan identitas
+  percakapan klien).
 
 ## 8. Free-tier fingerprint gate (403) — diverifikasi live 2026-09-18
 

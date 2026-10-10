@@ -14,7 +14,9 @@ import hashlib
 import os
 import secrets
 import struct
+import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import OPENCODE_CLIENT_NAME, OPENCODE_PROJECT, OPENCODE_SESSION_ID
@@ -26,7 +28,7 @@ _BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 # Bisa dioverride via env bila CLI upstream diupdate.
 OPENCODE_USER_AGENT = os.getenv(
     "OPENCODE_USER_AGENT",
-    "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+    "opencode/1.18.35 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
 )
 
 
@@ -61,8 +63,8 @@ def _opencode_cli_headers(
 ) -> Dict[str, str]:
     """Bangun header identitas CLI + User-Agent ala CLI asli.
 
-    User-Agent disamakan dengan CLI opencode asli (`opencode-session.md` §5:
-    `opencode/1.18.31 ...`) agar fingerprint caller upstream konsisten — UA
+    User-Agent disamakan dengan CLI opencode asli (`opencode-session.md` §5)
+    agar fingerprint caller upstream konsisten — UA
     python-httpx bawaan justru menandai request ini BUKAN CLI (rawan
     ditolak free tier dengan FreeTierError).
     """
@@ -93,7 +95,87 @@ def _is_valid_opencode_id(value: str, prefix: str) -> bool:
     )
 
 
-_STABLE_SESSION_FALLBACK = "ses_" + "0" * 12 + "0" * 14  # format-valid bila tak ada sinyal
+_STABLE_SESSION_FALLBACK = "ses_" + "0" * 12 + "0" * 14  # legacy (format-valid tapi timestamp 1970 = fake); dipertahankan untuk kompat, tidak lagi dipakai sebagai default.
+
+# Cache fingerprint -> session ID timestamp-valid (lihat _stable_opencode_session).
+# Alasan: 12 hex pertama suffix ses_/msg_ BUKAN hex bebas — ia meng-encode
+# timestamp (ms*0x1000+counter, big-endian [2:], descending=NOT untuk session;
+# lihat `opencode-session.md` §4 / headers.go createID). Upstream dapat
+# men-decode-nya dan menolak ID yang timestamp-nya acak/kuno/masa-depan
+# sebagai "bukan dari CLI" (403 FreeTierError di SEMUA egress walau payload
+# fingerprint lain lengkap). Implementasi lama memetakan sha256 fingerprint
+# langsung menjadi prefix hex -> timestamp uniform-acak dalam jendela ~2.18
+# tahun (≈89% di luar 90 hari / ≈50% masa-depan) -> terdeteksi fake.
+# Fix: session stabil = ID timestamp-valid yang digenerate SEKALI per
+# fingerprint lalu dipakai ulang (stabil antar-turn + timestamp selalu
+# plausibel saat pertama dibuat). TTL 7 hari agar proses long-running tidak
+# memakai session basi selamanya; evict LRU bila penuh.
+_STABLE_SESSION_CACHE_MAX = 2000
+_STABLE_SESSION_TTL_S = 7 * 24 * 3600.0
+_stable_session_cache: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+_stable_session_lock = threading.Lock()
+
+
+def _decode_opencode_ms(suffix12: str, descending: bool) -> Optional[int]:
+    """Decode estimasi millisecond dari 12 hex pertama suffix ID ala CLI.
+
+    Return ms (int) atau None bila bukan hex / di luar rentang tanggal wajar.
+    Asumsi 2 byte teratas (bits 48-63) sama dengan waktu sekarang — valid
+    untuk ID yang dibuat dalam ±1 tahun terakhir (top berubah tiap ~2.18 th).
+    Tak pernah melempar.
+    """
+    try:
+        if not isinstance(suffix12, str) or len(suffix12) < 12:
+            return None
+        enc48 = int(suffix12[:12], 16)
+        low48 = ((~enc48) if descending else enc48) & ((1 << 48) - 1)
+        now_full = (int(time.time() * 1000) * 0x1000 + 1) & ((1 << 64) - 1)
+        top = (now_full >> 48) & 0xFFFF
+        candidate = ((top << 48) | low48)
+        # Koreksi wrap ±1 top-step bila kandidat >12 jam di masa depan
+        # (ID dibuat tepat sebelum top bergulir).
+        now_ms = int(time.time() * 1000)
+        ms = (candidate - 1) // 0x1000
+        step_ms = (1 << 48) // 0x1000
+        if ms - now_ms > 12 * 3600 * 1000:
+            ms -= step_ms
+        elif now_ms - ms > step_ms // 2:
+            ms += step_ms
+        return ms
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _is_plausible_opencode_id(value: str, prefix: str, max_age_days: float = 90.0) -> bool:
+    """True bila ID format-valid DAN timestamp-nya plausibel (tak kuno/masa-depan).
+
+    Session (`ses_`, descending=True) maupun request (`msg_`, descending=False)
+    didukung. Jendela: [now-max_age_days, now+1 jam]. Tak pernah melempar.
+    """
+    try:
+        if not _is_valid_opencode_id(value, prefix):
+            return False
+        descending = prefix.startswith("ses_")
+        ms = _decode_opencode_ms(value[len(prefix):len(prefix) + 12], descending)
+        if ms is None:
+            return False
+        now_ms = int(time.time() * 1000)
+        if ms - now_ms > 3600 * 1000:
+            return False
+        if now_ms - ms > max_age_days * 24 * 3600 * 1000:
+            return False
+        return True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _clear_stable_session_cache() -> None:
+    """Kosongkan cache sesi stabil (dipakai test/setup). Tak pernah melempar."""
+    try:
+        with _stable_session_lock:
+            _stable_session_cache.clear()
+    except (TypeError, ValueError, AttributeError):
+        pass
 
 
 def _conversation_fingerprint(payload: Any) -> str:
@@ -167,32 +249,54 @@ def _stable_opencode_session(payload: Any = None) -> str:
 
     Format HASIL mengikuti spec `opencode-session.md` §4 agar lolos
     validasi free-tier (bukan sekadar alfanumerik acak):
-      `ses_` + 12 hex + 14 base62.
-    Deterministik dari fingerprint sehingga stabil antar-turn DAN antar
-    restart (cache in-memory hilang saat restart, tapi hash sama -> ID sama).
+      `ses_` + 12 hex timestamp + 14 base62.
+    KRITIS: 12 hex pertama HARUS meng-encode timestamp valid (bukan hash
+    bebas) — upstream dapat men-decode-nya; hash acak terdeteksi sebagai
+    fake dan ditolak 403 di semua egress. Karena itu fungsi ini TIDAK
+    memetakan hash menjadi prefix, melainkan meng-generate SATU ID
+    timestamp-valid per fingerprint percakapan lalu meng-cache-nya
+    (stabil antar-turn dalam satu proses + timestamp plausibel).
+    TTL 7 hari + LRU 2000 entri; antar-restart sesi dibuat ulang (valid
+    baru) dan auto-heal encrypted_content menanggung replay basi.
 
     Prioritas:
     1. OPENCODE_SESSION_ID env (statis global, opsional).
     2. Fingerprint percakapan (prompt_cache_key / system+first user msg) ->
        sesi sama otomatis untuk percakapan sama, beda untuk percakapan beda.
-    3. Fallback konstan bila payload tak punya sinyal sama sekali.
+    3. Fallback ID valid per-proses (di-cache di bawah kunci fallback)
+       bila payload tak punya sinyal sama sekali (konstan dalam satu
+       proses agar test/klien stabil, valid saat pertama dibuat).
     """
     if OPENCODE_SESSION_ID:
         return OPENCODE_SESSION_ID
     fingerprint = _conversation_fingerprint(payload)
-    if fingerprint:
-        # 12 hex pertama fingerprint = prefix hex valid (lowercase sha256).
-        # 14 base62 sisanya dipetakan deterministik dari sisa hash agar
-        # suffix penuh 26 char valid + stabil (dua percakapan berbeda hampir
-        # pasti beda: ruang 16^12 * 62^14).
-        hex_prefix = fingerprint[:12].lower()
-        remainder_int = int(fingerprint[12:], 16)
-        chars: List[str] = []
-        for _ in range(14):
-            remainder_int, rem = divmod(remainder_int, 62)
-            chars.append(_BASE62_ALPHABET[rem])
-        return "ses_" + hex_prefix + "".join(chars)
-    return _STABLE_SESSION_FALLBACK
+    cache_key = fingerprint if fingerprint else "__fallback__"
+    try:
+        now = time.time()
+        with _stable_session_lock:
+            hit = _stable_session_cache.get(cache_key)
+            if isinstance(hit, (list, tuple)) and len(hit) == 2:
+                sess, created = hit
+                if (
+                    isinstance(sess, str)
+                    and sess.startswith("ses_")
+                    and isinstance(created, (int, float))
+                    and (now - float(created)) < _STABLE_SESSION_TTL_S
+                ):
+                    _stable_session_cache.move_to_end(cache_key)
+                    return sess
+            fresh = _new_opencode_session_id()
+            _stable_session_cache[cache_key] = (fresh, now)
+            _stable_session_cache.move_to_end(cache_key)
+            while len(_stable_session_cache) > _STABLE_SESSION_CACHE_MAX:
+                _stable_session_cache.popitem(last=False)
+            return fresh
+    except (TypeError, ValueError, AttributeError):
+        pass
+    try:
+        return _new_opencode_session_id()
+    except (TypeError, ValueError, AttributeError):
+        return _STABLE_SESSION_FALLBACK
 
 
 def _resolve_opencode_headers(incoming: Any = None) -> Dict[str, str]:

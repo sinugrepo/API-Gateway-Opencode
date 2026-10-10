@@ -307,6 +307,12 @@ async def _tool_responses(args: Dict[str, Any]) -> Dict[str, Any]:
             body[key] = args[key]
     if isinstance(args.get("reasoning_effort"), str) and not isinstance(body.get("reasoning"), dict):
         body["reasoning"] = {"effort": args["reasoning_effort"]}
+    # Sesi stabil dari body ASLI (sebelum sintesis key) agar selaras dengan
+    # identitas percakapan klien (lihat responses_api: hash-dari-hash bila sesudah).
+    try:
+        _pre_fp_body = dict(body)
+    except (TypeError, ValueError, AttributeError):
+        _pre_fp_body = body
     try:
         from app.services.opencode import ensure_responses_wire_fields
         ensure_responses_wire_fields(body)
@@ -323,8 +329,8 @@ async def _tool_responses(args: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from app.services.opencode import _stable_opencode_session
         oc_headers = dict(oc_headers)
-        oc_headers["x-opencode-session"] = _stable_opencode_session(body)
-    except (ImportError, AttributeError, TypeError, ValueError):
+        oc_headers["x-opencode-session"] = _stable_opencode_session(_pre_fp_body)
+    except (ImportError, AttributeError, TypeError, ValueError, NameError):
         pass
     use_relay = _default_use_relay()
 
