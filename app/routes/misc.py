@@ -46,18 +46,13 @@ def _proxy_overview() -> Dict[str, Any]:
 
 router = APIRouter()
 
-# Favicon SG (sama dengan <link rel="icon"> inline di template): disajikan
-# via /favicon.ico agar request otomatis browser tidak 404 dan tidak
-# mengotori log. SVG modern didukung semua browser terkini sebagai favicon.
+# Favicon: marka gerbang amber di atas charcoal (sama dengan logo sidebar).
 _FAVICON_SVG = (
     "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
-    "<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>"
-    "<stop offset='0' stop-color='#5794f2'/>"
-    "<stop offset='1' stop-color='#3d71d9'/>"
-    "</linearGradient></defs>"
-    "<rect width='64' height='64' rx='14' fill='url(#g)'/>"
-    "<text x='32' y='43' font-family='system-ui,sans-serif' font-size='26' "
-    "font-weight='700' fill='white' text-anchor='middle'>SG</text></svg>"
+    "<rect width='64' height='64' rx='14' fill='#df9432'/>"
+    "<path d='M16 44V28a16 16 0 0 1 32 0v16' fill='none' stroke='#1c1b17' "
+    "stroke-width='6' stroke-linecap='round'/>"
+    "<circle cx='32' cy='44' r='5' fill='#1c1b17'/></svg>"
 )
 
 
@@ -224,6 +219,16 @@ async def get_props():
                 supported=True,
                 description="SOCKS5/HTTP egress pool untuk direct upstream (anti-429, konfigurasi via /monitor).",
             ),
+            PropsCapability(
+                name="mcp_server",
+                supported=True,
+                description="MCP Streamable HTTP: POST /mcp (JSON-RPC initialize/tools.list/tools.call), GET /mcp discovery, tools chat+responses+list_models+gateway_props (muse-spark auto-bridge).",
+            ),
+            PropsCapability(
+                name="mcp_tool_passthrough",
+                supported=True,
+                description="Tools MCP (inputSchema) dinormalisasi ke OpenAI parameters di /v1/chat/completions + /v1/responses; fingerprint kuartet + tool_choice auto tetap ditegakkan.",
+            ),
         ],
         supported_parameters=[
             "temperature",
@@ -307,6 +312,26 @@ async def get_props():
                 path="/api/show",
                 method="POST",
                 description="Ollama-compatible /api/show stub.",
+            ),
+            PropsEndpoint(
+                path="/mcp",
+                method="POST",
+                description="MCP Streamable HTTP JSON-RPC (initialize/tools.list/tools.call: chat, responses, list_models, gateway_props).",
+            ),
+            PropsEndpoint(
+                path="/mcp",
+                method="GET",
+                description="MCP discovery (server info + tool list).",
+            ),
+            PropsEndpoint(
+                path="/sse",
+                method="GET",
+                description="MCP legacy SSE transport (endpoint event).",
+            ),
+            PropsEndpoint(
+                path="/messages",
+                method="POST",
+                description="MCP legacy messages endpoint (JSON-RPC).",
             ),
         ],
     )

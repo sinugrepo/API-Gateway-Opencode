@@ -837,11 +837,62 @@ def expand_targets_with_proxy(
             return []
 
 
+# Endpoint cek egress IP untuk pool WARP (IPv6-only):
+# - api64.ipify.org = dual-stack (ada AAAA) -> via proxy V6ONLY mengembalikan
+#   IPv6 unik per node. WAJIB dipakai untuk verifikasi keunikan.
+# - api.ipify.org = IPv4-ONLY (tanpa AAAA) -> SELALU terlihat sebagai IPv4
+#   shared anycast Cloudflare (104.28.x.x sama di semua node WARP gratis).
+#   JANGAN dipakai untuk menilai "IP tidak variatif" (false alarm).
+# - Cloudflare trace -> konfirmasi warp=on + IP egress yang sama.
+_IPIFY_V6_URL = "https://api64.ipify.org?format=json"
+_CF_TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+
+
+def detect_ip_version(ip: Optional[str]) -> Optional[int]:
+    """Versi IP (4/6) dari string, None bila bukan IP literal. Tak melempar."""
+    try:
+        import ipaddress as _ipaddr
+        if not ip or not isinstance(ip, str):
+            return None
+        return _ipaddr.ip_address(ip.strip()).version
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _parse_cf_trace(trace_text: str) -> Dict[str, Optional[str]]:
+    """Parse body `cdn-cgi/trace` (format `k=v` per baris) -> {warp, ip}."""
+    out: Dict[str, Optional[str]] = {"warp": None, "ip": None}
+    try:
+        for line in (trace_text or "").splitlines():
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip()
+            if k == "warp":
+                out["warp"] = v or None
+            elif k == "ip":
+                out["ip"] = v or None
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return out
+
+
 async def test_proxy_connection(
     proxy_conn_url: str,
     timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Test satu proxy: GET ipify via proxy. Return {ok, ip, latency_ms}."""
+    """Test satu proxy via IPv6: GET api64.ipify.org + CF trace via proxy.
+
+    Return {ok, ip, ip_version, warp, trace_ip, latency_ms, display, error}:
+    - `ip` = egress IP dari api64 (IPv6 unik bila warp V6ONLY aktif).
+    - `ip_version` = 4/6 (None bila tak terdeteksi).
+    - `warp` = "on"/"off"/None (dari trace; None = trace gagal, non-fatal).
+    - `ok=True` = api64 OK (walau trace gagal). `ok=False` bila api64 gagal.
+    - CATATAN WARP gratis: bila `ip_version==4`, itu IPv4 shared anycast
+      (sama di semua node) — BUKAN bug proxy. Aktifkan V6ONLY di container
+      warp agar egress IPv6 unik.
+    """
     started = time.time()
     try:
         timeout_s = PROXY_TEST_TIMEOUT if timeout is None else max(1.0, min(float(timeout), 60.0))
@@ -851,14 +902,17 @@ async def test_proxy_connection(
     try:
         # Client FRESH per test (tidak memakai pool) agar proxy buruk tidak
         # meracuni koneksi pooled + timeout pendek untuk dashboard.
+        # socks5h = DNS via proxy (remote resolve) sehingga query AAAA
+        # api64.ipify.org diselesaikan DI DALAM container warp -> keluar IPv6.
         async with httpx.AsyncClient(
             proxy=proxy_conn_url,
             timeout=httpx.Timeout(connect=timeout_s, read=timeout_s, write=timeout_s, pool=timeout_s),
         ) as client:
-            resp = await client.get("https://api.ipify.org?format=json", headers={"Accept": "application/json"})
+            resp = await client.get(_IPIFY_V6_URL, headers={"Accept": "application/json"})
             latency = int((time.time() - started) * 1000)
             if resp.status_code != 200:
-                return {"ok": False, "ip": None, "latency_ms": latency,
+                return {"ok": False, "ip": None, "ip_version": None, "warp": None,
+                        "trace_ip": None, "latency_ms": latency,
                         "display": disp, "error": f"HTTP {resp.status_code}"}
             try:
                 data = resp.json()
@@ -866,27 +920,53 @@ async def test_proxy_connection(
             except (ValueError, TypeError, AttributeError):
                 ip = None
             if not ip:
-                return {"ok": False, "ip": None, "latency_ms": latency,
+                return {"ok": False, "ip": None, "ip_version": None, "warp": None,
+                        "trace_ip": None, "latency_ms": latency,
                         "display": disp, "error": "respons tanpa IP"}
-            return {"ok": True, "ip": ip, "latency_ms": latency, "display": disp, "error": None}
+            ver = detect_ip_version(ip)
+            # Trace Cloudflare (best-effort, non-fatal): konfirmasi warp=on.
+            warp: Optional[str] = None
+            trace_ip: Optional[str] = None
+            try:
+                t_resp = await client.get(_CF_TRACE_URL, headers={"Accept": "text/plain"})
+                if t_resp.status_code == 200:
+                    parsed = _parse_cf_trace(t_resp.text or "")
+                    warp = parsed.get("warp")
+                    trace_ip = parsed.get("ip")
+            except (httpx.TimeoutException, httpx.RequestError, ValueError, TypeError, AttributeError):
+                warp, trace_ip = None, None
+            except Exception:  # noqa: BLE001 — trace non-fatal
+                warp, trace_ip = None, None
+            if ver == 4:
+                _log("RELAY", f"proxy {disp}: api64 balikan IPv4 {ip} (shared anycast WARP gratis, "
+                              f"sama di semua node) — aktifkan V6ONLY di container warp agar IPv6 unik")
+            return {"ok": True, "ip": ip, "ip_version": ver, "warp": warp,
+                    "trace_ip": trace_ip, "latency_ms": latency,
+                    "display": disp, "error": None}
     except ImportError as exc:
         # socksio belum terpasang.
-        return {"ok": False, "ip": None, "latency_ms": int((time.time() - started) * 1000),
+        return {"ok": False, "ip": None, "ip_version": None, "warp": None,
+                "trace_ip": None, "latency_ms": int((time.time() - started) * 1000),
                 "display": disp, "error": f"socksio belum terpasang: {exc}"}
     except httpx.TimeoutException:
-        return {"ok": False, "ip": None, "latency_ms": int((time.time() - started) * 1000),
+        return {"ok": False, "ip": None, "ip_version": None, "warp": None,
+                "trace_ip": None, "latency_ms": int((time.time() - started) * 1000),
                 "display": disp, "error": f"timeout >{timeout_s:.0f}s"}
     except httpx.ConnectError as exc:
-        return {"ok": False, "ip": None, "latency_ms": int((time.time() - started) * 1000),
+        return {"ok": False, "ip": None, "ip_version": None, "warp": None,
+                "trace_ip": None, "latency_ms": int((time.time() - started) * 1000),
                 "display": disp, "error": f"connect gagal: {str(exc)[:120]}"}
     except httpx.ProxyError as exc:
-        return {"ok": False, "ip": None, "latency_ms": int((time.time() - started) * 1000),
+        return {"ok": False, "ip": None, "ip_version": None, "warp": None,
+                "trace_ip": None, "latency_ms": int((time.time() - started) * 1000),
                 "display": disp, "error": f"proxy error: {str(exc)[:120]}"}
     except httpx.RequestError as exc:
-        return {"ok": False, "ip": None, "latency_ms": int((time.time() - started) * 1000),
+        return {"ok": False, "ip": None, "ip_version": None, "warp": None,
+                "trace_ip": None, "latency_ms": int((time.time() - started) * 1000),
                 "display": disp, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
     except Exception as exc:  # noqa: BLE001 — test tak boleh melempar
-        return {"ok": False, "ip": None, "latency_ms": int((time.time() - started) * 1000),
+        return {"ok": False, "ip": None, "ip_version": None, "warp": None,
+                "trace_ip": None, "latency_ms": int((time.time() - started) * 1000),
                 "display": disp, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
 
 
@@ -898,15 +978,15 @@ async def test_proxy_by_id(pid: str) -> Dict[str, Any]:
             entry = _proxies.get((pid or "").strip())
             entry = dict(entry) if isinstance(entry, dict) else None
         if entry is None:
-            return {"ok": False, "ip": None, "latency_ms": 0, "error": "proxy tidak ditemukan"}
+            return {"ok": False, "ip": None, "ip_version": None, "warp": None, "trace_ip": None, "latency_ms": 0, "error": "proxy tidak ditemukan"}
         conn = proxy_connection_url(entry)
         if not conn:
-            return {"ok": False, "ip": None, "latency_ms": 0, "error": "konfigurasi proxy rusak"}
+            return {"ok": False, "ip": None, "ip_version": None, "warp": None, "trace_ip": None, "latency_ms": 0, "error": "konfigurasi proxy rusak"}
         result = await test_proxy_connection(conn)
         result["id"] = entry.get("id")
         return result
     except (TypeError, ValueError, AttributeError) as exc:
-        return {"ok": False, "ip": None, "latency_ms": 0, "error": str(exc)[:200]}
+        return {"ok": False, "ip": None, "ip_version": None, "warp": None, "trace_ip": None, "latency_ms": 0, "error": str(exc)[:200]}
 
 
 def get_proxy_overview() -> Dict[str, Any]:

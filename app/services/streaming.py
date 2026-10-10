@@ -41,7 +41,7 @@ def _eff_fallback() -> bool:
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
 from app.core.http_client import _get_http, _pick_http_client
 from app.core.logging_utils import _log
-from app.services.opencode import _fresh_request_headers, _fresh_retry_targets, _oc_session_tag
+from app.services.opencode import _fresh_request_headers, _fresh_retry_targets, _is_non_retryable_400, _oc_session_tag
 from app.core.sse import _sse
 from app.services.relay import (
     _is_relay_penalized,
@@ -450,6 +450,20 @@ async def stream_generator(
                                     f"(proxy SEHAT, egress IP di-flag — bukan salah proxy) "
                                     f"-> disisihkan sementara, lanjut ke target berikutnya"
                                 )
+                            if (
+                                response.status_code == 400
+                                and not sent_payload
+                                and _is_non_retryable_400(detail)
+                            ):
+                                # 400 payload-error (skema rekursif, schema invalid,
+                                # tool tak dikenal, ...): request identik gagal di
+                                # SEMUA egress — fail-fast tanpa membakar 13
+                                # attempt + menandai proxy/relay sehat sebagai rusak.
+                                _log("STREAM",
+                                    f"FATAL-400 {target_url} | payload ditolak upstream "
+                                    f"({detail[:500]!r}) -> fail-fast, tanpa rotasi target lain"
+                                )
+                                break
                             target_index += 1
                             _log("STREAM",
                                 f"FAIL {_route} {target_url} "

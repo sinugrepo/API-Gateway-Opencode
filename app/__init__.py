@@ -80,11 +80,12 @@ def create_app() -> FastAPI:
     application.add_middleware(BodyLimitMiddleware)
     register_error_handlers(application)
 
-    from .routes import chat, misc, monitor, responses_api, usage_routes
+    from .routes import chat, mcp, misc, monitor, responses_api, usage_routes
 
     application.include_router(misc.router)
     application.include_router(chat.router)
     application.include_router(responses_api.router)
+    application.include_router(mcp.router)
     application.include_router(usage_routes.router)
     application.include_router(monitor.router)
     return application

@@ -28,7 +28,7 @@ from app.core.config import (
 )
 from app.core.errors import TimeoutError_, UpstreamError
 from app.core.logging_utils import _log
-from app.services.opencode import _fresh_request_headers, _oc_session_tag
+from app.services.opencode import _fresh_request_headers, _is_non_retryable_400, _oc_session_tag
 
 
 def _eff_fallback() -> bool:
@@ -71,11 +71,25 @@ def build_upstream_payload(req: ChatCompletionRequest) -> Dict[str, Any]:
         "stream": req.stream,
     }
 
+    # Normalisasi tools MCP (inputSchema) -> OpenAI (parameters) SEBELUM
+    # fingerprint: klien opencode MCP / Claude Desktop mengirim schema MCP,
+    # upstream chat hanya mengerti `parameters`. Tanpa ini schema MCP hilang
+    # (khususnya saat model chat-native dipakai bersama MCP servers).
+    _raw_tools = getattr(req, "tools", None)
+    if isinstance(_raw_tools, list) and _raw_tools:
+        try:
+            from app.services.opencode import normalize_chat_tools
+            _normalized = normalize_chat_tools(_raw_tools)
+            if _normalized is not None:
+                payload["tools"] = _normalized
+        except (ImportError, AttributeError, TypeError, ValueError):
+            payload["tools"] = _raw_tools
+
     # Forward only values explicitly supplied or safe defaults.
+    # NOTE: `tools` excluded here — already normalized from MCP shape above.
     for key in (
         "temperature",
         "max_tokens",
-        "tools",
         "tool_choice",
         "parallel_tool_calls",
         "top_p",
@@ -605,6 +619,26 @@ async def call_upstream(
                 )
 
         _log("RELAY", f"FAIL {url} | upstream-status={response.status_code}")
+
+        if response.status_code == 400:
+            # 400 payload-error (skema rekursif MCP, schema invalid, ...):
+            # request identik gagal di semua egress — fail-fast tanpa
+            # merotasi relay lain / fallback direct yang sama-sama gagal.
+            try:
+                _fatal_detail = (response.text or "")[:500]
+            except (ValueError, TypeError, AttributeError):
+                _fatal_detail = ""
+            if _is_non_retryable_400(_fatal_detail):
+                _log(
+                    "RELAY",
+                    f"FATAL-400 {url} | payload ditolak upstream "
+                    f"({_fatal_detail[:500]!r}) -> fail-fast, tanpa rotasi/fallback",
+                )
+                raise UpstreamError(
+                    f"Upstream rejected payload (400, not retryable): {_fatal_detail}",
+                    status_code=HTTP_502_BAD_GATEWAY,
+                    upstream_status=400,
+                )
 
         if attempt == num_relays - 1 and not _fb:
             if response.status_code == 429:

@@ -176,9 +176,18 @@ def responses_input_to_chat_messages(
 
 
 def _responses_tools_to_chat_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
-    """Flat Responses function tools -> chat function tools (best-effort)."""
+    """Flat Responses/MCP function tools -> chat function tools (best-effort).
+
+    Menerima `parameters` (OpenAI) maupun `inputSchema`/`input_schema` (MCP);
+    `strict` dipertahankan bila ada.
+    """
     if not isinstance(tools, list):
         return None
+    try:
+        from app.services.opencode import normalize_chat_tools
+        return normalize_chat_tools(tools)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
     out: List[Dict[str, Any]] = []
     for tool in tools:
         if not isinstance(tool, dict):
@@ -188,15 +197,24 @@ def _responses_tools_to_chat_tools(tools: Any) -> Optional[List[Dict[str, Any]]]
             continue
         parameters = tool.get("parameters")
         if not isinstance(parameters, dict):
+            for _alias in ("inputSchema", "input_schema"):
+                _cand = tool.get(_alias)
+                if isinstance(_cand, dict):
+                    parameters = _cand
+                    break
+        if not isinstance(parameters, dict):
             parameters = {"type": "object", "properties": {}}
-        out.append({
+        entry: Dict[str, Any] = {
             "type": "function",
             "function": {
                 "name": name.strip(),
                 "description": tool.get("description") or f"Tool {name.strip()}",
                 "parameters": parameters,
             },
-        })
+        }
+        if isinstance(tool.get("strict"), bool):
+            entry["function"]["strict"] = tool["strict"]
+        out.append(entry)
     return out or None
 
 

@@ -354,7 +354,7 @@ OPENCODE_RESPONSES_MODELS = frozenset({
 
 
 def _tool_name_of(tool: Any) -> str:
-    """Ambil nama tool dari bentuk chat maupun responses (toleran)."""
+    """Ambil nama tool dari bentuk chat, responses, maupun MCP (toleran)."""
     if not isinstance(tool, dict):
         return ""
     name = tool.get("name")
@@ -368,11 +368,140 @@ def _tool_name_of(tool: Any) -> str:
     return ""
 
 
+def _tool_schema_of(tool: Any) -> Optional[Dict[str, Any]]:
+    """Ambil JSON Schema tool dari `parameters` (OpenAI) atau `inputSchema` (MCP)."""
+    if not isinstance(tool, dict):
+        return None
+    for key in ("parameters", "inputSchema", "input_schema"):
+        schema = tool.get(key)
+        if isinstance(schema, dict):
+            return schema
+    function = tool.get("function")
+    if isinstance(function, dict):
+        for key in ("parameters", "inputSchema", "input_schema"):
+            schema = function.get(key)
+            if isinstance(schema, dict):
+                return schema
+    return None
+
+
+def normalize_chat_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
+    """Normalisasi tools MCP/Responses/chat menjadi bentuk chat OpenAI.
+
+    MCP clients (opencode.json `mcp` servers, Claude Desktop) mendeskripsikan
+    schema sebagai `inputSchema`, sedangkan OpenAI memakai `parameters`.
+    Upstream chat HANYA mengerti `{"type":"function","function":{...}}` dengan
+    `parameters` — tanpa normalisasi, schema MCP hilang/ditolak. Fungsi ini:
+    - `inputSchema`/`input_schema` -> `parameters` (kedua level: top & function)
+    - flat Responses/MCP `{"name":...}` -> bungkus chat `{"type":"function","function":{...}}`
+    - mempertahankan `description`, `parameters`, dan `strict` bila ada.
+    Tidak pernah melempar; return None bila tidak ada tools valid.
+    """
+    if not isinstance(tools, list) or not tools:
+        return None
+    out: List[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else None
+        if function is not None:
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            schema = _tool_schema_of(tool)
+            entry: Dict[str, Any] = {
+                "type": "function",
+                "function": {
+                    "name": name.strip(),
+                    "description": function.get("description") or tool.get("description") or f"Tool {name.strip()}",
+                    "parameters": schema if schema is not None else {"type": "object", "properties": {}},
+                },
+            }
+            if isinstance(function.get("strict"), bool):
+                entry["function"]["strict"] = function["strict"]
+            elif isinstance(tool.get("strict"), bool):
+                entry["function"]["strict"] = tool["strict"]
+            out.append(entry)
+            continue
+        name = tool.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        schema = _tool_schema_of(tool)
+        entry = {
+            "type": "function",
+            "function": {
+                "name": name.strip(),
+                "description": tool.get("description") or f"Tool {name.strip()}",
+                "parameters": schema if schema is not None else {"type": "object", "properties": {}},
+            },
+        }
+        if isinstance(tool.get("strict"), bool):
+            entry["function"]["strict"] = tool["strict"]
+        out.append(entry)
+    return out or None
+
+
+def normalize_responses_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
+    """Normalisasi tools chat/MCP menjadi bentuk flat Responses API.
+
+    Kebalikan `normalize_chat_tools`: `{"type":"function","function":{...}}`
+    (chat) maupun MCP `{"name":..., "inputSchema":...}` -> flat
+    `{"type":"function","name":...,"parameters":...}`. `strict` dipertahankan.
+    """
+    if not isinstance(tools, list) or not tools:
+        return None
+    out: List[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else None
+        if function is not None:
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            schema = _tool_schema_of(tool)
+            entry: Dict[str, Any] = {
+                "type": "function",
+                "name": name.strip(),
+                "description": function.get("description") or tool.get("description") or f"Tool {name.strip()}",
+                "parameters": schema if schema is not None else {"type": "object", "properties": {}},
+            }
+            if isinstance(function.get("strict"), bool):
+                entry["strict"] = function["strict"]
+            elif isinstance(tool.get("strict"), bool):
+                entry["strict"] = tool["strict"]
+            out.append(entry)
+            continue
+        name = tool.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        schema = _tool_schema_of(tool)
+        entry = {
+            "type": "function",
+            "name": name.strip(),
+            "description": tool.get("description") or f"Tool {name.strip()}",
+            "parameters": schema if schema is not None else {"type": "object", "properties": {}},
+        }
+        if isinstance(tool.get("strict"), bool):
+            entry["strict"] = tool["strict"]
+        out.append(entry)
+    return out or None
+
+
 def ensure_chat_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Suntik kuartet tools fingerprint bentuk chat bila belum ada."""
     if not isinstance(payload, dict):
         return payload
     tools = payload.get("tools")
+    # Normalisasi dulu (idempotent): tools MCP/Responses (`inputSchema`,
+    # flat `name`) -> bentuk chat agar skema tidak hilang di wire.
+    if isinstance(tools, list) and tools:
+        try:
+            _norm = normalize_chat_tools(tools)
+            if _norm is not None:
+                payload["tools"] = tools = _norm
+        except (AttributeError, TypeError, ValueError):
+            pass
     if not isinstance(tools, list):
         tools = []
         payload["tools"] = tools
@@ -388,6 +517,19 @@ def ensure_chat_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "parameters": {"type": "object", "properties": {}},
             },
         })
+    # Tools MCP kerap membawa $ref siklik (skema rekursif) yang ditolak
+    # provider Console dengan 400 di SEMUA target — putus siklusnya di sini
+    # (satu choke point untuk SEMUA jalur chat) sebelum wire.
+    try:
+        _, _n_fixed = sanitize_tools_for_upstream(tools)
+        if _n_fixed:
+            try:
+                from app.core.logging_utils import _log as _san_log
+                _san_log("TOOLS", f"sanitized {_n_fixed} recursive tool schema(s) (chat)")
+            except (ImportError, AttributeError, TypeError, ValueError):
+                pass
+    except (AttributeError, TypeError, ValueError):
+        pass
     return payload
 
 
@@ -396,6 +538,17 @@ def ensure_responses_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any
     if not isinstance(payload, dict):
         return payload
     tools = payload.get("tools")
+    # Normalisasi dulu (idempotent): tools MCP (`inputSchema`) maupun bentuk
+    # chat (`function.{...}`) -> flat responses. TANPA ini, tools MCP yang
+    # masuk via /v1/responses direct wire tanpa `parameters` (skema hilang)
+    # dan berisiko 400/403 upstream — padahal "biasa" (tanpa MCP) lolos.
+    if isinstance(tools, list) and tools:
+        try:
+            _norm = normalize_responses_tools(tools)
+            if _norm is not None:
+                payload["tools"] = tools = _norm
+        except (AttributeError, TypeError, ValueError):
+            pass
     if not isinstance(tools, list):
         tools = []
         payload["tools"] = tools
@@ -409,6 +562,18 @@ def ensure_responses_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any
             "description": f"OpenCode built-in {name} tool",
             "parameters": {"type": "object", "properties": {}},
         })
+    # Lihat ensure_chat_fingerprint_tools: putus skema rekursif ($ref siklik
+    # MCP) yang ditolak provider dengan 400 di semua target.
+    try:
+        _, _n_fixed = sanitize_tools_for_upstream(tools)
+        if _n_fixed:
+            try:
+                from app.core.logging_utils import _log as _san_log
+                _san_log("TOOLS", f"sanitized {_n_fixed} recursive tool schema(s) (responses)")
+            except (ImportError, AttributeError, TypeError, ValueError):
+                pass
+    except (AttributeError, TypeError, ValueError):
+        pass
     return payload
 
 
@@ -460,10 +625,31 @@ def ensure_responses_wire_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
                 break
     payload.pop("max_tokens", None)
     payload.pop("max_completion_tokens", None)
+    # §8: max_output_tokens WAJIB ada (default proxy 65536 bila klien kirim
+    # null/hilang — jalur MCP opencode kadang tidak mengirimnya, dan tanpa
+    # ini upstream menjawab 403 walau fingerprint lain lengkap).
+    _mo = payload.get("max_output_tokens")
+    if not isinstance(_mo, (int, float)) or isinstance(_mo, bool):
+        payload["max_output_tokens"] = 65536
+    # Null eksplisit (temperature:null dsb. dari klien MCP) bila diteruskan
+    # mentah berisiko 400 upstream — drop agar upstream pakai default-nya.
+    for _opt in ("temperature", "top_p"):
+        if _opt in payload and payload.get(_opt) is None:
+            payload.pop(_opt, None)
     payload["store"] = False
     ensure_responses_fingerprint_tools(payload)
     ensure_spark_reasoning_xhigh(payload)
     coerce_tool_choice_auto(payload, "responses-wire")
+    # prompt_cache_key stabil per-percakapan (bagian fingerprint gate §8):
+    # jalur bridge mensintesisnya, jalur direct passthrough selama ini tidak —
+    # samakan agar wire direct selengkap wire bridge yang terbukti lolos.
+    if not payload.get("prompt_cache_key"):
+        try:
+            _fp = _conversation_fingerprint(payload)
+            if _fp:
+                payload["prompt_cache_key"] = _fp[:32]
+        except (TypeError, ValueError, AttributeError):
+            pass
     return payload
 
 
@@ -507,3 +693,424 @@ def coerce_tool_choice_auto(payload: Dict[str, Any], context: str = "") -> bool:
         return True
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+# ── Sanitizer skema JSON rekursif (tools MCP) ──
+# Provider Console menolak skema rekursif dengan 400
+# "Recursive JSON schemas are not currently supported" (live: muse-spark via
+# /v1/responses dengan tools MCP bersiklus $ref -> 400 di SEMUA target karena
+# ini salah payload, bukan salah route). Tools MCP (filesystem, opencode
+# built-in, dsb.) lumrah membawa $ref siklik gaya Pydantic
+# (`#/$defs/Node` -> ... -> `#/$defs/Node`, termasuk mutual A<->B), jadi
+# gateway memutus siklusnya sebelum wire: $ref yang membentuk back-edge
+# (target satu SCC siklik dengan frame ekspansi aktif) diganti placeholder
+# `{"type": "object"}`. $ref non-siklik dipertahankan apa adanya (tidak
+# di-inline) agar payload tetap kecil dan skema utuh.
+_RECURSION_PLACEHOLDER_DESC = (
+    "Truncated by gateway: provider rejects recursive JSON schemas"
+)
+
+_DEPTH_PLACEHOLDER_DESC = (
+    "Truncated by gateway: provider allows max 10 schema nesting levels"
+)
+
+_SCHEMA_MAX_DEPTH = 40
+
+# Batas nesting provider Console: 400 "JSON schema exceeds the maximum
+# nesting depth of 10 levels" (live muse-spark + tools MCP dalam, yang skema
+# mentahnya >10 level). Dihitung 0-indexed per level JSON (dict maupun list):
+# di atas 7 (total 9 level) dipadatkan — strictly di bawah 10 apa pun basis
+# hitung provider (root dihitung/tidak), dengan tetap mempertahankan `type`
+# node asal agar validasi longgar tapi benar arah (bukan object buta).
+# Skema tulisan-tangan (2-4 level) tak tersentuh; hanya monster auto-generate
+# yang dipadatkan.
+_PROVIDER_MAX_SCHEMA_DEPTH = 7
+
+_SCALAR_TYPES = frozenset({"string", "number", "integer", "boolean", "array", "object", "null"})
+
+
+def _pointer_escape(segment: str) -> str:
+    return str(segment).replace("~", "~0").replace("/", "~1")
+
+
+def _pointer_of(path: tuple) -> str:
+    return "#/" + "/".join(_pointer_escape(s) for s in path)
+
+
+def _resolve_schema_pointer(root: Any, ref: str) -> Any:
+    """Resolve JSON pointer internal (`#/$defs/X`, `#/definitions/X`, ...).
+
+    Return node target atau None bila tak dapat di-resolve (ref eksternal /
+    pointer rusak dibiarkan apa adanya). Tak pernah melempar.
+    """
+    try:
+        if not isinstance(ref, str) or not ref.startswith("#"):
+            return None
+        if ref in ("#", "#/"):
+            return root
+        if not ref.startswith("#/"):
+            return None
+        node = root
+        for raw_part in ref[2:].split("/"):
+            part = raw_part.replace("~1", "/").replace("~0", "~")
+            if isinstance(node, dict) and part in node:
+                node = node[part]
+            elif isinstance(node, list):
+                try:
+                    node = node[int(part)]
+                except (ValueError, IndexError, TypeError):
+                    return None
+            else:
+                return None
+        return node
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _index_schema_defs(node: Any, path: tuple, defs: Dict[str, Any], seen: frozenset) -> None:
+    """Index semua blok `$defs`/`definitions`: pointer-penuh -> node. Tak melempar."""
+    try:
+        if isinstance(node, list):
+            for i, item in enumerate(node):
+                _index_schema_defs(item, path + (str(i),), defs, seen)
+            return
+        if not isinstance(node, dict) or id(node) in seen:
+            return
+        seen = seen | {id(node)}
+        for key, value in node.items():
+            if key in ("$defs", "definitions") and isinstance(value, dict):
+                for name, child in value.items():
+                    try:
+                        defs[_pointer_of(path + (key, str(name)))] = child
+                    except (TypeError, ValueError):
+                        continue
+            _index_schema_defs(value, path + (key,), defs, seen)
+    except (TypeError, ValueError, AttributeError, RecursionError):
+        pass
+
+
+def _collect_internal_refs(node: Any, out: set, seen: frozenset) -> None:
+    """Kumpulkan SEMUA string `$ref` internal (`#...`) di subtree. Tak melempar."""
+    try:
+        if isinstance(node, list):
+            for item in node:
+                _collect_internal_refs(item, out, seen)
+            return
+        if not isinstance(node, dict) or id(node) in seen:
+            return
+        seen = seen | {id(node)}
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#"):
+            out.add(ref)
+        for value in node.values():
+            _collect_internal_refs(value, out, seen)
+    except (TypeError, ValueError, AttributeError, RecursionError):
+        pass
+
+
+def _cyclic_scc_map(defs: Dict[str, Any]) -> Tuple[Dict[str, frozenset], set]:
+    """Petakan pointer definisi -> SCC, plus himpunan SCC yang siklik.
+
+    SCC siklik = anggota >1, atau self-loop. $ref ke anggota SCC siklik
+    HANYA diputus bila terjadi sebagai back-edge (ada frame ekspansi aktif
+    dari SCC yang sama); tepi masuk dari luar dipertahankan agar bentuk
+    skema level-atas tetap utuh. Tak pernah melempar.
+    """
+    try:
+        edges: Dict[str, set] = {}
+        for ptr, sub in defs.items():
+            refs: set = set()
+            _collect_internal_refs(sub, refs, frozenset())
+            edges[ptr] = {q for q in refs if q in defs}
+        reach: Dict[str, set] = {}
+        for ptr in defs:
+            seen: set = set()
+            stack = list(edges.get(ptr, ()))
+            while stack:
+                cur = stack.pop()
+                for nxt in edges.get(cur, ()):
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        stack.append(nxt)
+            reach[ptr] = seen
+        scc_of: Dict[str, frozenset] = {}
+        cyclic: set = set()
+        for ptr in defs:
+            members = frozenset({ptr} | {
+                q for q in defs
+                if ptr in reach.get(q, set()) and q in reach.get(ptr, set())
+            })
+            scc_of[ptr] = members
+            if len(members) > 1 or ptr in reach.get(ptr, set()):
+                cyclic.add(members)
+        return scc_of, cyclic
+    except (TypeError, ValueError, AttributeError):
+        return {}, set()
+
+
+def _ensure_container_type(out: Any) -> Any:
+    """Isi `type` yang hilang tanpa mengubah makna: node ber-`properties`
+    adalah object, node ber-`items` adalah array menurut semantik JSON
+    Schema. Validator ketat kadang menolak node tanpa `type`. Tak melempar."""
+    try:
+        if isinstance(out, dict) and "type" not in out:
+            if isinstance(out.get("properties"), dict):
+                out["type"] = "object"
+            elif "items" in out:
+                out["type"] = "array"
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return out
+
+
+def _clean_schema_node(
+    node: Any,
+    root: Any,
+    path: tuple,
+    ref_stack: tuple,
+    active: frozenset,
+    depth: int,
+    scc_of: Optional[Dict[str, frozenset]],
+    cyclic_ids: set,
+) -> Any:
+    """Salinan node skema dengan back-edge $ref rekursif diputus. Tak melempar.
+
+    `path` = lokasi tree saat ini (untuk pointer frame `$defs` akurat);
+    `ref_stack` = pointer yang sedang diekspansi di jalur ini; `active` =
+    id() dict ancestor (backstop siklus identitas); `depth` memutus nesting
+    patologis.
+    """
+    try:
+        if isinstance(node, list):
+            if depth > _SCHEMA_MAX_DEPTH:
+                return []
+            if depth > _PROVIDER_MAX_SCHEMA_DEPTH:
+                # Di batas provider: skalar (enum/required/type-array) tidak
+                # menambah nesting bermakna -> pertahankan; komposisi ber-dict
+                # (anyOf/oneOf/allOf/prefixItems dalam) dipadatkan satu opsi
+                # object longgar (valid, bukan never-valid seperti [] kosong).
+                if all(not isinstance(item, (dict, list)) for item in node):
+                    return list(node)
+                return [{"type": "object", "description": _DEPTH_PLACEHOLDER_DESC}]
+            return [
+                _clean_schema_node(item, root, path + (str(i),), ref_stack, active, depth + 1, scc_of, cyclic_ids)
+                for i, item in enumerate(node)
+            ]
+        if not isinstance(node, dict):
+            return node
+        if id(node) in active or depth > _SCHEMA_MAX_DEPTH:
+            return {"type": "object", "description": _RECURSION_PLACEHOLDER_DESC}
+        active = active | {id(node)}
+        if "additionalProperties" in node or node.get("required") == []:
+            # Provider Console 400 "Invalid JSON schema" untuk
+            # `additionalProperties` dalam BENTUK APA PUN (bool `false`
+            # maupun dict ber-skema seperti `{"type": "object", ...}` —
+            # umum di tools MCP auto-generate; live: `analysis_profile`
+            # dkk. via spark DITOLAK walau bentuk dict).
+            # Dilonggarkan (drop key) agar skema lolos: `required` asli yang
+            # non-kosong dipertahankan (opsional tetap opsional — model
+            # tidak dipaksa mengarang nilai), dan model jarang mengarang
+            # key baru. `required: []` kosong ikut di-drop (tanpa makna,
+            # sebagian validator menolaknya).
+            node = {k: v for k, v in node.items()
+                    if k != "additionalProperties" and not (k == "required" and v == [])}
+        if depth > _PROVIDER_MAX_SCHEMA_DEPTH:
+            # Padatkan: pertahankan type asal bila skalar-valid agar
+            # array/string/number dalam tidak berubah jadi object.
+            _t = node.get("type")
+            _t = _t if isinstance(_t, str) and _t in _SCALAR_TYPES else "object"
+            _d = node.get("description")
+            _desc = (_d.strip() + " (deep schema truncated by gateway)") \
+                if isinstance(_d, str) and _d.strip() else _DEPTH_PLACEHOLDER_DESC
+            return {"type": _t, "description": _desc}
+        active = active | {id(node)}
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#"):
+            target = _resolve_schema_pointer(root, ref)
+            is_back_edge = ref in ref_stack
+            if not is_back_edge and target is not None and scc_of:
+                try:
+                    scc = scc_of.get(ref)
+                    is_back_edge = (
+                        scc is not None
+                        and scc in cyclic_ids
+                        and any(scc_of.get(p) == scc for p in ref_stack)
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    is_back_edge = False
+            if target is not None and is_back_edge:
+                desc = node.get("description")
+                if isinstance(desc, str) and desc.strip():
+                    return {
+                        "type": "object",
+                        "description": desc.strip() + " (recursive reference truncated by gateway)",
+                    }
+                return {"type": "object", "description": _RECURSION_PLACEHOLDER_DESC}
+            child_stack = ref_stack + (ref,) if target is not None else ref_stack
+            out: Dict[str, Any] = {}
+            for key, value in node.items():
+                if key == "$ref":
+                    out[key] = value
+                else:
+                    out[key] = _clean_schema_node(
+                        value, root, path + (key,), child_stack, active, depth + 1, scc_of, cyclic_ids
+                    )
+            return _ensure_container_type(out)
+        # Blok definisi bernama = frame ekspansi (agar siklus terdeteksi
+        # walau situs definisi sendiri bukan $ref).
+        out = {}
+        for key, value in node.items():
+            if key in ("$defs", "definitions") and isinstance(value, dict):
+                cleaned_defs = {}
+                for def_name, def_node in value.items():
+                    try:
+                        ptr = _pointer_of(path + (key, str(def_name)))
+                    except (TypeError, ValueError):
+                        ptr = ""
+                    cleaned_defs[def_name] = _clean_schema_node(
+                        def_node, root, path + (key, str(def_name)),
+                        ref_stack + ((ptr,) if ptr else ()),
+                        active, depth + 1, scc_of, cyclic_ids,
+                    )
+                out[key] = cleaned_defs
+            else:
+                out[key] = _clean_schema_node(
+                    value, root, path + (key,), ref_stack, active, depth + 1, scc_of, cyclic_ids
+                )
+        return _ensure_container_type(out)
+    except (TypeError, ValueError, AttributeError, RecursionError):
+        return {"type": "object", "description": _RECURSION_PLACEHOLDER_DESC}
+
+
+def sanitize_tools_for_upstream(tools: Any) -> Tuple[List[Dict[str, Any]], int]:
+    """Normalisasi skema tools ke subset aman provider (chat/responses/MCP).
+
+    Menangani `parameters` maupun `inputSchema`/`input_schema` di level
+    `function` maupun top-level: putus $ref siklik, padatkan nesting >batas,
+    drop `additionalProperties` (bentuk apa pun) + `required: []` kosong, isi
+    `type` yang hilang. Return (tools, n_fixed). Payload di-mutasi in-place
+    (per-request, aman). Tak pernah melempar; bila gagal, tools dikembalikan
+    apa adanya dengan n_fixed=0.
+    """
+    try:
+        if not isinstance(tools, list):
+            return tools, 0
+        fixed = 0
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            holder = function if isinstance(function, dict) else tool
+            for key in ("parameters", "inputSchema", "input_schema"):
+                schema = holder.get(key)
+                if not isinstance(schema, dict):
+                    continue
+                try:
+                    defs: Dict[str, Any] = {}
+                    _index_schema_defs(schema, (), defs, frozenset())
+                    scc_of, cyclic_ids = _cyclic_scc_map(defs) if defs else ({}, set())
+                    cleaned = _clean_schema_node(
+                        schema, schema, (), (), frozenset(), 0, scc_of, cyclic_ids
+                    )
+                except (TypeError, ValueError, AttributeError, RecursionError):
+                    continue
+                if isinstance(cleaned, dict) and cleaned != schema:
+                    holder[key] = cleaned
+                    fixed += 1
+        return tools, fixed
+    except (AttributeError, TypeError, ValueError):
+        try:
+            return tools, 0
+        except (TypeError, ValueError):
+            return [], 0
+
+
+# ── Klasifikasi 400 non-retryable (fail-fast, tanpa rotasi target) ──
+# 400 payload-error (skema rekursif, schema invalid, tool tak dikenal,
+# konteks kepanjangan, ...) TIDAK sembuh dengan ganti relay/proxy/direct:
+# request identik gagal di semua egress. Tanpa fail-fast, 1 request buruk
+# membakar 13 attempt x ~2 dtk + menandai proxy/relay sehat sebagai rusak.
+# PENGECUALIAN: penolakan replay `encrypted_content` (400 juga) punya jalur
+# auto-heal sendiri — helper ini sengaja return False untuknya.
+_NON_RETRYABLE_400_MARKERS = (
+    "recursive",
+    "nesting",
+    "too deep",
+    "maximum depth",
+    "invalid_request_error",
+    "invalid schema",
+    "additional properties",
+    "unknown function",
+    "unknown tool",
+    "invalid tool",
+    "invalid function",
+    "unsupported",
+    "not supported",
+    "context length",
+    "context_length",
+    "token limit",
+    "maximum context",
+)
+
+
+def _is_non_retryable_400(detail: Any) -> bool:
+    """True bila detail 400 = salah payload (retry ke target lain sia-sia)."""
+    try:
+        if not detail or not isinstance(detail, str):
+            return False
+        lowered = detail.lower()
+        if "encrypted_content" in lowered:
+            return False
+        return any(marker in lowered for marker in _NON_RETRYABLE_400_MARKERS)
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _dump_fatal_400(model: Any, payload: Any, status: Any, raw_body: Any) -> str:
+    """Simpan wire `tools` + body upstream lengkap ke file bounded (overwrite).
+
+    Dipakai saat FATAL-400: pesan provider di log terpotong (echo skema bisa
+    puluhan KB) sehingga aturan penolakan persisnya tak terlihat. File
+    `<tmp>/sinug-fatal-400.json` ditimpa tiap kejadian (bounded, bukan append)
+    berisi wire tools persis yang dikirim + body upstream utuh (cap 1MB
+    per sisi). Return path atau ''. Tak pernah melempar.
+    """
+    try:
+        import json as _json
+        import os as _os
+        import tempfile as _tf
+        import time as _time
+        tools = payload.get("tools") if isinstance(payload, dict) else None
+        try:
+            wire_str = _json.dumps(tools, ensure_ascii=False)
+        except (TypeError, ValueError):
+            wire_str = "<unserializable>"
+        try:
+            if isinstance(raw_body, (bytes, bytearray)):
+                up_str = bytes(raw_body).decode("utf-8", "replace")
+            else:
+                up_str = str(raw_body)
+        except (TypeError, ValueError, AttributeError):
+            up_str = "<undecodable>"
+        try:
+            wire_obj: Any = _json.loads(wire_str)
+        except (TypeError, ValueError):
+            wire_obj = wire_str[:1000000]
+        if isinstance(wire_str, str) and len(wire_str) > 1000000:
+            try:
+                wire_obj = _json.loads(wire_str[:1000000])
+            except (TypeError, ValueError):
+                wire_obj = wire_str[:1000000]
+        doc = {
+            "ts": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "model": model if isinstance(model, str) else str(model),
+            "upstream_status": status,
+            "wire_tools": wire_obj,
+            "upstream_body": up_str[:1000000],
+        }
+        path = _os.path.join(_tf.gettempdir(), "sinug-fatal-400.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            _json.dump(doc, fh, ensure_ascii=False)
+        return path
+    except (OSError, TypeError, ValueError):
+        return ""

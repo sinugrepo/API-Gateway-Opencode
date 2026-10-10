@@ -31,7 +31,7 @@ from app.core.config import (
 from app.core.errors import TimeoutError_, UpstreamEmptyResponse, UpstreamError
 from app.core.http_client import _get_http, _pick_http_client
 from app.core.logging_utils import _log
-from app.services.opencode import _fresh_request_headers, _fresh_retry_targets, _oc_session_tag
+from app.services.opencode import _dump_fatal_400, _fresh_request_headers, _fresh_retry_targets, _is_non_retryable_400, _oc_session_tag
 from app.services.relay import (
     _is_relay_timeout,
     _limit_stream_targets,
@@ -403,9 +403,18 @@ def _chat_messages_to_responses_input(
 def _chat_tools_to_responses_tools(
     tools: Optional[List[Dict[str, Any]]],
 ) -> Optional[List[Dict[str, Any]]]:
-    """Konversi chat tools -> Responses tools (keduanya skema function)."""
+    """Konversi chat/MCP tools -> Responses tools (keduanya skema function).
+
+    Menerima `parameters` (OpenAI) maupun `inputSchema`/`input_schema` (MCP);
+    `strict` dipertahankan bila ada.
+    """
     if not tools:
         return None
+    try:
+        from app.services.opencode import normalize_responses_tools
+        return normalize_responses_tools(tools)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
     converted: List[Dict[str, Any]] = []
     for tool in tools:
         if not isinstance(tool, dict):
@@ -417,16 +426,40 @@ def _chat_tools_to_responses_tools(
                 entry["name"] = function["name"]
             if function.get("description"):
                 entry["description"] = function["description"]
-            if function.get("parameters") is not None:
-                entry["parameters"] = function["parameters"]
+            _schema = function.get("parameters")
+            if not isinstance(_schema, dict):
+                for _alias in ("inputSchema", "input_schema"):
+                    _cand = function.get(_alias)
+                    if isinstance(_cand, dict):
+                        _schema = _cand
+                        break
+                if not isinstance(_schema, dict):
+                    _cand = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else tool.get("input_schema")
+                    if isinstance(_cand, dict):
+                        _schema = _cand
+            if _schema is not None:
+                entry["parameters"] = _schema
+            if isinstance(function.get("strict"), bool):
+                entry["strict"] = function["strict"]
+            elif isinstance(tool.get("strict"), bool):
+                entry["strict"] = tool["strict"]
             if entry.get("name"):
                 converted.append(entry)
         elif tool.get("name"):
             entry = {"type": "function", "name": tool["name"]}
             if tool.get("description"):
                 entry["description"] = tool["description"]
-            if tool.get("parameters") is not None:
-                entry["parameters"] = tool["parameters"]
+            _schema = tool.get("parameters")
+            if not isinstance(_schema, dict):
+                for _alias in ("inputSchema", "input_schema"):
+                    _cand = tool.get(_alias)
+                    if isinstance(_cand, dict):
+                        _schema = _cand
+                        break
+            if _schema is not None:
+                entry["parameters"] = _schema
+            if isinstance(tool.get("strict"), bool):
+                entry["strict"] = tool["strict"]
             converted.append(entry)
     return converted or None
 
@@ -869,7 +902,10 @@ async def responses_stream_generator(
                         if response.status_code != 200:
                             try:
                                 body = await response.aread()
-                                detail = body.decode("utf-8", errors="replace")[:500]
+                                # 2000 char: pesan provider (termasuk echo
+                                # skema yang ditolak) harus utuh sampai ke
+                                # klien/log FATAL agar iterasi debug cepat.
+                                detail = body.decode("utf-8", errors="replace")[:2000]
                             except Exception:  # noqa: BLE001
                                 detail = ""
                             # AUTO-HEAL: penolakan replay encrypted_content tidak
@@ -989,6 +1025,23 @@ async def responses_stream_generator(
                                     f"FORBIDDEN PROXY {target_url} | upstream 403 "
                                     f"(proxy SEHAT, egress IP di-flag — bukan salah proxy)",
                                 )
+                            if (
+                                response.status_code == 400
+                                and not sent_first_byte
+                                and _is_non_retryable_400(detail)
+                            ):
+                                # 400 payload-error (skema rekursif MCP, schema
+                                # invalid, ...): gagal di SEMUA egress — fail-fast
+                                # tanpa membakar 13 attempt x ~2 dtk. Bukan
+                                # penolakan encrypted_content (punya auto-heal).
+                                _dump_path = _dump_fatal_400(client_model, payload, 400, body)
+                                _log(
+                                    "RESP",
+                                    f"FATAL-400 {target_url} | payload ditolak upstream "
+                                    f"({detail[:500]!r}) tail=({detail[-300:]!r}) "
+                                    f"dump={_dump_path or '-'} -> fail-fast, tanpa rotasi target lain",
+                                )
+                                break
                             target_index += 1
                             _log(
                                 "RESP",
@@ -1256,6 +1309,23 @@ async def responses_stream_generator(
 
         if not stream_completed:
             log_summary("all-failed")
+            # Event error gaya Responses API (`type: "error"`) DIDAHULUKAN
+            # agar klien Responses ketat (Kilo Code validasi zod tiap event):
+            # chunk `{"error": ...}` warisan di bawah BUKAN event Responses
+            # valid dan membuat Kilo melempar UnknownError tanpa pesan.
+            # Kolektor internal (collect_responses_object) mengabaikan event
+            # ini (tanpa key `error`) lalu tetap raise dari chunk warisan.
+            try:
+                if last_rate_limited:
+                    _compat_msg = (
+                        "Upstream rate limited (429)"
+                        f", retry in {(last_retry_after or RATE_LIMIT_BACKOFF):.0f}s"
+                    )
+                else:
+                    _compat_msg = f"Upstream request failed: {(last_error or 'unknown error')[:300]}"
+            except (TypeError, ValueError, AttributeError):
+                _compat_msg = "Upstream request failed"
+            yield _sse({"type": "error", "sequence_number": 0, "message": _compat_msg})
             if last_rate_limited:
                 yield _sse(
                     {
@@ -1532,7 +1602,7 @@ async def responses_to_chat_stream_generator(
                         if response.status_code != 200:
                             try:
                                 body = await response.aread()
-                                detail = body.decode("utf-8", errors="replace")[:500]
+                                detail = body.decode("utf-8", errors="replace")[:2000]
                             except Exception:  # noqa: BLE001
                                 detail = ""
                             if is_relay and _is_relay_timeout(response):
@@ -1625,6 +1695,23 @@ async def responses_to_chat_stream_generator(
                                     f"FORBIDDEN PROXY {target_url} | upstream 403 "
                                     f"(proxy SEHAT, egress IP di-flag — bukan salah proxy)",
                                 )
+                            if (
+                                response.status_code == 400
+                                and not sent_payload
+                                and _is_non_retryable_400(detail)
+                            ):
+                                # Fail-fast 400 payload-error (lihat
+                                # responses_stream_generator): tanpa ini request
+                                # buruk merotasi semua target sia-sia.
+                                _dump_path = _dump_fatal_400(client_model, payload, 400, body)
+                                _log(
+                                    "RESP",
+                                    f"FATAL-400 {target_url} (bridge) | payload ditolak "
+                                    f"upstream ({detail[:500]!r}) tail=({detail[-300:]!r}) "
+                                    f"dump={_dump_path or '-'} -> fail-fast, "
+                                    f"tanpa rotasi target lain",
+                                )
+                                break
                             target_index += 1
                             _log(
                                 "RESP",

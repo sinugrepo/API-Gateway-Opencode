@@ -10,7 +10,8 @@ Cakupan (offline kecuali G yang memakai warp-socks lokal bila ada):
   D. round-robin + cooldown (sehat dulu, penalized cadangan)
   E. expand_targets_with_proxy (relay tak tersentuh, direct disisip proxy)
   F. _fresh_retry_targets tahan 3-tuple (regresi forbidden-retry)
-  G. LIVE lokal: socks5h://127.0.0.1:40001 -> ipify 200 (skip bila tutup)
+  G. LIVE lokal: socks5h://127.0.0.1:40001 -> api64.ipify.org 200 via IPv6 (skip bila tutup)
+   H. OFFLINE: detect_ip_version (v4/v6/invalid) + _parse_cf_trace (warp/ip)
 """
 import asyncio
 import os
@@ -225,7 +226,7 @@ def _f1():
     assert new_targets[1][2] == "socks5h://127.0.0.1:40001"
 
 
-@case("G1 LIVE lokal warp-socks 40001 -> ipify 200 (skip bila tutup)")
+@case("G1 LIVE lokal warp-socks 40001 -> api64 200 IPv6 (skip bila tutup)")
 def _g1():
     import socket
     s = socket.socket()
@@ -244,6 +245,28 @@ def _g1():
     res = asyncio.run(test_proxy_connection("socks5h://127.0.0.1:40001", timeout=10))
     assert res.get("ok") is True, res
     assert res.get("ip"), res
+    # WARP V6ONLY -> api64 HARUS IPv6 unik; IPv4 berarti container belum V6ONLY
+    # (shared anycast 104.28.x.x, bukan bug gateway). Tes hanya memastikan
+    # gateway MEMAKAI jalur IPv6-capable (api64), bukan api.ipify.org v4-only.
+    assert res.get("ip_version") in (4, 6), res
+    print(f"    (live: ip={res.get('ip')} v{res.get('ip_version')} warp={res.get('warp')})")
+    if res.get("ip_version") == 4:
+        print("    (peringatan: egress IPv4 = shared WARP gratis; aktifkan V6ONLY di container)")
+
+
+@case("H1 detect_ip_version + _parse_cf_trace offline")
+def _h1():
+    from app.services.outbound_proxy import detect_ip_version, _parse_cf_trace
+    assert detect_ip_version("2a09:bac5::99") == 6
+    assert detect_ip_version("104.28.10.20") == 4
+    assert detect_ip_version("") is None
+    assert detect_ip_version(None) is None
+    assert detect_ip_version("bukan-ip") is None
+    p = _parse_cf_trace("fl=1\nip=2a09:bac5::99\nwarp=on\n")
+    assert p == {"warp": "on", "ip": "2a09:bac5::99"}, p
+    q = _parse_cf_trace("ip=104.28.10.20\nwarp=off\n")
+    assert q == {"warp": "off", "ip": "104.28.10.20"}, q
+    assert _parse_cf_trace("") == {"warp": None, "ip": None}
 
 
 def main() -> int:

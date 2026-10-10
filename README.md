@@ -33,6 +33,10 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
   Matikan relay untuk mode proxy/direct murni; matikan fallback untuk relay-only.
 - Outbound proxy: pool SOCKS5/HTTP untuk request DIRECT (round-robin per-request,
   relay tidak pernah lewat proxy; kosong = no-op, perilaku lama dipertahankan).
+  Verifikasi via `api64.ipify.org` (IPv6, unik per node WARP V6ONLY) + trace
+  `warp=on`; `api.ipify.org` itu IPv4-only (shared `104.28.x.x` sama di semua
+  node WARP gratis — bukan bug, jangan dipakai menilai variasi IP). `socks5h`
+  wajib (DNS via proxy agar AAAA ter-resolve di dalam container warp).
   Dikelola via website (`proxies.json`; password tidak pernah dikembalikan ke UI).
   Status per-proxy: `READY` / `DOWN` (transport gagal) / `FLAGGED` (egress IP
   ditolak upstream 403 — proxy SEHAT/test OK, yang di-flag IP-nya). Blip transport
@@ -60,6 +64,49 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
   token/request, Recent Requests + Live Logs SSE, status egress ringkas, hasil
   probe relay — read-only), **Konfigurasi** (egress + preview rute, pool relay,
   pool proxy, ScanGuard, snapshot konfigurasi efektif), **Uji Model**.
+- MCP Server (Streamable HTTP): `POST /mcp` (JSON-RPC `initialize` /
+  `tools/list` / `tools/call`, single + batch, notifikasi → 202),
+  `GET /mcp` discovery, `DELETE /mcp` no-op stateless, plus SSE legacy
+  `GET /sse` + `POST /messages`. Tools: `chat` (semua model, muse-spark
+  auto-bridge), `responses` (native spark/gpt/grok, reverse-bridge model lain),
+  `list_models`, `gateway_props`. Auth sama seperti `/v1/*`.
+- MCP tool passthrough: tools gaya MCP (`inputSchema`) dinormalisasi ke
+  OpenAI (`parameters`) di `/v1/chat/completions` + `/v1/responses`
+  (dua arah bridge, `strict` dipertahankan) — MCP servers di `opencode.json`
+  tetap jalan termasuk via muse-spark. `tool_choice` tetap dikoersi `auto`
+  (batasan provider Console).
+- Skema rekursif MCP (`$ref` siklik gaya Pydantic, termasuk mutual A↔B)
+  diputus otomatis sebelum wire (`{"type": "object"}`) karena provider
+  Console menolaknya dengan 400 `Recursive JSON schemas are not currently
+  supported`; `$ref` non-siklik dipertahankan utuh.
+- Skema terlalu dalam (>10 level nesting, umum di tools MCP auto-generate)
+  dipadatkan otomatis di bawah limit provider (400 `maximum nesting depth`),
+  dengan `type` asal dipertahankan; skema tulisan-tangan (2-4 level) tak
+  tersentuh.
+- `additionalProperties` dalam bentuk apa pun (bool `false` maupun dict
+  ber-skema — provider menolak key-nya, live: `analysis_profile` via spark)
+  di-drop otomatis (400 `Invalid JSON schema`); `required` asli yang
+  non-kosong (`required: []` ikut di-drop) dan `type` yang hilang
+  (`properties`→object, `items`→array) dilengkapi tanpa mengubah makna.
+- Error SSE `/v1/responses` kini diawali event Responses-valid
+  `{"type":"error","sequence_number":0,"message":...}` agar klien ketat
+  (Kilo Code) menampilkan pesan alih-alih `UnknownError`;
+  chunk `{"error":...}` warisan tetap dikirim untuk kolektor internal.
+- Log `FATAL-400` mencetak 500 char pertama + 300 char terakhir detail
+  (bukan 200) agar pesan provider penuh terlihat untuk iterasi berikutnya,
+  plus black-box recorder: wire `tools` persis yang dikirim + body upstream
+  utuh tersimpan di `/tmp/sinug-fatal-400.json` (overwrite tiap kejadian)
+  untuk diagnosis presisi tanpa menebak.
+- Fail-fast 400 payload-error: 400 yang jelas salah payload (skema rekursif,
+  schema invalid, tool tak dikenal, konteks kepanjangan) langsung dikembalikan
+  tanpa merotasi 13 target (~25 dtk sia-sia + menandai proxy/relay sehat
+  sebagai rusak). 400 replay `encrypted_content` tetap lewat auto-heal.
+- Wire `/v1/responses` direct kini selengkap wire bridge yang terbukti lolos:
+  `prompt_cache_key` stabil disintesis bila klien tidak mengirim (bagian
+  fingerprint gate §8 `opencode-session.md`), `max_output_tokens` default
+  65536, `temperature`/`top_p` null di-drop, dan tools MCP (`inputSchema` /
+  bentuk chat) dinormalisasi ke flat responses ber-`parameters` — request
+  MCP tidak lagi 403 FreeTier sementara request biasa lolos.
 
 ## Syarat
 
@@ -147,6 +194,35 @@ Inferensi:
 - `GET /v1/usage?period=today|3h|6h|1d|7d|30d` atau `?start=YYYY-MM-DD&end=YYYY-MM-DD`,
   `GET /v1/usage/periods`
 
+MCP (auth sama seperti `/v1/*` bila `GATEWAY_API_KEYS` diisi):
+
+- `POST /mcp` — Streamable HTTP JSON-RPC (`initialize` →
+  `notifications/initialized` → `tools/list` → `tools/call`).
+- `GET /mcp` — discovery (info server + daftar tools).
+- `DELETE /mcp` — terminasi sesi (stateless: selalu OK).
+- `GET /sse` + `POST /messages` — transport SSE legacy (klien MCP lama).
+- `GET /.well-known/mcp` — discovery alternatif.
+
+Contoh `opencode.json` (remote MCP + provider gateway):
+
+```json
+{
+  "provider": {
+    "sinug": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8000/v1", "apiKey": "sk-gateway-anda" }
+    }
+  },
+  "mcp": {
+    "sinug-gateway": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": { "Authorization": "Bearer sk-gateway-anda" }
+    }
+  }
+}
+```
+
 Monitor (cookie `monitor_token`, 24 jam):
 
 - Halaman: `GET /monitor/login`, `POST /monitor/login`, `GET /monitor`,
@@ -200,13 +276,15 @@ app/services/            # relay (+ relay_store: pool & egress runtime),
                          # chat_bridge (reverse bridge), opencode,
                          # models_cache, model_context, model_endpoints,
                          # tools_dsml, usage
-app/routes/              # chat, responses_api, misc, usage_routes, monitor
+app/routes/              # chat, responses_api, misc, usage_routes, monitor, mcp
 app/web/templates/       # login.html, dashboard.html (vanilla, tanpa build;
-                         # 3 view: Monitoring / Konfigurasi / Uji Model)
+                          # 3 view: Monitoring / Konfigurasi / Uji Model)
 test/                    # test_long_stream_fixes.py, test_live_requests.py,
-                         # test_reverse_bridge.py, test_forbidden_fresh_retry.py,
-                         # test_direct_first_slow.py, test_output_item_done.py,
-                         # test_tool_choice_coerce.py, test_outbound_proxy.py
+                          # test_reverse_bridge.py, test_forbidden_fresh_retry.py,
+                          # test_direct_first_slow.py, test_output_item_done.py,
+                          # test_tool_choice_coerce.py, test_outbound_proxy.py,
+                          # test_mcp.py (offline, 43 case: normalisasi
+                          # inputSchema + sanitizer rekursi + JSON-RPC + HTTP layer)
 plans/                   # docs lokal, di-gitignore
 usage.db*                # runtime SQLite, di-gitignore
 proxies.json             # pool proxy website, di-gitignore
@@ -217,6 +295,7 @@ relays.json              # pool relay + egress website, di-gitignore
 
 ```bash
 python -m compileall -q app main.py test
+python test/test_mcp.py   # offline, 43 case (MCP server + passthrough + sanitizer + paritas + depth + strict + Kilo-compat + recorder)
 python test/test_outbound_proxy.py   # offline, 8 case (pool proxy + flap/flag + expand)
 python test/test_long_stream_fixes.py   # offline, 34 case, harus ALL PASSED
 python test/test_reverse_bridge.py      # offline, 15 case (routing endpoint + reverse bridge)
