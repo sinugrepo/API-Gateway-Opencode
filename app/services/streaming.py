@@ -13,6 +13,7 @@ from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 from app.core.config import (
     API_KEY,
     BRIDGE_REQUEST_TIMEOUT,
+    FORBIDDEN_EARLY_FRESH_AFTER,
     FORBIDDEN_FRESH_SESSION_RETRY,
     FORBIDDEN_RETRY_DELAY,
     HERMES_COMPAT,
@@ -287,6 +288,29 @@ async def stream_generator(
         while True:
             target_index = 0
             while target_index < len(targets):
+                # EARLY-FRESH: N 403 beruntun tanpa kegagalan lain = sesi yang
+                # di-flag (bukan egress). Jangan bakar sisa proxy/relay sesi-lama;
+                # putus loop dalam agar fase fresh-session langsung jalan.
+                # Menghemat ~10 attempt sia-sia + menghindari penandaan FLAGGED
+                # pada proxy/relay SEHAT yang belum dicoba.
+                if (
+                    FORBIDDEN_FRESH_SESSION_RETRY
+                    and not fresh_session_retry_done
+                    and not sent_payload
+                    and not saw_non_403_failure
+                    and FORBIDDEN_EARLY_FRESH_AFTER > 0
+                    and forbidden_count >= FORBIDDEN_EARLY_FRESH_AFTER
+                    and target_index > 0
+                    and target_index < len(targets)
+                ):
+                    _log(
+                        "STREAM",
+                        f"EARLY-FRESH-SESSION model={client_model} "
+                        f"{forbidden_count}x403 beruntun -> potong sisa "
+                        f"{len(targets) - target_index} target sesi-lama, "
+                        f"langsung coba sesi baru",
+                    )
+                    break
                 try:
                     from app.services.outbound_proxy import unpack_target as _unpack
                     target_url, headers, proxy_url = _unpack(targets[target_index])

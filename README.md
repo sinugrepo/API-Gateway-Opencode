@@ -48,8 +48,8 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
 - Free-tier 403: relay yang kena 403 di-cooldown 300 dtk; bila SEMUA target
   (termasuk direct) 403 pra-payload — yang di-flag identitas request, bukan
   IP — rotasi PENUH sekali lagi dengan SATU pasangan (session,
-  prompt_cache_key) baru yang konsisten (`FORBIDDEN_FRESH_SESSION_RETRY`,
-  `FORBIDDEN_RETRY_DELAY`), kecuali payload membawa replay `encrypted_content`
+   prompt_cache_key) baru yang konsisten (`FORBIDDEN_FRESH_SESSION_RETRY`,
+  `FORBIDDEN_RETRY_DELAY`, `FORBIDDEN_EARLY_FRESH_AFTER`), kecuali payload membawa replay `encrypted_content`
   (identitas wajib stabil). Fingerprint §8 opencode-session.md ditegakkan di
   semua jalur (kuartet tools, stream:true, store:false, key stabil, xhigh).
 - Streaming stabil: `Accept-Encoding: identity`, SSE keepalive 5 dtk,
@@ -165,6 +165,7 @@ contoh siap salin di `.env.example`. Environment yang sudah ada menang atas `.en
 | `RESPONSES_REVERSE_BRIDGE` | `true` | `false` = model non-Responses via `/v1/responses` ditolak 400 bersih (tanpa bridge balik) |
 | `FORBIDDEN_FRESH_SESSION_RETRY` | `true` | `false` = matikan upaya terakhir sesi-baru saat semua target 403 |
 | `FORBIDDEN_RETRY_DELAY` | `2.0` | Jeda (dtk) sebelum upaya terakhir sesi-baru |
+| `FORBIDDEN_EARLY_FRESH_AFTER` | `3` | N 403 beruntun -> langsung sesi-baru tanpa menghabiskan sisa proxy (`0` = matikan, sapu penuh dulu) |
 | `DIRECT_FIRST_SLOW` | `false` | DEPRECATED no-op: relay-first selalu untuk non-vision; vision tetap direct-first |
 | `PORT` / `RELOAD` | `8000` / `false` | Server |
 

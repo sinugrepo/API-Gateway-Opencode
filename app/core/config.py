@@ -380,6 +380,25 @@ FORBIDDEN_FRESH_SESSION_RETRY = os.getenv("FORBIDDEN_FRESH_SESSION_RETRY", "true
 FORBIDDEN_RETRY_DELAY = float(os.getenv("FORBIDDEN_RETRY_DELAY", "2.0"))
 
 
+# Potong loop proxy/relay lebih awal bila sesi yang di-flag (bukan egress).
+# Bila N attempt pertama SEMUANYA 403 FreeTierError tanpa kegagalan lain,
+# sisa target sesi-lama TIDAK dicoba lagi — langsung masuk fase fresh-session
+# (sesi + prompt_cache_key baru, rotasi penuh). Menghemat ~N detik loop sia-sia
+# seperti di log (10 proxy 403 beruntun -> fresh baru sukses di attempt-1).
+# Tanpa ini, 1 sesi basi membakar 13 attempt x ~2 dtk + menandai proxy/relay
+# SEHAT sebagai FLAGGED. 0/nonpositif = matikan (perilaku lama: sapu penuh
+# dulu baru fresh). Dilewati bila payload membawa replay encrypted_content.
+def _parse_forbidden_early_after() -> int:
+    try:
+        value = int(os.getenv("FORBIDDEN_EARLY_FRESH_AFTER", "3"))
+    except (TypeError, ValueError):
+        return 3
+    return value
+
+
+FORBIDDEN_EARLY_FRESH_AFTER = _parse_forbidden_early_after()
+
+
 # DEPRECATED (no-op): dulu direct-first untuk thinking xhigh / giant bila
 # `true`. Kebijakan kini RELAY-FIRST selalu untuk non-vision: direct hanya
 # fallback terakhir setelah SEMUA relay gagal, agar IP ter-masking dan rotasi
