@@ -11,7 +11,9 @@ Aturan pakai (§7): session STABIL 1 ID per conversation (cache affinity),
 request UNIK per message, project=global, client=cli.
 """
 import hashlib
+import json
 import os
+import re
 import secrets
 import struct
 import threading
@@ -24,11 +26,14 @@ from app.core.config import OPENCODE_CLIENT_NAME, OPENCODE_PROJECT, OPENCODE_SES
 
 _BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-# User-Agent persis CLI opencode asli (dari capture request nyata + doc §5).
-# Bisa dioverride via env bila CLI upstream diupdate.
+# User-Agent ala CLI opencode v2 (bisa dioverride via env).
+# Gate upstream v2 (live-bisect 2026-10-14, endpoint /inference/v1/*):
+# UA WAJIB bentuk `opencode/<channel>/<version>/<client>` — UA gaya lama
+# `opencode/1.19.0` (tanpa channel/client) berisiko ditolak. Default
+# `opencode/latest/2.0.26/cli` = nilai terbukti lolos gate.
 OPENCODE_USER_AGENT = os.getenv(
     "OPENCODE_USER_AGENT",
-    "opencode/1.18.35 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+    "opencode/latest/2.0.26/cli",
 )
 
 
@@ -59,20 +64,27 @@ def _new_opencode_request_id() -> str:
 def _opencode_cli_headers(
     *,
     session_id: Optional[str] = None,
-    request_id: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Bangun header identitas CLI + User-Agent ala CLI asli.
+    """Bangun header identitas CLI v2 + User-Agent ala CLI asli.
 
-    User-Agent disamakan dengan CLI opencode asli (`opencode-session.md` §5)
-    agar fingerprint caller upstream konsisten — UA
-    python-httpx bawaan justru menandai request ini BUKAN CLI (rawan
-    ditolak free tier dengan FreeTierError).
+    Gate upstream /inference/v1/* (live-bisect 2026-10-14):
+    - `x-opencode-session` DAN `x-opencode-session-id` WAJIB dua-duanya
+      (salah satu saja -> 403 FreeTierError). Nilainya sama.
+    - `x-opencode-request` TIDAK BOLEH dikirim sama sekali (ada value ->
+      403 FreeTierError) — dulu CLI v1 mengunggulnya, v2 menolaknya.
+    - `x-session-affinity` / `x-session-id` mirror tambahan (tidak dicek,
+    dikirim untuk kompatibilitas kedua varian header CLI).
+    - `x-opencode-client` / `x-opencode-project` tidak dicek, dikirim apa
+      adanya untuk menyerupai CLI.
     """
+    session = session_id or OPENCODE_SESSION_ID or _new_opencode_session_id()
     return {
         "x-opencode-client": OPENCODE_CLIENT_NAME,
         "x-opencode-project": OPENCODE_PROJECT,
-        "x-opencode-session": session_id or OPENCODE_SESSION_ID or _new_opencode_session_id(),
-        "x-opencode-request": request_id or _new_opencode_request_id(),
+        "x-opencode-session": session,
+        "x-opencode-session-id": session,
+        "x-session-affinity": session,
+        "x-session-id": session,
         "User-Agent": OPENCODE_USER_AGENT,
     }
 
@@ -302,9 +314,17 @@ def _stable_opencode_session(payload: Any = None) -> str:
 def _resolve_opencode_headers(incoming: Any = None) -> Dict[str, str]:
     """Tentukan header identitas untuk satu request klien.
 
-    Header yang sudah dikirim klien (Hermes baru dsb.) dipakai apa adanya;
-    yang hilang diisi ala CLI. Hasilnya dipakai untuk SEMUA upstream attempt
-    dalam request ini agar sesi stabil lintas retry relay/direct.
+    Header yang sudah dikirim klien (Hermes baru dsb.) dipakai apa adanya
+    BILA formatnya valid; yang hilang diisi ala CLI. Hasilnya dipakai untuk
+    SEMUA upstream attempt dalam request ini agar sesi stabil lintas retry
+    relay/direct.
+
+    Catatan v2 (2026-10-14):
+    - `x-opencode-request` dari klien TIDAK diteruskan — upstream /inference
+      menolak request apapun yang membawanya (403 FreeTierError).
+    - Sesi klien hanya dipakai bila lolos `_is_valid_opencode_id` (12 hex
+      timestamp + 14 base62); nilai di luar format itu bertrigger 403 di
+      /inference sehingga diganti sesi timestamp-valid buatan proxy.
     """
     def _get(name: str) -> str:
         value = None
@@ -330,17 +350,16 @@ def _resolve_opencode_headers(incoming: Any = None) -> Dict[str, str]:
         return (value or "").strip() if isinstance(value, str) else ""
 
     session = _get("x-opencode-session")
-    req_id = _get("x-opencode-request")
-    headers = _opencode_cli_headers(
-        session_id=session or None,
-        request_id=req_id or None,
-    )
+    if session and not _is_valid_opencode_id(session, "ses_"):
+        session = ""
+    headers = _opencode_cli_headers(session_id=session or None)
     client = _get("x-opencode-client")
     if client:
         headers["x-opencode-client"] = client
     project = _get("x-opencode-project")
     if project:
         headers["x-opencode-project"] = project
+    # x-opencode-request sengaja TIDAK diteruskan (gate v2: header itu = 403).
     return headers
 
 
@@ -354,34 +373,39 @@ def _oc_session_tag(headers: Optional[Dict[str, str]]) -> str:
 
 
 def _fresh_request_headers(base: Optional[Dict[str, str]]) -> Dict[str, str]:
-    """Salinan headers dengan `x-opencode-request` baru yang unik.
+    """Salinan headers yang DIJAMIN tanpa `x-opencode-request`.
 
-    Dipakai per upstream attempt (tiap rotasi relay + fallback direct):
-    CLI asli mengirim `msg_...` unik per POST, dan memakai ulang satu
-    request ID di semua attempt terlihat seperti replay di sisi upstream.
-    Sesi (`x-opencode-session`) sengaja TIDAK diubah agar affinity cache
+    Gate v2 (2026-10-14): upstream /inference menolak request bernilai
+    `x-opencode-request` apapun dengan 403 FreeTierError, jadi header itu
+    dibuang (termasuk bila base membawanya dari klien). Sesi
+    (`x-opencode-session` + mirror) sengaja TIDAK diubah agar affinity cache
     + issuance encrypted_content tetap stabil dalam satu request klien.
     """
     headers = dict(base or {})
-    headers["x-opencode-request"] = _new_opencode_request_id()
+    headers.pop("x-opencode-request", None)
     return headers
 
 
 def _fresh_identity_headers(base: Optional[Dict[str, str]]) -> Dict[str, str]:
-    """Salinan headers dengan session DAN request ID yang sepenuhnya baru.
+    """Salinan headers dengan session ID yang sepenuhnya baru.
 
     HANYA untuk upaya terakhir fresh-session (semua target 403 termasuk
     direct): bila identitas lama yang di-flag upstream, identitas baru
     memberi peluang lolos. Format tetap valid ala CLI
-    (`ses_`/`msg_` + 12 hex + 14 base62); header lain (client, project,
+    (`ses_` + 12 hex timestamp + 14 base62); header lain (client, project,
     User-Agent) dipertahankan agar fingerprint caller tetap konsisten.
+    `x-opencode-request` DIHAPUS (gate v2: header itu = 403).
     JANGAN dipakai untuk retry biasa — sesi stabil per-percakapan adalah
     syarat cache affinity + issuance encrypted_content (lihat
     `_stable_opencode_session`).
     """
     headers = dict(base or {})
-    headers["x-opencode-session"] = _new_opencode_session_id()
-    headers["x-opencode-request"] = _new_opencode_request_id()
+    fresh = _new_opencode_session_id()
+    headers["x-opencode-session"] = fresh
+    headers["x-opencode-session-id"] = fresh
+    headers["x-session-affinity"] = fresh
+    headers["x-session-id"] = fresh
+    headers.pop("x-opencode-request", None)
     return headers
 
 
@@ -429,7 +453,10 @@ def _fresh_retry_targets(
             continue
         fresh_headers = dict(headers or {})
         fresh_headers["x-opencode-session"] = fresh_session
-        fresh_headers["x-opencode-request"] = _new_opencode_request_id()
+        fresh_headers["x-opencode-session-id"] = fresh_session
+        fresh_headers["x-session-affinity"] = fresh_session
+        fresh_headers["x-session-id"] = fresh_session
+        fresh_headers.pop("x-opencode-request", None)
         if proxy_url:
             new_targets.append((url, fresh_headers, proxy_url))
         else:
@@ -439,16 +466,239 @@ def _fresh_retry_targets(
     return new_targets, fresh_session, fresh_key
 
 
-# ── Free-tier client fingerprint gates ( diverifikasi live 2026-09-18 ) ──
-# Upstream Zen menolak request free-tier dengan 403 FreeTierError bila salah
-# satu gate tidak terpenuhi (lihat `fix opencode.ts`):
-#   1. stream:true (stream:false / hilang -> 403, chat MAUPUN responses).
-#   2. Kuartet tools bawaan OpenCode [bash, glob, grep, read] hadir di body.
+# ── Free-tier client fingerprint gates (gate v2, diverifikasi live 2026-10-14) ──
+# Upstream /inference/v1/* menolak request free-tier dengan 403 FreeTierError
+# bila salah satu gate tidak terpenuhi (live-bisect terhadap CLI v2.0.26):
+#   1. Endpoint: /zen/v1/* MATI — semua free request di sana 403 blanket.
+#   2. User-Agent bentuk `opencode/<channel>/<version>/<client>`
+#      (mis. `opencode/latest/2.0.26/cli`).
+#   3. Header sesi: `x-opencode-session` DAN `x-opencode-session-id`
+#      (salah satu saja -> 403); `x-opencode-request` ADA NILAI -> 403.
+#   4. Body: `stream:true` WAJIB (chat maupun responses).
+#   5. Tools: definisi KANONIK OpenCode `read` + `shell` (deskripsi + schema
+#      PERSIS) WAJIB hadir — stub (nama saja / parameters kosong / deskripsi
+#      palsu) ditolak 403. Nama lain (bash/glob/grep/read stubs) sudah tidak
+#      cukup.
 # Bentuk tools berbeda per API: chat memakai bungkus
 # {"type":"function","function":{...}}, responses memakai flat
 # {"type":"function","name":...}. Klien (Hermes dsb.) jarang mengirim tools
 # ini, jadi proxy menyuntikkannya agar terlihat seperti OpenCode CLI.
-OPENCODE_FINGERPRINT_TOOLS = ("bash", "glob", "grep", "read")
+OPENCODE_FINGERPRINT_TOOLS = ("read", "shell")
+
+# Definisi kanonik VERBATIM dari source resmi opencode v2.0.26
+# (packages/core/src/tool/plugin/read.ts + shell.ts). Schema mengikuti
+# Effect Schema -> JSON Schema: optional key tidak masuk `required`.
+_OPENCODE_CANONICAL_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
+    "read": {
+        "description": (
+            "Read the contents of a file or directory. Supports text files, images, and PDFs. "
+            "Images and PDFs are presented directly to the model. Each text line is prefixed by "
+            "its 1-based line number as <line>: <content>. The prefix is for reference and is not "
+            "part of the file content. Directory entries are returned one per line. Use offset and "
+            "limit to read large files or directories in sections. Prefer one larger read over "
+            "many small slices, and use grep to find specific content in large files."
+        ),
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "File or directory to read",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "The line or directory entry to start reading from (1-based)",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "The maximum number of lines or directory entries to read (defaults to and capped at 2000)",
+            },
+        },
+        "required": ["path"],
+    },
+    "shell": {
+        "description": (
+            "Execute a shell command and return its output. "
+            "Quote file paths containing spaces or special characters. "
+            "Prefer dedicated tools over shell commands when possible. "
+            "When output is large, the full result is saved to a file and a truncated preview is returned. "
+            "Rely on automatic truncation unless filtering the output is more useful. "
+            "Commands accept an optional timeout, background commands have no timeout by default. "
+            "Background commands return immediately, and you will be notified when they complete."
+        ),
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Shell command string to execute",
+            },
+            "workdir": {
+                "type": "string",
+                "description": (
+                    "Working directory to execute the command in. Defaults to the current working "
+                    "directory. When possible, avoid changing directories in the command and set "
+                    "the working directory here instead."
+                ),
+            },
+            "timeout": {
+                "type": "integer",
+                "description": (
+                    "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 "
+                    "for foreground commands. Background commands have no timeout by default."
+                ),
+            },
+            "background": {
+                "type": "boolean",
+                "description": (
+                    "Run the command in the background and return immediately (useful for dev "
+                    "servers and long-running builds). You do not need to use '&' at the end of "
+                    "your command when using this parameter. You will be notified when it "
+                    "completes. DO NOT poll for completion."
+                ),
+            },
+        },
+        "required": ["command"],
+    },
+}
+
+# Catatan sistem yang disisipkan saat tool kanonik read/shell disuntikkan
+# (klien tidak mendeklarasikannya). TANPA catatan ini model benar-benar
+# MEMANGGIL read/shell hasil suntikan (phantom tool calls). Redaksi PENTING
+# (diverifikasi live): frasa "tools are not available" membuat model juga
+# menolak tool milik klien sendiri (Read/Bash); "placeholders ... use the
+# other tools you have been given" membuat tool klien tetap jalan (0 phantom).
+_OPENCODE_PLACEHOLDER_TOOLS_NOTE = (
+    "The read and shell tools in this conversation are placeholders provided for "
+    "compatibility and cannot be executed. Use the other tools you have been "
+    "given to complete the task."
+)
+
+
+def _canonical_chat_tool(name: str) -> Dict[str, Any]:
+    """Definisi kanonik satu tool (read/shell) dalam bentuk chat (nested)."""
+    spec = _OPENCODE_CANONICAL_TOOL_SPECS[name]
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": spec["description"],
+            "parameters": {
+                "type": "object",
+                "properties": spec["properties"],
+                "required": list(spec["required"]),
+            },
+        },
+    }
+
+
+def _canonical_responses_tool(name: str) -> Dict[str, Any]:
+    """Definisi kanonik satu tool (read/shell) dalam bentuk responses (flat)."""
+    spec = _OPENCODE_CANONICAL_TOOL_SPECS[name]
+    return {
+        "type": "function",
+        "name": name,
+        "description": spec["description"],
+        "parameters": {
+            "type": "object",
+            "properties": spec["properties"],
+            "required": list(spec["required"]),
+        },
+    }
+
+
+def restore_client_tool_name(name: Any) -> Any:
+    """Kembalikan nama tool klien yang di-alias gateway (read_client -> read).
+
+    Gateway meng-alias tool klien yang namanya PERSIS `read`/`shell` menjadi
+    `<name>_client` agar tidak bentrok dengan definisi kanonik yang disuntikkan.
+    Pemulihan diterapkan di sisi respons agar penanganan tool di klien
+    sepenuhnya transparan. Nilai lain diloloskan apa adanya.
+    """
+    if isinstance(name, str) and name in ("read_client", "shell_client"):
+        return name[: -len("_client")]
+    return name
+
+
+def restore_aliased_names_in_response(obj: Any) -> Any:
+    """Pulihkan nama tool ter-alias pada objek/event Responses (in-place).
+
+    Menangani `output[].name` (objek response penuh) dan `item.name` (event
+    `response.output_item.*`). Dipakai jalur passthrough responses mentah agar
+    klien tidak melihat nama alias internal (`read_client`).
+    """
+    if not isinstance(obj, dict):
+        return obj
+    output = obj.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                item["name"] = restore_client_tool_name(item.get("name"))
+    item = obj.get("item")
+    if isinstance(item, dict) and item.get("type") == "function_call":
+        item["name"] = restore_client_tool_name(item.get("name"))
+    return obj
+
+
+def _alias_canonical_tool_conflicts_names(names: Any) -> "tuple[set, bool]":
+    """Hitung nama tool yang bentrok persis dengan kanonik (read/shell)."""
+    conflicts: set = set()
+    if isinstance(names, (list, tuple, set)):
+        for name in names:
+            if isinstance(name, str) and name in OPENCODE_FINGERPRINT_TOOLS:
+                conflicts.add(name)
+    return conflicts, bool(conflicts)
+
+
+def _prepend_placeholder_note(payload: Dict[str, Any], logger_tag: str) -> None:
+    """Sisipkan catatan placeholder di paling depan system prompt payload.
+
+    Chat: prepend `{"role":"system","content":NOTE}` ke `messages`.
+    Responses: prepend item system ke `input` (bila input berupa list;
+    bila string, input dibungkus jadi satu item user lebih dulu? TIDAK —
+    string input dibiarkan, catatan masuk via item system di depan).
+    Idempoten: tidak menambah bila catatan sudah ada.
+    """
+    if not isinstance(payload, dict):
+        return
+    note = _OPENCODE_PLACEHOLDER_TOOLS_NOTE
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "system":
+                content = message.get("content")
+                if isinstance(content, str) and note in content:
+                    return
+        payload["messages"] = [{"role": "system", "content": note}] + messages
+        return
+    items = payload.get("input")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and item.get("role") == "system":
+                content = item.get("content")
+                texts = []
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    texts.extend(
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    )
+                if any(note in text for text in texts):
+                    return
+        payload["input"] = [{"role": "system", "content": note}] + items
+        return
+    if isinstance(items, str):
+        payload["input"] = [
+            {"role": "system", "content": note},
+            {"role": "user", "content": items},
+        ]
+        return
+    # Responses tanpa input sama sekali: sisipkan lewat `instructions`.
+    instructions = payload.get("instructions")
+    if isinstance(instructions, str):
+        if note in instructions:
+            return
+        payload["instructions"] = f"{note}\n\n{instructions}"
+    elif not instructions:
+        payload["instructions"] = note
 
 # Model yang HANYA dilayani lewat Responses API (substring, lowercase).
 OPENCODE_RESPONSES_MODELS = frozenset({
@@ -545,12 +795,34 @@ def normalize_chat_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
     return out or None
 
 
+# Upstream `/zen/v1/responses` WAJIB nama tool hanya `[a-zA-Z0-9_-]`
+# (`^[a-zA-Z0-9_-]+$`). Tools MCP yang namanya mengandung `:` atau `.`
+# (mis. `mcp:fs:read`, `server.getTime`) sebelumnya menyebabkan 400
+# `invalid_request_error` di SEMUA target — request MCP gagal padahal
+# request biasa lolos. Sanitasi: karakter di luar kelas itu -> `_`.
+_RESPONSES_TOOL_NAME_INVALID = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def sanitize_responses_tool_name(name: Any) -> str:
+    """Nama tool yang layak `/zen/v1/responses` (`^[a-zA-Z0-9_-]+$`).
+
+    Karakter di luar kelas diganti `_`; nama kosong menghasilkan `_`.
+    Tidak pernah melempar.
+    """
+    if not isinstance(name, str):
+        return "_"
+    cleaned = _RESPONSES_TOOL_NAME_INVALID.sub("_", name.strip())
+    return cleaned or "_"
+
+
 def normalize_responses_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
     """Normalisasi tools chat/MCP menjadi bentuk flat Responses API.
 
     Kebalikan `normalize_chat_tools`: `{"type":"function","function":{...}}`
     (chat) maupun MCP `{"name":..., "inputSchema":...}` -> flat
     `{"type":"function","name":...,"parameters":...}`. `strict` dipertahankan.
+    Nama tool disanitasi ke `^[a-zA-Z0-9_-]+$` (batas keras upstream
+    `/zen/v1/responses`; MCP `mcp:fs:read` -> `mcp_fs_read`).
     """
     if not isinstance(tools, list) or not tools:
         return None
@@ -566,7 +838,7 @@ def normalize_responses_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
             schema = _tool_schema_of(tool)
             entry: Dict[str, Any] = {
                 "type": "function",
-                "name": name.strip(),
+                "name": sanitize_responses_tool_name(name),
                 "description": function.get("description") or tool.get("description") or f"Tool {name.strip()}",
                 "parameters": schema if schema is not None else {"type": "object", "properties": {}},
             }
@@ -582,7 +854,7 @@ def normalize_responses_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
         schema = _tool_schema_of(tool)
         entry = {
             "type": "function",
-            "name": name.strip(),
+            "name": sanitize_responses_tool_name(name),
             "description": tool.get("description") or f"Tool {name.strip()}",
             "parameters": schema if schema is not None else {"type": "object", "properties": {}},
         }
@@ -592,8 +864,252 @@ def normalize_responses_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
     return out or None
 
 
+def sanitize_responses_items(items: Any) -> Tuple[List[Dict[str, Any]], int]:
+    """Pairing item `function_call` / `function_call_output` yang yatim.
+
+    Claude Code melakukan `/compact` dan user meng-interrupt turn tool ->
+    `body.input` bisa berisi `function_call` TANPA `function_call_output`
+    pasangannya (atau sebaliknya). Upstream `/zen/v1/responses` menolak
+    turn seperti itu dengan 400 `No tool output found for function call ...`
+    di SEMUA egress (salah payload, bukan salah relay). Aturan:
+    - `function_call_output` yatim (tak ada call-nya) -> DIBUANG.
+    - `function_call` yatim (tak ada output) -> dipasangkan dengan output
+      sintetis `{"type":"function_call_output","call_id":...,"output":"{}"}`
+      tepat setelah call-nya.
+
+    Return (items_baru, n_perbaikan). Tak pernah melempar; input non-list
+    dikembalikan apa adanya dengan n=0.
+    """
+    try:
+        if not isinstance(items, list):
+            return items, 0
+        call_ids: set = set()
+        output_ids: set = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("call_id")
+            if not isinstance(cid, str) or not cid:
+                continue
+            if item.get("type") == "function_call":
+                call_ids.add(cid)
+            elif item.get("type") == "function_call_output":
+                output_ids.add(cid)
+        out: List[Dict[str, Any]] = []
+        fixed = 0
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "function_call_output":
+                cid = item.get("call_id")
+                if not (isinstance(cid, str) and cid in call_ids):
+                    fixed += 1
+                    continue
+            out.append(item)
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                cid = item.get("call_id")
+                if isinstance(cid, str) and cid and cid not in output_ids:
+                    out.append({
+                        "type": "function_call_output",
+                        "call_id": cid,
+                        "output": "{}",
+                    })
+                    output_ids.add(cid)
+                    fixed += 1
+        return out, fixed
+    except (TypeError, ValueError, AttributeError):
+        return (items if isinstance(items, list) else []), 0
+
+
+# Batas keras `max_output_tokens` upstream /zen/v1/responses:
+# - < 16 -> 400 "max_output_tokens must be >= 16" (probe 1-token kuota/
+#   health dari jalur MCP opencode).
+# - > 65536 -> 400 "The request contains invalid parameters".
+# - input_tokens + max_output_tokens > 1.048.576 (combo context 1M) ->
+#   400 "The request contains invalid parameters".
+RESPONSES_MIN_OUTPUT_TOKENS = 16
+RESPONSES_MAX_OUTPUT_TOKENS = 65536
+SPARK_MAX_TOTAL_TOKENS = 1_048_576
+
+
+def _estimate_prompt_tokens(payload: Any) -> int:
+    """Estimasi kasar token input (chars//4 + media), untuk guard 1M.
+
+    Sengaja konservatif (lebih banyak estimasi = clamp lebih dini = aman):
+    teks len//4, tiap part image/file +1000. Bukan pengganti tokenizer;
+    hanya dipakai mencegah overflow 1M kombinasi, bukan untuk billing.
+    Tak pernah melempar.
+    """
+    try:
+        total_chars = 0
+        images = 0
+
+        def _add_text(value: Any) -> None:
+            nonlocal total_chars
+            if isinstance(value, str):
+                total_chars += len(value)
+
+        def _walk_content(content: Any) -> None:
+            nonlocal images
+            if isinstance(content, str):
+                _add_text(content)
+                return
+            if not isinstance(content, list):
+                return
+            for part in content:
+                if isinstance(part, str):
+                    _add_text(part)
+                elif isinstance(part, dict):
+                    ptype = part.get("type")
+                    if ptype in ("input_image", "image_url", "input_file", "file"):
+                        images += 1
+                    for key in ("text", "delta"):
+                        _add_text(part.get(key))
+                    if ptype == "function_call":
+                        _add_text(part.get("arguments"))
+
+        for key in ("instructions", "system"):
+            _add_text(payload.get(key))
+        items = payload.get("input")
+        if isinstance(items, str):
+            _add_text(items)
+        elif isinstance(items, list):
+            for item in items:
+                if isinstance(item, str):
+                    _add_text(item)
+                elif isinstance(item, dict):
+                    if item.get("type") in ("function_call", "function_call_output"):
+                        _add_text(item.get("arguments"))
+                        _add_text(item.get("output"))
+                        continue
+                    _walk_content(item.get("content"))
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, dict):
+                    _walk_content(message.get("content"))
+        return total_chars // 4 + images * 1000
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+def clamp_responses_max_output_tokens(value: int, payload: Any = None) -> int:
+    """Clamp `max_output_tokens` ke [16, 65536] + guard total 1M.
+
+    Return nilai yang aman dikirim ke upstream /zen/v1/responses. Bila
+    `payload` diberikan, estimasi token input dipakai untuk mencegah
+    `input_tokens + max_output_tokens > 1.048.576`. Tak pernah melempar.
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return RESPONSES_MAX_OUTPUT_TOKENS
+    if v < RESPONSES_MIN_OUTPUT_TOKENS:
+        v = RESPONSES_MIN_OUTPUT_TOKENS
+    if v > RESPONSES_MAX_OUTPUT_TOKENS:
+        v = RESPONSES_MAX_OUTPUT_TOKENS
+    if isinstance(payload, dict):
+        estimated = _estimate_prompt_tokens(payload)
+        if estimated > 0 and estimated + v > SPARK_MAX_TOTAL_TOKENS:
+            v = max(RESPONSES_MIN_OUTPUT_TOKENS, SPARK_MAX_TOTAL_TOKENS - estimated)
+    return v
+
+
+# ── Normalisasi alias parameter tool Claude Code ──
+# Model non-Anthropic yang dipakai lewat Claude Code CLI / Claude Desktop
+# (oc/muse-spark-*, glm-*, qwen-*, deepseek-*) kerap menghalusinasi nama
+# parameter saat memanggil tool built-in Claude:
+#   InputValidationError: Bash failed due to the following issue:
+#   The required parameter `command` is missing
+# Pemetaan di bawah hanya berlaku bila kanonik TIDAK ada (alias dipindah,
+# bukan diduplikasi). Nama tool dicocokkan case-insensitive.
+_CLAUDE_TOOL_INPUT_ALIASES: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "bash": {
+        "command": ("cmd", "script", "command_line", "commandLine", "input", "code"),
+    },
+    "read": {
+        "file_path": ("path", "file", "filepath", "filePath", "filename"),
+    },
+    "edit": {
+        "file_path": ("path", "file", "filepath", "filePath", "filename"),
+        "old_string": ("old_text",),
+        "new_string": ("new_text",),
+    },
+    "write": {
+        "file_path": ("path", "file", "filepath", "filePath", "filename"),
+        "content": ("text",),
+    },
+    "multiedit": {
+        "file_path": ("path", "file", "filepath", "filePath", "filename"),
+    },
+    "glob": {
+        "pattern": ("query", "search", "regex", "glob"),
+        "path": ("dir", "directory"),
+    },
+    "grep": {
+        "pattern": ("query", "search", "regex", "glob"),
+        "path": ("dir", "directory"),
+    },
+}
+
+
+def normalize_claude_tool_input(tool_name: Any, args: Any) -> Any:
+    """Normalkan alias parameter tool Claude Code ke nama kanonik.
+
+    `args` boleh dict atau string JSON (kembalikan dengan tipe yang sama).
+    Hanya alias->kanonik yang tercatat untuk tool tersebut; kanonik yang
+    sudah ada selalu menang. Tool tak dikenal / JSON rusak -> input
+    dikembalikan apa adanya. Tak pernah melempar.
+    """
+    if not isinstance(tool_name, str):
+        return args
+    table = _CLAUDE_TOOL_INPUT_ALIASES.get(tool_name.strip().lower())
+    if not table:
+        return args
+    is_str = isinstance(args, str)
+    if is_str:
+        try:
+            parsed = json.loads(args)
+        except (ValueError, TypeError):
+            return args
+    elif isinstance(args, dict):
+        parsed = args
+    else:
+        return args
+    if not isinstance(parsed, dict):
+        return args
+    out = dict(parsed)
+    changed = False
+    for canonical, aliases in table.items():
+        if canonical in out:
+            continue
+        for alias in aliases:
+            if alias in out:
+                out[canonical] = out.pop(alias)
+                changed = True
+                break
+    if not changed:
+        return args
+    if is_str:
+        try:
+            return json.dumps(out, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return args
+    return out
+
+
 def ensure_chat_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Suntik kuartet tools fingerprint bentuk chat bila belum ada."""
+    """Suntik tool kanonik read/shell (bentuk chat) + alias konflik + note.
+
+    Urutan:
+    1. Normalisasi tools MCP/Responses (idempotent) -> bentuk chat.
+    2. Alias: tool klien yang namanya PERSIS `read`/`shell` di-rename jadi
+       `<name>_client` (di `tools` DAN di `messages[].tool_calls[].function.
+       name` pada histori assistant) agar tidak bentrok dengan definisi
+       kanonik yang disuntikkan — upstream menolak tool nama sama, definisi beda.
+    3. Suntik definisi kanonik `read` + `shell` (deskripsi + schema PERSIS
+       v2.0.26) — gate upstream /inference mewajibkan keduanya.
+    4. Placeholder system note (agar model tidak memanggil read/shell suntikan
+       dan tidak menolak tool milik klien sendiri).
+    """
     if not isinstance(payload, dict):
         return payload
     tools = payload.get("tools")
@@ -610,17 +1126,38 @@ def ensure_chat_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
         tools = []
         payload["tools"] = tools
     present = {_tool_name_of(t) for t in tools}
+    conflicts, _ = _alias_canonical_tool_conflicts_names(present)
+    appended = False
+    if conflicts:
+        # Alias tool klien bentrok -> <name>_client (tools + histori pesan).
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            target = function if isinstance(function, dict) else tool
+            if target.get("name") in conflicts:
+                target["name"] = f"{target['name']}_client"
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                tool_calls = message.get("tool_calls")
+                if not isinstance(tool_calls, list):
+                    continue
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function")
+                    if isinstance(function, dict) and function.get("name") in conflicts:
+                        function["name"] = f"{function['name']}_client"
     for name in OPENCODE_FINGERPRINT_TOOLS:
-        if name in present:
+        if name in present and name not in conflicts:
             continue
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": f"OpenCode built-in {name} tool",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        })
+        tools.append(_canonical_chat_tool(name))
+        appended = True
+    if appended:
+        _prepend_placeholder_note(payload, "chat")
     # Tools MCP kerap membawa $ref siklik (skema rekursif) yang ditolak
     # provider Console dengan 400 di SEMUA target — putus siklusnya di sini
     # (satu choke point untuk SEMUA jalur chat) sebelum wire.
@@ -638,7 +1175,12 @@ def ensure_chat_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def ensure_responses_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Suntik kuartet tools fingerprint bentuk responses bila belum ada."""
+    """Suntik tool kanonik read/shell (bentuk responses) + alias + note.
+
+    Versi Responses dari `ensure_chat_fingerprint_tools`: bentuk tools flat,
+    alias konflik diterapkan pada `tools` maupun item `function_call` di
+    `input` (name di-rename, call_id dipertahankan).
+    """
     if not isinstance(payload, dict):
         return payload
     tools = payload.get("tools")
@@ -657,15 +1199,29 @@ def ensure_responses_fingerprint_tools(payload: Dict[str, Any]) -> Dict[str, Any
         tools = []
         payload["tools"] = tools
     present = {_tool_name_of(t) for t in tools}
+    conflicts, _ = _alias_canonical_tool_conflicts_names(present)
+    appended = False
+    if conflicts:
+        # Alias tool klien bentrok -> <name>_client (tools + item input).
+        for tool in tools:
+            if isinstance(tool, dict) and tool.get("name") in conflicts:
+                tool["name"] = f"{tool['name']}_client"
+        items = payload.get("input")
+        if isinstance(items, list):
+            for item in items:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "function_call"
+                    and item.get("name") in conflicts
+                ):
+                    item["name"] = f"{item['name']}_client"
     for name in OPENCODE_FINGERPRINT_TOOLS:
-        if name in present:
+        if name in present and name not in conflicts:
             continue
-        tools.append({
-            "type": "function",
-            "name": name,
-            "description": f"OpenCode built-in {name} tool",
-            "parameters": {"type": "object", "properties": {}},
-        })
+        tools.append(_canonical_responses_tool(name))
+        appended = True
+    if appended:
+        _prepend_placeholder_note(payload, "responses")
     # Lihat ensure_chat_fingerprint_tools: putus skema rekursif ($ref siklik
     # MCP) yang ditolak provider dengan 400 di semua target.
     try:
@@ -735,6 +1291,13 @@ def ensure_responses_wire_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     _mo = payload.get("max_output_tokens")
     if not isinstance(_mo, (int, float)) or isinstance(_mo, bool):
         payload["max_output_tokens"] = 65536
+    else:
+        # Batas keras upstream: <16 (probe 1-token kuota/health) DAN
+        # >65576->clamp; plus guard combo 1M context
+        # (input + output > 1.048.576 -> 400 invalid parameters).
+        payload["max_output_tokens"] = clamp_responses_max_output_tokens(
+            int(_mo), payload
+        )
     # Null eksplisit (temperature:null dsb. dari klien MCP) bila diteruskan
     # mentah berisiko 400 upstream — drop agar upstream pakai default-nya.
     for _opt in ("temperature", "top_p"):
@@ -744,6 +1307,23 @@ def ensure_responses_wire_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     ensure_responses_fingerprint_tools(payload)
     ensure_spark_reasoning_xhigh(payload)
     coerce_tool_choice_auto(payload, "responses-wire")
+    # Pairing item function_call/function_call_output yatim (Claude Code
+    # /compact atau interrupt tool turn) — upstream 400 "No tool output
+    # found for function call ..." bila ada pasangan yang putus.
+    _input_items = payload.get("input")
+    if isinstance(_input_items, list):
+        _items, _n_paired = sanitize_responses_items(_input_items)
+        if _n_paired:
+            payload["input"] = _items
+            try:
+                from app.core.logging_utils import _log as _pair_log
+                _pair_log(
+                    "RESP",
+                    f"paired/dropped {_n_paired} orphan function_call/"
+                    f"function_call_output item(s) (responses-wire)",
+                )
+            except (ImportError, AttributeError, TypeError, ValueError):
+                pass
     # prompt_cache_key stabil per-percakapan (bagian fingerprint gate §8):
     # jalur bridge mensintesisnya, jalur direct passthrough selama ini tidak —
     # samakan agar wire direct selengkap wire bridge yang terbukti lolos.

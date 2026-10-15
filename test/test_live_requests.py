@@ -56,15 +56,17 @@ def _rid(prefix, n):
 
 
 def _session_headers():
-    # Header spec-valid opencode-session.md §4 (§7: sesi stabil per
-    # conversation, request unik per POST). Pakai generator produksi agar
-    # live test mengirim fingerprint persis seperti CLI asli.
-    from app.services.opencode import _new_opencode_request_id, _new_opencode_session_id
+    # Header spec-valid gate v2 (2026-10-14): x-opencode-session DAN
+    # x-opencode-session-id wajib dua-duanya (mirror), dan x-opencode-request
+    # TIDAK BOLEH dikirim (ada value -> 403 FreeTierError). Pakai generator
+    # produksi agar live test mengirim fingerprint persis seperti CLI asli.
+    from app.services.opencode import _new_opencode_session_id
+    session = _new_opencode_session_id()
     return {
         "x-opencode-client": "cli",
         "x-opencode-project": "global",
-        "x-opencode-session": _new_opencode_session_id(),
-        "x-opencode-request": _new_opencode_request_id(),
+        "x-opencode-session": session,
+        "x-opencode-session-id": session,
     }
 
 
@@ -247,10 +249,8 @@ async def _u3(client):
 
 @case("U4 3x stream berulang 1 sesi -> semua finish bersih (regresi bug sesi panjang)")
 async def _u4(client):
-    from app.services.opencode import _new_opencode_request_id
     ses = _session_headers()  # satu sesi dipakai bersama, seperti Hermes
     for i in range(3):
-        ses["x-opencode-request"] = _new_opencode_request_id()
         async with client.stream("POST", "/v1/responses", json={
                 "model": SPARK, "input": f"sebutkan angka {i} saja",
                 "max_output_tokens": 16, "stream": True, "store": False},
@@ -305,7 +305,7 @@ async def _u6(client):
 @case("U7 chat stream mimo tiny -> delta KONTEN nyata (bukti isi mengalir)")
 async def _u7(client):
     async with client.stream("POST", "/v1/chat/completions", json={
-            "model": "mimo-v2.5-free", "stream": True, "max_tokens": 32,
+            "model": "mimo-v2.6-flash-free", "stream": True, "max_tokens": 32,
             "messages": [{"role": "user", "content": "sebutkan 3 warna saja"}]},
             headers=_session_headers()) as r:
         assert r.status_code == 200, r.status_code

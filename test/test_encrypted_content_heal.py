@@ -153,12 +153,12 @@ def _c1():
     assert s != _stable_opencode_session({"prompt_cache_key": "lain"})
 
 
-@case("C2 User-Agent CLI asli ada di header CLI")
+@case("C2 User-Agent bentuk v2 ada di header CLI")
 def _c2():
     from app.services.opencode import _opencode_cli_headers
     ua = _opencode_cli_headers()["User-Agent"]
-    assert ua.startswith("opencode/"), ua
-    assert "ai-sdk/" in ua and "runtime/" in ua, ua
+    assert ua.startswith("opencode/latest/"), ua
+    assert ua.endswith("/cli"), ua
 
 
 # ---------- D. heal end-to-end (HTTP 400 langsung) ----------

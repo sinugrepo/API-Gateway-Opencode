@@ -113,7 +113,8 @@ def _c1():
     )
     payload2 = build_responses_payload_from_chat(req2)
     assert payload2["tool_choice"] == "auto", payload2.get("tool_choice")
-    assert len(payload2["tools"]) >= 4  # kuartet fingerprint hadir
+    # Tool kanonik (read/shell) selalu disuntik -> tools tidak pernah kosong.
+    assert len(payload2["tools"]) >= 2  # read + shell (gate v2)
 
 
 @case("D1 responses wire: required -> auto")

@@ -146,11 +146,27 @@ async def collect_chat_completion(
     for index in sorted(calls):
         entry = calls[index]
         arguments = entry["arguments"] or "{}"
+        # Pulihkan nama tool klien yang di-alias gateway (read_client -> read)
+        # sebelum normalisasi alias parameter Claude Code.
+        try:
+            from app.services.opencode import restore_client_tool_name
+            call_name = restore_client_tool_name(entry["name"] or "")
+        except (ImportError, AttributeError, TypeError, ValueError):
+            call_name = entry["name"] or ""
+        # Normalkan alias parameter tool Claude Code (model non-Anthropic
+        # halusinasi `cmd`/`path`/`query` -> InputValidationError di Claude
+        # Code CLI/Desktop). Choke point non-stream: chat direct MAUPUN
+        # bridge responses-to-chat melewati kolektor ini.
+        try:
+            from app.services.opencode import normalize_claude_tool_input
+            arguments = normalize_claude_tool_input(call_name, arguments)
+        except (ImportError, AttributeError, TypeError, ValueError):
+            pass
         tool_calls.append({
             "id": entry["id"] or f"call_{index}",
             "type": "function",
             "function": {
-                "name": entry["name"] or "",
+                "name": call_name,
                 "arguments": arguments,
             },
         })
@@ -244,6 +260,13 @@ async def collect_responses_object(
                     pass
 
     if final is not None:
+        # Pulihkan nama tool ter-alias (read_client -> read) bila klien
+        # mendeklarasikan tool bernama persis read/shell.
+        try:
+            from app.services.opencode import restore_aliased_names_in_response
+            restore_aliased_names_in_response(final)
+        except (ImportError, AttributeError, TypeError, ValueError):
+            pass
         return final
     if pending_error is not None:
         _raise_for_error_chunk(pending_error)

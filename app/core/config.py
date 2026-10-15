@@ -105,9 +105,14 @@ GATEWAY_API_KEYS: list = _parse_api_key_list(
 GATEWAY_AUTH_ENABLED = len(GATEWAY_API_KEYS) > 0
 
 
+# Endpoint inferensi upstream. Sejak 2026-10-14 OpenCode v2 memindahkan
+# free-tier inference dari /zen/v1/* ke /inference/v1/* — seluruh request
+# free di /zen/v1/* kini dijawab 403 FreeTierError blanket walau fingerprint
+# lain sempurna (terverifikasi live + bisect header). /zen/v1/models MASIH
+# 200, jadi models fetcher tidak dipindah.
 OPENCODE_URL = os.getenv(
     "OPENCODE_URL",
-    "https://opencode.ai/zen/v1/chat/completions",
+    "https://opencode.ai/inference/v1/chat/completions",
 )
 
 
@@ -122,7 +127,7 @@ OPENCODE_MODELS_URL = os.getenv(
 # Responses API. Endpoint proxy /v1/responses meneruskan body mentah ke sini.
 OPENCODE_RESPONSES_URL = os.getenv(
     "OPENCODE_RESPONSES_URL",
-    "https://opencode.ai/zen/v1/responses",
+    "https://opencode.ai/inference/v1/responses",
 )
 
 
@@ -148,8 +153,11 @@ def _is_responses_only_model(model: str) -> bool:
 # #101864), jadi proxy menyuntikkannya agar terlihat seperti opencode CLI:
 #   x-opencode-client: cli | x-opencode-project: global
 #   x-opencode-session: ses_<12 hex timestamp + 14 base62> (stabil 1/conversation)
-#   x-opencode-request: msg_<12 hex timestamp + 14 base62> (unik per POST)
-# Format persis mengikuti `opencode-session.md` §4 (Go createID).
+#   x-opencode-session-id: <nilai sama>  <- MIRROR WAJIB (salah satu saja = 403)
+#   x-session-affinity / x-session-id: <nilai sama> (mirror tambahan)
+# CATATAN v2 (2026-10-14): x-opencode-request TIDAK BOLEH dikirim — upstream
+# menolak request apapun yang membawa header tersebut (403 FreeTierError).
+# Format sesi persis mengikuti `opencode-session.md` §4 (Go createID).
 # Satu sesi dipakai bersama untuk semua upstream attempt dalam SATU request
 # klien (relay + fallback direct). Bila klien sudah mengirim header tersebut,
 # nilai klien dihormati (diutamakan) agar sesi per-percakapan tetap stabil.

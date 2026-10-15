@@ -1,5 +1,31 @@
 # OpenCode Session — Dari Mana & Cara POST ke Muse
 
+> ## ⚠️ GATE v2 (berlaku sejak 2026-10-14) — BACA INI DULU
+>
+> Dokumen di bawah adalah **capture historis era 1.18.x/1.19.0** (`/zen/v1`,
+> UA `opencode/1.18.30 …`, `x-opencode-request` masih dikirim). Sejak
+> 2026-10-14 upstream memindahkan free inference dan memperketat gate.
+> Kontrak AKTIF (diverifikasi live + bisect terhadap CLI v2.0.26):
+>
+> | Gate | Diterima | Ditolak (403 FreeTierError) |
+> |---|---|---|
+> | Endpoint | `/inference/v1/{chat/completions,responses,messages}` | `/zen/v1/*` (semua free) |
+> | User-Agent | `opencode/<channel>/<version>/<client>` (mis. `opencode/latest/2.0.26/cli`) | `opencode/1.18.31`, `opencode/2.0.26` |
+> | Header sesi | `x-opencode-session` **DAN** `x-opencode-session-id` (dua-duanya) | salah satu saja |
+> | `x-opencode-request` | **ABSEN** | ada value apa pun |
+> | Tools | definisi KANONIK `read` + `shell` (deskripsi+schema persis) | stub `bash/glob/grep/read`, nama asli tapi deskripsi/schema stub |
+> | `tool_choice` | absen / `auto` | `none` |
+> | Prefix sesi | counter kecil `~(ms*0x1000+1)` | prefix dari digest sha256 (counter acak) |
+> | `stream` | `true` (WAJIB, chat & responses) | `false`/hilang |
+>
+> Tools kanonik diambil VERBATIM dari source resmi
+> `packages/core/src/tool/plugin/read.ts` + `shell.ts` @ tag `v2.0.26`
+> (implementasi Python: `_OPENCODE_CANONICAL_TOOL_SPECS` di
+> `app/services/opencode.py`). Chat butuh bentuk **nested**
+> (`{"type":"function","function":{…}}`), responses **flat**
+> (`{"type":"function","name":…}`). `/zen/v1/models` masih 200 (fetcher model
+> tidak dipindah). Model paid `opencode-zen` tetap `/zen/v1` (out of scope).
+
 ## 1. Kesimpulan
 
 `x-opencode-session: ses_...` **tidak didapat dari POST ke `opencode.ai`**.
@@ -274,5 +300,10 @@ Konsekuensi implementasi di proxy:
   dijembatani otomatis `chat → Responses → chat`
   (`build_responses_payload_from_chat` menyuntik seluruh fingerprint di atas,
   bukan meneruskan body klien mentah).
-* `User-Agent` disamakan CLI asli (`opencode/1.18.31 ...`); `python-httpx`
-  bawaan menandai request BUKAN CLI (rawan 403).
+* `User-Agent` disamakan CLI asli; `python-httpx` bawaan menandai request
+  BUKAN CLI (rawan 403). Default gateway mengikuti versi CLI terbaru yang
+  diverifikasi upstream (`opencode/1.19.0 ...`; capture historis di dokumen
+  ini masih 1.18.x). Sejak OpenCode 1.19.0, upstream juga memvalidasi
+  versi CLI pada UA dan prefix timestamp ID `ses_`/`msg_` — ID dengan
+  timestamp acak/kuno/ masa-depan ditolak `403 FreeTierError`. Override
+  lewat env `OPENCODE_USER_AGENT`.

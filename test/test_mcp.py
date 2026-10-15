@@ -59,7 +59,7 @@ def main():
     p = build_upstream_payload(req)
     names = {t.get("function", {}).get("name") for t in p.get("tools", [])}
     check("A5 upstream pertahankan MCP tool + fingerprint + auto",
-          "my_tool" in names and {"bash", "glob", "grep", "read"} <= names
+          "my_tool" in names and {"read", "shell"} <= names
           and p.get("tool_choice") == "auto", str(sorted(names)))
 
     # ── B. JSON-RPC dispatch ──
@@ -170,7 +170,7 @@ def main():
     fs_child = fs_tool["function"]["parameters"]["$defs"]["Node"]["properties"]["child"]
     check("D5 upstream chat: MCP rekursif dibersihkan + fingerprint",
           "$ref" not in fs_child
-          and {"bash", "glob", "grep", "read"} <= {t.get("function", {}).get("name") for t in p_rec["tools"]},
+          and {"read", "shell"} <= {t.get("function", {}).get("name") for t in p_rec["tools"]},
           str(fs_child)[:200])
     from app.services.responses_bridge import build_responses_payload_from_chat
     bp = build_responses_payload_from_chat(req_rec)
@@ -202,7 +202,7 @@ def main():
     ensure_responses_fingerprint_tools(p_mcp)
     check("E1 tools MCP flat inputSchema -> parameters di direct wire",
           all(isinstance(t.get("parameters"), dict) for t in p_mcp["tools"])
-          and {"mcp__fs__read", "mcp__fs__list", "bash", "glob", "grep", "read"}
+          and {"mcp__fs__read", "mcp__fs__list", "read", "shell"}
           <= {t.get("name") for t in p_mcp["tools"]},
           str([(t.get("name"), sorted(t.get("parameters", {}).keys())) for t in p_mcp["tools"]])[:250])
     w2 = {"model": "muse-spark-1.3-contributor-free", "input": "hi",

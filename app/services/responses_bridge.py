@@ -398,6 +398,15 @@ def _chat_messages_to_responses_input(
         items.append(
             {"role": role, "content": [{"type": part_type, "text": text}, *media]}
         )
+    # Pairing item function_call/function_call_output yatim: turn interrupt
+    # atau /compact bisa membuat assistant tool_calls tanpa role:tool
+    # pasangannya (atau sebaliknya) -> upstream 400 "No tool output found
+    # for function call ..." di SEMUA target.
+    try:
+        from app.services.opencode import sanitize_responses_items
+        items, _n = sanitize_responses_items(items)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
     return items
 
 
@@ -424,7 +433,11 @@ def _chat_tools_to_responses_tools(
         if isinstance(function, dict):
             entry: Dict[str, Any] = {"type": "function"}
             if function.get("name"):
-                entry["name"] = function["name"]
+                try:
+                    from app.services.opencode import sanitize_responses_tool_name
+                    entry["name"] = sanitize_responses_tool_name(function["name"])
+                except (ImportError, AttributeError, TypeError, ValueError):
+                    entry["name"] = function["name"]
             if function.get("description"):
                 entry["description"] = function["description"]
             _schema = function.get("parameters")
@@ -448,6 +461,11 @@ def _chat_tools_to_responses_tools(
                 converted.append(entry)
         elif tool.get("name"):
             entry = {"type": "function", "name": tool["name"]}
+            try:
+                from app.services.opencode import sanitize_responses_tool_name
+                entry["name"] = sanitize_responses_tool_name(tool["name"])
+            except (ImportError, AttributeError, TypeError, ValueError):
+                pass
             if tool.get("description"):
                 entry["description"] = tool["description"]
             _schema = tool.get("parameters")
@@ -559,6 +577,18 @@ def build_responses_payload_from_chat(req: ChatCompletionRequest) -> Dict[str, A
                 payload["prompt_cache_key"] = fingerprint[:32]
         except (ImportError, AttributeError, TypeError, ValueError):
             pass
+    # Clamp max_output_tokens ke [16, 65536] + guard total 1M — batas keras
+    # upstream /zen/v1/responses (satu-satunya choke point wire bridge ini,
+    # setara ensure_responses_wire_fields untuk jalur direct).
+    try:
+        from app.services.opencode import clamp_responses_max_output_tokens
+        _mot = payload.get("max_output_tokens")
+        payload["max_output_tokens"] = clamp_responses_max_output_tokens(
+            _mot if isinstance(_mot, (int, float)) and not isinstance(_mot, bool) else 65536,
+            payload,
+        )
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
     return payload
 
 
@@ -588,12 +618,26 @@ def _responses_output_to_chat(
                 arguments = json.dumps(arguments, ensure_ascii=False)
             elif arguments is None:
                 arguments = "{}"
+            # Pulihkan nama tool klien yang di-alias gateway (read_client -> read).
+            try:
+                from app.services.opencode import restore_client_tool_name
+                name = restore_client_tool_name(item.get("name") or "")
+            except (ImportError, AttributeError, TypeError, ValueError):
+                name = item.get("name") or ""
+            # Normalkan alias parameter tool Claude Code (model non-Anthropic
+            # halusinasi `cmd`/`path`/`query` -> InputValidationError di
+            # Claude Code CLI/Desktop).
+            try:
+                from app.services.opencode import normalize_claude_tool_input
+                arguments = normalize_claude_tool_input(name, str(arguments))
+            except (ImportError, AttributeError, TypeError, ValueError):
+                pass
             tool_calls.append(
                 {
                     "id": item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}",
                     "type": "function",
                     "function": {
-                        "name": item.get("name") or "",
+                        "name": name,
                         "arguments": str(arguments),
                     },
                 }
@@ -1222,6 +1266,19 @@ async def responses_stream_generator(
                                         except (AttributeError, TypeError):
                                             pass
                                 data_events += 1
+                                # Pulihkan nama tool ter-alias (read_client ->
+                                # read) pada passthrough mentah bila perlu.
+                                if "_client" in data:
+                                    try:
+                                        from app.services.opencode import (
+                                            restore_aliased_names_in_response,
+                                        )
+                                        _restored = restore_aliased_names_in_response(
+                                            json.loads(data)
+                                        )
+                                        data = json.dumps(_restored, ensure_ascii=False)
+                                    except (ValueError, TypeError, ImportError, AttributeError):
+                                        pass
                                 yield f"data: {data}\n\n"
                         finally:
                             if pending_line_task is not None:
@@ -2112,6 +2169,11 @@ async def responses_to_chat_stream_generator(
                                             yield role
                                         sent_payload = True
                                         call_id_emitted.add(call_id)
+                                        try:
+                                            from app.services.opencode import restore_client_tool_name
+                                            _added_name = restore_client_tool_name(item.get("name") or "")
+                                        except (ImportError, AttributeError, TypeError, ValueError):
+                                            _added_name = item.get("name") or ""
                                         yield chunk(
                                             {
                                                 "tool_calls": [
@@ -2120,7 +2182,7 @@ async def responses_to_chat_stream_generator(
                                                         "id": call_id,
                                                         "type": "function",
                                                         "function": {
-                                                            "name": item.get("name") or "",
+                                                            "name": _added_name,
                                                             "arguments": "",
                                                         },
                                                     }
@@ -2206,6 +2268,22 @@ async def responses_to_chat_stream_generator(
                                             args = done_item.get("arguments", "{}")
                                             if isinstance(args, (dict, list)):
                                                 args = json.dumps(args, ensure_ascii=False)
+                                            # Pulihkan nama tool klien yang di-alias
+                                            # gateway (read_client -> read).
+                                            try:
+                                                from app.services.opencode import restore_client_tool_name
+                                                done_name = restore_client_tool_name(done_item.get("name") or "")
+                                            except (ImportError, AttributeError, TypeError, ValueError):
+                                                done_name = done_item.get("name") or ""
+                                            # Alias parameter tool Claude Code
+                                            # (model non-Anthropic halusinasi).
+                                            try:
+                                                from app.services.opencode import normalize_claude_tool_input
+                                                args = normalize_claude_tool_input(
+                                                    done_name, str(args if args is not None else "{}")
+                                                )
+                                            except (ImportError, AttributeError, TypeError, ValueError):
+                                                pass
                                             saw_tool_call = True
                                             role = role_chunk()
                                             if role:
@@ -2221,7 +2299,7 @@ async def responses_to_chat_stream_generator(
                                                             "id": call_id,
                                                             "type": "function",
                                                             "function": {
-                                                                "name": done_item.get("name") or "",
+                                                                "name": done_name,
                                                                 "arguments": str(args if args is not None else "{}"),
                                                             },
                                                         }

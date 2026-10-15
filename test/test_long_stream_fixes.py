@@ -232,21 +232,24 @@ def _d3():
 
 # ---------- E. pendukung stream stabil ----------
 
-@case("E1 header stream matikan kompresi + bawa identitas CLI")
+@case("E1 header stream matikan kompresi + bawa identitas CLI (2 mirror)")
 def _e1():
     from app.services.opencode import _resolve_opencode_headers
     from app.services.relay import _stream_request_headers
     oc = _resolve_opencode_headers(None)
     assert oc["x-opencode-session"].startswith("ses_") and len(oc["x-opencode-session"]) == 30
-    assert oc["x-opencode-request"].startswith("msg_") and len(oc["x-opencode-request"]) == 30
+    # Gate v2: x-opencode-session DAN x-opencode-session-id wajib dua-duanya,
+    # x-opencode-request TIDAK boleh ada (ada value -> 403).
+    assert oc["x-opencode-session-id"] == oc["x-opencode-session"]
+    assert "x-opencode-request" not in oc
     # Format spec opencode-session.md §4: 12 hex + 14 base62.
     from app.services.opencode import _is_valid_opencode_id
     assert _is_valid_opencode_id(oc["x-opencode-session"], "ses_"), oc["x-opencode-session"]
-    assert _is_valid_opencode_id(oc["x-opencode-request"], "msg_"), oc["x-opencode-request"]
     h = _stream_request_headers(oc)
     assert h["Accept-Encoding"] == "identity", "kompresi harus mati agar SSE tidak di-buffer"
     assert h["Accept"] == "text/event-stream"
     assert "x-opencode-session" in h
+    assert "x-opencode-request" not in h
 
 
 @case("E2 _sse hasilkan frame SSE valid")

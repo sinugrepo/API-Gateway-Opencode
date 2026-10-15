@@ -1,6 +1,6 @@
 # Sinug Gateway — OpenAI-Compatible API Gateway
 
-Proxy FastAPI yang kompatibel OpenAI untuk upstream `opencode.ai/zen/v1`, dengan
+Proxy FastAPI yang kompatibel OpenAI untuk upstream `opencode.ai/inference/v1`, dengan
 relay round-robin Vercel (masking IP), pool proxy SOCKS/HTTP (egress tambahan),
 bridge Chat → Responses untuk model Responses-only (cth. `muse-spark`),
 tracking usage SQLite, dan dashboard `/monitor` yang terbagi menjadi
@@ -50,8 +50,16 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
   IP — rotasi PENUH sekali lagi dengan SATU pasangan (session,
    prompt_cache_key) baru yang konsisten (`FORBIDDEN_FRESH_SESSION_RETRY`,
   `FORBIDDEN_RETRY_DELAY`, `FORBIDDEN_EARLY_FRESH_AFTER`), kecuali payload membawa replay `encrypted_content`
-  (identitas wajib stabil). Fingerprint §8 opencode-session.md ditegakkan di
-  semua jalur (kuartet tools, stream:true, store:false, key stabil, xhigh).
+  (identitas wajib stabil). Fingerprint gate ditegakkan di
+  semua jalur (tool kanonik `read`+`shell`, stream:true, store:false, key stabil, xhigh).
+- **Gate v2 (2026-10-14)**: upstream memindahkan free inference ke
+  `/inference/v1/*` dan memperketat identitas caller — `x-opencode-request`
+  kini **dilarang** (ada value → 403), header sesi butuh **dua** mirror
+  (`x-opencode-session` + `x-opencode-session-id`), UA wajib bentuk
+  `opencode/<channel>/<version>/<client>` (default `opencode/latest/2.0.26/cli`),
+  dan tools wajib berisi definisi **kanonik `read` + `shell`** (deskripsi +
+  schema PERSIS v2.0.26 — stub `bash/glob/grep` tidak lagi diterima). Semua
+  terverifikasi live; detail di `opencode-session.md` §GATE-v2.
 - Streaming stabil: `Accept-Encoding: identity`, SSE keepalive 5 dtk,
   `reasoning_content` diteruskan agar socket tidak idle — termasuk reasoning
   yang datang utuh via `response.output_item.done` (tanpa summary delta);
@@ -107,6 +115,37 @@ Entry point: `main.py` → package `app/` (`app:create_app`).
   65536, `temperature`/`top_p` null di-drop, dan tools MCP (`inputSchema` /
   bentuk chat) dinormalisasi ke flat responses ber-`parameters` — request
   MCP tidak lagi 403 FreeTier sementara request biasa lolos.
+- Hardening OpenCode (proxy `claude-code-router`/9router, root cause
+  identik): (a) `User-Agent` default bentuk v2 `opencode/latest/2.0.26/cli`;
+  (b) nama tool `/v1/responses` disanitasi ke
+  `^[a-zA-Z0-9_-]+$` — MCP `mcp:fs:read` -> `mcp_fs_read` (tanpa ini 400
+  `invalid_request_error`); (c) item `function_call`/`function_call_output`
+  yatim (setelah `/compact` atau interrupt tool turn) dipasangkan/dibuang —
+  tanpa ini 400 `No tool output found for function call ...`; (d)
+  `max_output_tokens` di-clamp `[16, 65536]` + guard `input+output <=
+  1.048.576` (combo context 1M).
+- **Gate v2 free tier** (diverifikasi live via bisect header/body terhadap
+  upstream): endpoint pindah ke `/inference/v1/*`; `x-opencode-request`
+  dihapus dari semua jalur (ada value → 403); header sesi dikirim sebagai dua
+  mirror (`x-opencode-session` + `x-opencode-session-id`, plus
+  `x-session-affinity`/`x-session-id`); `_fresh_*` header ikut membuang
+  request header; sesi klien yang formatnya tidak valid (bukan
+  `ses_`+12hex+14base62) diganti sesi timestamp-valid proxy; tools kanonik
+  `read` (param `path`) + `shell` (param `command`) disuntik dengan deskripsi
+  dan schema PERSIS source v2.0.26 (chat=nested, responses=flat); tool klien
+  bernama persis `read`/`shell` di-alias ke `read_client`/`shell_client`
+  (termasuk histori tool_call) dan nama aslinya dipulihkan di respons; system
+  note "placeholders … use the other tools you have been given" disisipkan
+  agar model tidak memanggil tool kanonik dan tidak menolak tool klien
+  (redaksi "not available" terbukti memicu penolakan tool klien).
+- Normalisasi alias parameter tool Claude Code: model non-Anthropic
+  (`oc/*`, `muse-spark-*`, `glm-*`, `qwen-*`, `deepseek-*`) kerap
+  menghalusinasi nama parameter (`cmd`/`path`/`query` -> `command`/
+  `file_path`/`pattern`), menyebabkan `InputValidationError` di Claude Code
+  CLI/Desktop. Argumen tool-call dinormalkan di semua choke point output
+  (bridge non-stream + stream `output_item.done`, reverse bridge,
+  kolektor non-stream chat). Jalur streaming chat mentah meneruskan
+  fragmen argumen apa adanya (normalisasi butuh argumen utuh).
 
 ## Syarat
 
@@ -134,9 +173,9 @@ contoh siap salin di `.env.example`. Environment yang sudah ada menang atas `.en
 |---|---|---|
 | `GATEWAY_API_KEYS` / `GATEWAY_API_KEY` / `API_KEYS` | `` (kosong = terbuka) | **Auth klien gateway** (koma-dipisah, digabung). Terisi = `/v1/*` + `/api/*` + `/relay/status` wajib `Authorization: Bearer <key>` / `x-api-key: <key>` / `?api_key=`; kosong = mode terbuka (lokal saja). BEDA dari `OPENCODE_API_KEY` |
 | `OPENCODE_API_KEY` | `public` | Key upstream server-to-server; jangan dibagikan ke klien |
-| `OPENCODE_URL` | `.../zen/v1/chat/completions` | Upstream chat |
-| `OPENCODE_RESPONSES_URL` | `.../zen/v1/responses` | Upstream responses |
-| `OPENCODE_MODELS_URL` | `.../zen/v1/models` | Daftar model |
+| `OPENCODE_URL` | `.../inference/v1/chat/completions` | Upstream chat (gate v2) |
+| `OPENCODE_RESPONSES_URL` | `.../inference/v1/responses` | Upstream responses (gate v2) |
+| `OPENCODE_MODELS_URL` | `.../zen/v1/models` | Daftar model (masih 200) |
 | `RESPONSES_ONLY_MODELS` | `muse-spark` | Substring model yang hanya via Responses |
 | `MODEL` | `` (kosong) | Tidak ada default diam-diam; klien wajib kirim model |
 | `RELAY_URLS` / `RELAY_URL` | 11 relay bawaan | Default awal pool; hostname telanjang dinormalisasi ke `/api/relay`. Daftar efektif dikelola via website (`relays.json`) |
@@ -281,11 +320,15 @@ app/routes/              # chat, responses_api, misc, usage_routes, monitor, mcp
 app/web/templates/       # login.html, dashboard.html (vanilla, tanpa build;
                           # 3 view: Monitoring / Konfigurasi / Uji Model)
 test/                    # test_long_stream_fixes.py, test_live_requests.py,
-                          # test_reverse_bridge.py, test_forbidden_fresh_retry.py,
-                          # test_direct_first_slow.py, test_output_item_done.py,
-                          # test_tool_choice_coerce.py, test_outbound_proxy.py,
-                          # test_mcp.py (offline, 43 case: normalisasi
-                          # inputSchema + sanitizer rekursi + JSON-RPC + HTTP layer)
+                         # test_reverse_bridge.py, test_forbidden_fresh_retry.py,
+                         # test_direct_first_slow.py, test_output_item_done.py,
+                         # test_tool_choice_coerce.py, test_outbound_proxy.py,
+                         # test_stable_session.py, test_pr_403_fixes.py,
+                         # test_v2_gate.py (gate /inference/v1: endpoint, UA,
+                         # 2 mirror sesi, tool kanonik read/shell, alias+restore,
+                         # placeholder note),
+                         # test_mcp.py (offline, 43 case: normalisasi
+                         # inputSchema + sanitizer rekursi + JSON-RPC + HTTP layer)
 plans/                   # docs lokal, di-gitignore
 usage.db*                # runtime SQLite, di-gitignore
 proxies.json             # pool proxy website, di-gitignore
@@ -304,6 +347,14 @@ python test/test_forbidden_fresh_retry.py  # offline, 7 case (retry sesi-baru al
 python test/test_direct_first_slow.py  # offline, 8 case (direct-first request lambat)
 python test/test_tool_choice_coerce.py  # offline, 7 case (koersi tool_choice auto)
 python test/test_output_item_done.py  # offline, 5 case (reasoning utuh done-event)
+python test/test_pr_403_fixes.py      # offline, 26 case (hardening OpenCode:
+                                      # UA bentuk v2, sanitasi nama tool,
+                                      # pairing orphan, clamp max_output_tokens,
+                                      # normalisasi alias tool Claude Code)
+python test/test_v2_gate.py            # offline, 30 case (gate v2 /inference/v1:
+                                      # endpoint, UA, 2 mirror sesi, larangan
+                                      # x-opencode-request, tool kanonik read/shell,
+                                      # alias konflik + restore, placeholder note)
 python test/test_live_requests.py       # live: ASGI in-process → relay Vercel
                                         # + opencode.ai; kontrak 200 / 429-bersih /
                                         # EMPTY_RESPONSE; butuh internet

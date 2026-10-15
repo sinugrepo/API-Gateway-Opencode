@@ -164,11 +164,18 @@ def _c1():
     assert h1["x-opencode-session"] != h2["x-opencode-session"]  # acak per-call
 
 
-@case("C2 resolver menghormati sesi klien")
+@case("C2 resolver menghormati sesi klien yang format-valid")
 def _c2():
     from app.services.opencode import _resolve_opencode_headers
-    h = _resolve_opencode_headers({"X-OpenCode-Session": "ses_KLIEN"})
-    assert h["x-opencode-session"] == "ses_KLIEN"
+    # Format spec §4: ses_ + 12 hex + 14 base62. Sesi valid dihormati apa adanya.
+    valid = "ses_" + "0" * 12 + "a" * 14
+    h = _resolve_opencode_headers({"X-OpenCode-Session": valid})
+    assert h["x-opencode-session"] == valid, h
+    assert h["x-opencode-session-id"] == valid, h
+    # Sesi format-valid TAPI timestamp-nya tidak plausible tetap diterima apa
+    # adanya (validasi gate hanya bentuk); sesi NON-format diganti proxy.
+    h2 = _resolve_opencode_headers({"X-OpenCode-Session": "ses_KLIEN"})
+    assert h2["x-opencode-session"] != "ses_KLIEN", h2
 
 
 # ---------- D. integrasi route ----------
@@ -282,20 +289,23 @@ def _d3():
             model="muse-spark-1.3-contributor-free",
             messages=[{"role": "user", "content": "halo"}],
         )
-        request = type("Req", (), {"headers": {"x-opencode-session": "ses_KLIEN"}})()
+        request = type("Req", (), {"headers": {"x-opencode-session": "ses_" + "0" * 12 + "a" * 14}})()
         asyncio.run(chat.chat_completions(req, None, request))
-        assert captured["headers"]["x-opencode-session"] == "ses_KLIEN"
+        assert captured["headers"]["x-opencode-session"] == "ses_" + "0" * 12 + "a" * 14
     finally:
         chat.chat_completions_via_responses = orig
 
 
-@case("E1 header CLI membawa User-Agent ala opencode asli")
+@case("E1 header CLI membawa User-Agent bentuk v2 + mirror sesi")
 def _e1():
     import app.services.opencode as oc
     h = oc._opencode_cli_headers()
     ua = h["User-Agent"]
     assert ua.startswith("opencode/"), ua
-    assert "ai-sdk/" in ua and "runtime/" in ua, ua
+    assert ua.endswith("/cli"), ua
+    # Gate v2: dua mirror sesi wajib, request header dilarang.
+    assert h["x-opencode-session-id"] == h["x-opencode-session"], h
+    assert "x-opencode-request" not in h, h
     # Override env dihormati
     old = oc.OPENCODE_USER_AGENT
     try:

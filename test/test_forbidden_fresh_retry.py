@@ -131,8 +131,9 @@ def _base_headers(session="ses_abcdef1234567890abcdefghij"):
         "x-opencode-client": "cli",
         "x-opencode-project": "global",
         "x-opencode-session": session,
+        "x-opencode-session-id": session,
         "x-opencode-request": "msg_abcdef1234567890abcdefghij",
-        "User-Agent": "opencode/1.18.31 test",
+        "User-Agent": "opencode/latest/2.0.26/cli test",
     }
 
 
@@ -147,7 +148,7 @@ def _a1():
 
 # ---------- B. helper ----------
 
-@case("B1 identitas fresh: format valid, beda, preservasi header")
+@case("B1 identitas fresh: format valid, beda, mirror sinkron, request dibuang")
 def _b1():
     from app.services.opencode import (
         _fresh_identity_headers,
@@ -156,12 +157,14 @@ def _b1():
     base = _base_headers()
     fresh = _fresh_identity_headers(base)
     assert _is_valid_opencode_id(fresh["x-opencode-session"], "ses_")
-    assert _is_valid_opencode_id(fresh["x-opencode-request"], "msg_")
+    assert fresh["x-opencode-session-id"] == fresh["x-opencode-session"]
+    assert fresh["x-session-affinity"] == fresh["x-opencode-session"]
+    # Gate v2: x-opencode-request TIDAK boleh diteruskan (ada value -> 403).
+    assert "x-opencode-request" not in fresh
     assert fresh["x-opencode-session"] != base["x-opencode-session"]
-    assert fresh["x-opencode-request"] != base["x-opencode-request"]
     assert fresh["x-opencode-client"] == "cli"
     assert fresh["x-opencode-project"] == "global"
-    assert "opencode/1.18.31" in fresh["User-Agent"]
+    assert "opencode/latest/2.0.26/cli" in fresh["User-Agent"]
     # Base tidak dimutasi.
     assert base["x-opencode-session"].startswith("ses_abcdef")
 

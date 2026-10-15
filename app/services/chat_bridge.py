@@ -77,6 +77,19 @@ def _responses_item_to_chat_message(item: Any) -> Optional[Dict[str, Any]]:
             arguments = json.dumps(arguments, ensure_ascii=False)
         elif arguments is None:
             arguments = "{}"
+        # Pulihkan nama tool klien yang di-alias gateway (read_client -> read).
+        try:
+            from app.services.opencode import restore_client_tool_name
+            name = restore_client_tool_name(item.get("name") or "")
+        except (ImportError, AttributeError, TypeError, ValueError):
+            name = item.get("name") or ""
+        # Alias parameter tool Claude Code (model non-Anthropic halusinasi
+        # `cmd`/`path`/`query` dsb. -> InputValidationError di klien).
+        try:
+            from app.services.opencode import normalize_claude_tool_input
+            arguments = normalize_claude_tool_input(name, str(arguments))
+        except (ImportError, AttributeError, TypeError, ValueError):
+            pass
         return {
             "role": "assistant",
             "content": "",
@@ -84,7 +97,7 @@ def _responses_item_to_chat_message(item: Any) -> Optional[Dict[str, Any]]:
                 "id": item.get("call_id") or item.get("id") or "call_0",
                 "type": "function",
                 "function": {
-                    "name": item.get("name") or "",
+                    "name": name,
                     "arguments": str(arguments),
                 },
             }],
@@ -323,11 +336,17 @@ def chat_completion_to_responses(
             arguments = function.get("arguments", "{}")
             if isinstance(arguments, (dict, list)):
                 arguments = json.dumps(arguments, ensure_ascii=False)
+            name = function.get("name") or ""
+            try:
+                from app.services.opencode import normalize_claude_tool_input
+                arguments = normalize_claude_tool_input(name, str(arguments if arguments is not None else "{}"))
+            except (ImportError, AttributeError, TypeError, ValueError):
+                pass
             output.append({
                 "type": "function_call",
                 "id": f"fc-{secrets.token_hex(8)}",
                 "call_id": call.get("id") or f"call_{index}",
-                "name": function.get("name") or "",
+                "name": name,
                 "arguments": str(arguments if arguments is not None else "{}"),
             })
     usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
@@ -485,10 +504,22 @@ async def chat_stream_to_responses_stream(
         entry = calls[index]
         if not entry["name"]:
             continue
+        # Pulihkan nama tool klien yang di-alias gateway (read_client -> read).
+        try:
+            from app.services.opencode import restore_client_tool_name
+            call_name = restore_client_tool_name(entry["name"])
+        except (ImportError, AttributeError, TypeError, ValueError):
+            call_name = entry["name"]
+        arguments = entry["arguments"] or "{}"
+        try:
+            from app.services.opencode import normalize_claude_tool_input
+            arguments = normalize_claude_tool_input(call_name, arguments)
+        except (ImportError, AttributeError, TypeError, ValueError):
+            pass
         output.append({"type": "function_call", "id": f"fc-{secrets.token_hex(8)}",
                        "call_id": entry["id"] or f"call_{index}",
-                       "name": entry["name"],
-                       "arguments": entry["arguments"] or "{}"})
+                       "name": call_name,
+                       "arguments": arguments or "{}"})
     prompt_tokens = completion_tokens = total_tokens = 0
     if isinstance(usage, dict):
         try:
