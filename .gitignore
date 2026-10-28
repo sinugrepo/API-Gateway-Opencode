@@ -17,6 +17,13 @@ logs/
 # Planning docs lokal (tidak ikut ke git).
 plans/
 
+# Internal tooling & IDE workspace (jangan di-commit).
+.workbuddy-ai/
+.kilo/
+.freebuff/
+.workbuddy*
+*.genie
+
 # Python cache.
 __pycache__/
 *.py[cod]

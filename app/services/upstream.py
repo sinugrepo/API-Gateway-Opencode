@@ -23,6 +23,7 @@ from app.core.config import (
     RATE_LIMIT_COOLDOWN,
     RATE_LIMIT_RETRIES,
     RELAY_FALLBACK,
+    REQUEST_TIMEOUT,
     SPURIOUS_429_SAME_ROUTE_RETRIES,
     _is_responses_only_model,
 )
@@ -49,6 +50,37 @@ from app.services.relay import (
 )
 from app.core.schemas import ChatCompletionRequest
 from app.core.http_client import _get_http, _get_proxy_client
+
+
+def _try_bun_forward(
+    target_url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    proxy_url: Optional[str] = None,
+) -> Optional[httpx.Response]:
+    """Coba forward request non-stream via Bun sidecar (fingerprint TLS asli).
+
+    Return `httpx.Response` palsu bila Bun sukses, atau None bila fallback
+    httpx diperlukan (Bun off / mati / tidak didukung / DIRECT_ONLY matikan
+    jalur proxy). TIDAK PERNAH melempar: request path tetap hidup.
+    """
+    try:
+        import json as _json
+        from app.core.bun_egress import forward as _bun_fwd
+        from app.core.bun_proxy import bun_response
+
+        body = _json.dumps(payload).encode("utf8", "replace")
+        result = _bun_fwd(
+            "POST",
+            target_url,
+            dict(headers or {}),
+            body,
+            proxy_url=proxy_url,
+            timeout_s=REQUEST_TIMEOUT,
+        )
+        return bun_response(result)
+    except (ImportError, AttributeError, TypeError, ValueError, OSError):
+        return None
 
 
 def _resolve_request_model(req: ChatCompletionRequest) -> str:
@@ -137,6 +169,22 @@ def build_upstream_payload(req: ChatCompletionRequest) -> Dict[str, Any]:
         ensure_chat_fingerprint_tools(payload)
         coerce_tool_choice_auto(payload, "chat-upstream")
     except (ImportError, AttributeError, TypeError):
+        pass
+
+    # Clamp output per model (SSOT window: app/services/model_context.py).
+    # Default schema `max_tokens=65536` membuat prompt+output bisa melewati
+    # window model chat (deepseek-v4* 131K -> 400 "context length" padahal
+    # input baru ~65K). Estimasi input ikut menghitung tools + tools
+    # fingerprint yang baru disuntik. Tidak pernah menaikkan nilai klien.
+    try:
+        from app.services.opencode import clamp_max_tokens_for_model
+
+        _clamped = clamp_max_tokens_for_model(
+            payload.get("max_tokens"), payload, payload.get("model")
+        )
+        if _clamped is not None:
+            payload["max_tokens"] = _clamped
+    except (ImportError, AttributeError, TypeError, ValueError):
         pass
 
     return payload
@@ -345,6 +393,25 @@ async def call_upstream(
                     continue
                 if not _conn:
                     continue
+                # Coba via Bun sidecar dulu (fingerprint TLS asli); bila Bun
+                # mati / tidak applicable -> fallback httpx di bawah.
+                _bun_resp = _try_bun_forward(
+                    upstream_url, _fresh_request_headers(headers), payload, proxy_url=_conn
+                )
+                if _bun_resp is not None:
+                    r = _bun_resp
+                    if r.status_code == 403:
+                        try:
+                            from app.services.outbound_proxy import mark_proxy_flagged as _markf
+                            _markf(_conn)
+                        except (ImportError, AttributeError, TypeError, ValueError):
+                            pass
+                    elif r.status_code == 429:
+                        try:
+                            _markp(_conn)
+                        except (TypeError, ValueError, AttributeError):
+                            pass
+                    return r, upstream_url
                 try:
                     from app.core.http_client import _get_proxy_client as _gpc
                     _client = _gpc(_conn)
@@ -384,6 +451,13 @@ async def call_upstream(
                     except (TypeError, ValueError, AttributeError):
                         pass
                 return r, upstream_url
+        # Direct mentah: coba via Bun sidecar dulu (fingerprint TLS asli);
+        # bila Bun mati / tidak applicable -> fallback httpx di bawah.
+        _bun_direct = _try_bun_forward(
+            upstream_url, _fresh_request_headers(headers), payload, proxy_url=None
+        )
+        if _bun_direct is not None:
+            return _bun_direct, upstream_url
         client = _get_http()
         # Request ID fresh per attempt ala CLI asli (msg_ unik per POST).
         r = await client.post(upstream_url, headers=_fresh_request_headers(headers), json=payload)

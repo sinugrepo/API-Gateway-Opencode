@@ -38,6 +38,14 @@ async def lifespan(app: FastAPI):
         _log("INFO", f"Relay pool: {_rov.get('enabled_count', 0)}/{_rov.get('count', 0)} enabled, order={_rov.get('egress_order')}")
     except (ImportError, AttributeError, TypeError, ValueError):
         _rov = {}
+    # Bun sidecar (egress fingerprint TLS asli). Tidak melempar: bila Bun
+    # tidak tersedia / tidak enabled, start() mengulang log saja dan jalan
+    # gateway tetap httpx (fallback otomatis per-request di bun_egress).
+    try:
+        from app.core.bun_proxy import start as _bun_start
+        _bun_start()
+    except (ImportError, AttributeError, TypeError, ValueError):
+        pass
     _log("INFO", f"Usage DB ready at {os.path.abspath(USAGE_DB_PATH)}")
     _log("INFO", "Backend API ready at http://0.0.0.0:8000")
     _log("INFO", f"Model: {MODEL}")
@@ -59,6 +67,13 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("MONITOR_PASSWORD must be changed when ENFORCE_MONITOR_PASSWORD=true")
     _log("INFO", "Monitor dashboard at /monitor")
     yield
+    # Hentikan Bun sidecar SEBELUM menutup shared httpx client agar tidak
+    # ada proses yatim yang terus jalan saat shutdown.
+    try:
+        from app.core.bun_proxy import stop as _bun_stop
+        _bun_stop()
+    except (ImportError, AttributeError, TypeError, ValueError, OSError):
+        pass
     await _close_http()
 
 

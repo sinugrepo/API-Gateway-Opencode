@@ -27,6 +27,8 @@ from app.core.config import (
     REQUEST_TIMEOUT,
     SSE_KEEPALIVE_INTERVAL,
     STREAM_BYPASS_RELAY,
+    UPSTREAM_429_SESSION_ROTATIONS,
+    UPSTREAM_429_SESSION_THRESHOLD,
     USE_RELAY,
 )
 
@@ -44,6 +46,13 @@ from app.core.http_client import _get_http, _pick_http_client
 from app.core.logging_utils import _log
 from app.services.opencode import _fresh_request_headers, _fresh_retry_targets, _is_non_retryable_400, _oc_session_tag
 from app.core.sse import _sse
+from app.services.rate_guard import (
+    backoff_delay,
+    make_session_rotation_state,
+    record_429,
+    rotations_exhausted,
+    upstream_token,
+)
 from app.services.relay import (
     _is_relay_penalized,
     _is_relay_stream_broken,
@@ -276,6 +285,16 @@ async def stream_generator(
     forbidden_count = 0
     saw_non_403_failure = False
     fresh_session_retry_done = False
+    # Berapa kali 429 sudah memaksa rotasi pada request INI. Dipakai untuk
+    # menghentikan amplifikasi: setelah N target berbeda sama-sama 429,
+    # hipotesis "limit per-IP" sudah terbantah dan attempt berikutnya hanya
+    # menambah beban ke bucket upstream yang sama.
+    rate_limit_hits = 0
+    # Rotasi sesi saat sesi tertentu dipanaskan (429 per-sesi, bukan per-IP):
+    # N 429 beruntun dengan tag sesi sama -> fresh (session, prompt_cache_key)
+    # + rotasi ulang semua target, hingga UPSTREAM_429_SESSION_ROTATIONS habis.
+    _session_rotation = make_session_rotation_state()
+    _session_rotation_done = 0
     _log("STREAM", f"REQ model={client_model} keys={sorted(payload.keys())} {_oc_session_tag(opencode_headers)}")
 
     try:
@@ -330,6 +349,10 @@ async def stream_generator(
                     f"ATTEMPT {target_index + 1}/{len(targets)} "
                     f"{_route} target={target_url}"
                 )
+                # Admission control global: satu token per attempt. Menahan
+                # laju di sini membuat 429 tidak perlu ditemukan dulu lewat
+                # percobaan yang gagal (lihat app/services/rate_guard.py).
+                await upstream_token()
                 try:
                     target_termination_seen = False
                     relay_target_failed = False
@@ -397,7 +420,9 @@ async def stream_generator(
                                 _spurious_key = f"{target_url}|{proxy_url or ''}"
                                 if _should_retry_same_route_429(client_model) and _spurious_key not in spurious_429_retried:
                                     spurious_429_retried.add(_spurious_key)
-                                    _delay = _retry_after_seconds(response, RATE_LIMIT_BACKOFF)
+                                    _delay = backoff_delay(
+                                        1, _retry_after_seconds(response, 0.0)
+                                    )
                                     _log(
                                         "STREAM",
                                         f"SPURIOUS-429 {target_url} | retry same-route 1x "
@@ -408,6 +433,18 @@ async def stream_generator(
                                 rate_cls = _classify_rate_limit(response)
                                 last_retry_after = _retry_after_seconds(
                                     response, RATE_LIMIT_BACKOFF
+                                )
+                                # Catat untuk atribusi (target vs sesi vs akun).
+                                # Tanpa ini operator hanya bisa menebak sumber
+                                # 429, dan tebakan salah berujung rotasi sia-sia.
+                                record_429(
+                                    route=_route,
+                                    target=target_url,
+                                    session=_oc_session_tag(headers),
+                                    model=client_model,
+                                    attempt=target_index + 1,
+                                    source=rate_cls.get("source", "unknown"),
+                                    retry_after=last_retry_after,
                                 )
                                 if is_relay:
                                     _mark_relay_rate_limited(
@@ -423,12 +460,69 @@ async def stream_generator(
                                 last_error = f"Rate limited (429): {detail}"
                                 last_rate_limited = True
                                 saw_non_403_failure = True
+                                rate_limit_hits += 1
+                                # Catat 429 untuk tag sesi ini (rotasi sesi).
+                                _session_rotation.note_429(_oc_session_tag(headers))
                                 _log(
                                     "STREAM",
                                     f"RATE-LIMITED {_route} {target_url} | "
                                     f"{rate_cls['description']} | IP dirotasi "
                                     f"terus -> target berikutnya | detail={detail[:300]!r}",
                                 )
+                                # Rotasi SESI saat tag sesi tertentu dipanaskan
+                                # (>= threshold 429 beruntun, sebelum budget
+                                # global habis): session + prompt_cache_key baru
+                                # + rotasi ulang semua target. Mekanisme
+                                # berulang (hingga UPSTREAM_429_SESSION_ROTATIONS).
+                                if (
+                                    not sent_payload
+                                    and _session_rotation_done < UPSTREAM_429_SESSION_ROTATIONS
+                                    and _session_rotation.should_rotate(
+                                        _oc_session_tag(headers)
+                                    )
+                                ):
+                                    _log(
+                                        "STREAM",
+                                        f"SESSION-ROTATE-429 | sesi "
+                                        f"{_oc_session_tag(headers)} panas "
+                                        f"({UPSTREAM_429_SESSION_THRESHOLD}+ 429 "
+                                        f"beruntun) -> fresh sesi + kunci baru, "
+                                        f"rotasi ulang semua target "
+                                        f"(rotasi sesi {_session_rotation_done + 1}/"
+                                        f"{UPSTREAM_429_SESSION_ROTATIONS})",
+                                    )
+                                    _rot_targets, _rot_sess, _rot_key = _fresh_retry_targets(
+                                        targets, payload
+                                    )
+                                    if _rot_targets:
+                                        _session_rotation.mark_rotated()
+                                        _session_rotation_done += 1
+                                        old_tag = _oc_session_tag(opencode_headers)
+                                        targets = _rot_targets
+                                        opencode_headers = {
+                                            **opencode_headers,
+                                            "x-opencode-session": _rot_sess,
+                                            "x-opencode-session-id": _rot_sess,
+                                            "x-session-affinity": _rot_sess,
+                                            "x-session-id": _rot_sess,
+                                        }
+                                        headers = _rot_targets[0][1] if _rot_targets else headers
+                                        rate_limit_hits = 0  # reset: anggaran rotasi IP
+                                        spurious_429_retried = set()
+                                        target_index = 0
+                                        continue
+                                if rotations_exhausted(rate_limit_hits):
+                                    # Budget habis: berhenti merotasi. Melanjutkan
+                                    # hanya menambah request ke bucket yang sama
+                                    # (amplifikasi), bukan menemukan kuota baru.
+                                    _log(
+                                        "STREAM",
+                                        f"RATE-LIMIT-BUDGET {rate_limit_hits} 429 pada "
+                                        f"request ini -> stop rotasi, balas 429 bersih "
+                                        f"(Retry-After) alih-alih menambah attempt",
+                                    )
+                                    target_index = len(targets)  # keluar loop target
+                                    continue
                                 target_index += 1
                                 _log("STREAM",
                                     f"FAIL {_route} {target_url} | upstream-status=429 detail={detail[:300]!r}"

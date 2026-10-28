@@ -22,6 +22,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import OPENCODE_CLIENT_NAME, OPENCODE_PROJECT, OPENCODE_SESSION_ID
+from app.services.model_context import get_model_context_window
 
 
 _BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -930,13 +931,16 @@ RESPONSES_MAX_OUTPUT_TOKENS = 65536
 SPARK_MAX_TOTAL_TOKENS = 1_048_576
 
 
-def _estimate_prompt_tokens(payload: Any) -> int:
-    """Estimasi kasar token input (chars//4 + media), untuk guard 1M.
+def estimate_prompt_tokens(payload: Any) -> int:
+    """Estimasi kasar token input (chars//4 + media + tools).
 
-    Sengaja konservatif (lebih banyak estimasi = clamp lebih dini = aman):
-    teks len//4, tiap part image/file +1000. Bukan pengganti tokenizer;
-    hanya dipakai mencegah overflow 1M kombinasi, bukan untuk billing.
-    Tak pernah melempar.
+    Dipakai untuk dua hal: guard combo 1M upstream dan clamp output per
+    model. Sengaja konservatif (lebih banyak estimasi = clamp lebih dini
+    = aman): teks len//4, tiap part image/file +1000, definisi tools
+    (nama/deskripsi/schema JSON) ikut dihitung karena MCP-heavy request
+    bisa puluhan ribu token tanpa satu pun pesan panjang. Bukan pengganti
+    tokenizer; hanya guard overflow, bukan untuk billing. Tak pernah
+    melempar.
     """
     try:
         total_chars = 0
@@ -946,6 +950,17 @@ def _estimate_prompt_tokens(payload: Any) -> int:
             nonlocal total_chars
             if isinstance(value, str):
                 total_chars += len(value)
+
+        def _add_json(value: Any) -> None:
+            nonlocal total_chars
+            if value is None:
+                return
+            try:
+                total_chars += len(
+                    json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                )
+            except (TypeError, ValueError):
+                _add_text(str(value))
 
         def _walk_content(content: Any) -> None:
             nonlocal images
@@ -986,17 +1001,84 @@ def _estimate_prompt_tokens(payload: Any) -> int:
             for message in messages:
                 if isinstance(message, dict):
                     _walk_content(message.get("content"))
+        # Definisi tools (chat `function.parameters` maupun Responses/MCP
+        # `parameters`/`inputSchema`) tidak pernah lewat `messages`, jadi
+        # tanpa ini request ber-tools besar dianggap kecil.
+        tools = payload.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                if isinstance(tool, str):
+                    _add_text(tool)
+                elif isinstance(tool, dict):
+                    _add_json(tool)
         return total_chars // 4 + images * 1000
     except (TypeError, ValueError, AttributeError):
         return 0
+
+
+# Tokenizer asli tidak tersedia (tanpa dependensi baru); chars//4 bisa
+# UNDER-estimate pada JSON schema, kode, dan teks non-Latin. Faktor + margin
+# ini membuat clamp turun lebih awal agar upstream tidak balas 400
+# "context length" tepat di batas.
+CONTEXT_INPUT_SAFETY_FACTOR = 1.10
+CONTEXT_INPUT_SAFETY_TOKENS = 512
+
+
+def _model_output_budget(window: int, payload: Any, minimum: int) -> Optional[int]:
+    """Sisa token output yang aman untuk `window` setelah estimasi input."""
+    estimated = estimate_prompt_tokens(payload)
+    if estimated <= 0:
+        return None
+    effective = int(estimated * CONTEXT_INPUT_SAFETY_FACTOR) + CONTEXT_INPUT_SAFETY_TOKENS
+    return max(minimum, window - effective)
+
+
+def clamp_max_tokens_for_model(
+    value: Any,
+    payload: Any = None,
+    model_id: Optional[str] = None,
+    *,
+    minimum: int = 1,
+) -> Optional[int]:
+    """Turunkan `max_tokens`/output agar input + output muat window model.
+
+    Schema chat memakai default `max_tokens=65536`; untuk model ber-window
+    131K (deepseek-v4*) itu menyisakan ~65K input saja bila upstream
+    menghitung prompt+output sebagai satu context. Fungsi ini menurunkan
+    nilai HANYA bila perlu: tidak pernah menaikkan permintaan klien, dan
+    mengembalikan None untuk nilai kosong/invalid agar default lama tetap
+    berlaku. Tak pernah melempar.
+    """
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    model = model_id
+    if not model and isinstance(payload, dict):
+        model = payload.get("model")
+    if not model:
+        return v
+    try:
+        window = int(get_model_context_window(model))
+        budget = _model_output_budget(window, payload, minimum)
+    except (TypeError, ValueError, AttributeError):
+        return v
+    if budget is not None and v > budget:
+        return budget
+    return v
 
 
 def clamp_responses_max_output_tokens(value: int, payload: Any = None) -> int:
     """Clamp `max_output_tokens` ke [16, 65536] + guard total 1M.
 
     Return nilai yang aman dikirim ke upstream /zen/v1/responses. Bila
-    `payload` diberikan, estimasi token input dipakai untuk mencegah
-    `input_tokens + max_output_tokens > 1.048.576`. Tak pernah melempar.
+    `payload` diberikan, estimasi token input (termasuk tools) dipakai
+    untuk mencegah `input_tokens + max_output_tokens` melewati combo 1M
+    upstream MAUPUN window model itu sendiri. Tak pernah melempar.
     """
     try:
         v = int(value)
@@ -1007,9 +1089,22 @@ def clamp_responses_max_output_tokens(value: int, payload: Any = None) -> int:
     if v > RESPONSES_MAX_OUTPUT_TOKENS:
         v = RESPONSES_MAX_OUTPUT_TOKENS
     if isinstance(payload, dict):
-        estimated = _estimate_prompt_tokens(payload)
+        estimated = estimate_prompt_tokens(payload)
         if estimated > 0 and estimated + v > SPARK_MAX_TOTAL_TOKENS:
             v = max(RESPONSES_MIN_OUTPUT_TOKENS, SPARK_MAX_TOTAL_TOKENS - estimated)
+        # Batas combo 1M adalah batas API, bukan batas model: gpt-5 (400K),
+        # claude (1M), deepseek (131K) tetap menolak di window masing-masing.
+        # Pakai budget per model bila id-nya dikenal; payload tanpa model
+        # (unit test / probe) tetap hanya memakai guard 1M.
+        model_id = payload.get("model")
+        if model_id:
+            try:
+                window = min(SPARK_MAX_TOTAL_TOKENS, int(get_model_context_window(model_id)))
+                budget = _model_output_budget(window, payload, RESPONSES_MIN_OUTPUT_TOKENS)
+            except (TypeError, ValueError, AttributeError):
+                budget = None
+            if budget is not None and v > budget:
+                v = budget
     return v
 
 

@@ -275,6 +275,54 @@ RATE_LIMIT_BACKOFF = float(os.getenv("RATE_LIMIT_BACKOFF", "2.0"))
 RATE_LIMIT_COOLDOWN = float(os.getenv("RATE_LIMIT_COOLDOWN", "60"))
 
 
+# ==================== RATE GUARD (admission control + atribusi 429) ====================
+# Lihat app/services/rate_guard.py. Dua fungsi, satu saklar:
+#   1. Token bucket global di depan SETIAP attempt upstream. Tujuannya bukan
+#      "menembus" limit, melainkan berhenti menabraknya: laju request keluar
+#      dibatasi di sisi kita, bukan ditemukan lewat 429.
+#   2. Pencatatan + klasifikasi 429 (target / sesi / akun) untuk dashboard.
+# RATE_GUARD_ENABLED=false mengembalikan perilaku lama 100% (tanpa throttle,
+# tanpa pencatatan).
+RATE_GUARD_ENABLED = os.getenv("RATE_GUARD_ENABLED", "true").lower() == "true"
+
+
+# Laju maksimum attempt upstream per detik (global, semua relay/proxy/direct).
+# Kalibrasi dari kuota upstream yang sebenarnya: bila upstream mengizinkan
+# N request/menit, set UPSTREAM_MAX_RPS = N/60 dengan burst kecil. Nilai
+# terlalu tinggi = 429 tetap muncul; terlalu rendah = latensi antre.
+UPSTREAM_MAX_RPS = float(os.getenv("UPSTREAM_MAX_RPS", "6"))
+
+
+# Burst awal token bucket (request yang boleh menumpuk saat idle).
+UPSTREAM_BURST = int(os.getenv("UPSTREAM_BURST", "6"))
+
+
+# Budget rotasi akibat 429 untuk SATU request klien. Rotasi lintas target
+# hanya masuk akal bila limit bersifat per-IP; setelah N target berbeda
+# menjawab 429, hipotesis itu terbantah dan attempt berikutnya hanya
+# menambah beban. 0 = tanpa batas (perilaku lama, bisa sampai ~22 attempt).
+UPSTREAM_MAX_429_ROTATIONS = int(os.getenv("UPSTREAM_MAX_429_ROTATIONS", "3"))
+
+
+# Plafon jeda backoff (detik). Retry-After upstream di atas nilai ini
+# dipotong agar satu request tidak menggantung terlalu lama.
+UPSTREAM_BACKOFF_MAX = float(os.getenv("UPSTREAM_BACKOFF_MAX", "20"))
+
+
+# Jendela analisis pola 429 (detik) untuk klasifikasi di dashboard.
+UPSTREAM_429_WINDOW = float(os.getenv("UPSTREAM_429_WINDOW", "600"))
+
+
+# Berapa kali 429 beruntun dengan SESI YANG SAMA (cross-egress) sebelum
+# gateway memicu rotasi session: session+prompt_cache_key baru, rotasi
+# ulang semua target. Berbeda dari fresh-session 403 (satu upaya terakhir)
+# — ini adalah mekanisme berulang: tiap kali sesi baru juga 429 N kali,
+# rotasi ulang lagi (hingga batas total). 0 = matikan (perilaku lama).
+UPSTREAM_429_SESSION_ROTATIONS = int(os.getenv("UPSTREAM_429_SESSION_ROTATIONS", "2"))
+# Berapa kali 429 beruntun dengan SESI YANG SAMA sebelum sesi dirotasi.
+UPSTREAM_429_SESSION_THRESHOLD = int(os.getenv("UPSTREAM_429_SESSION_THRESHOLD", "3"))
+
+
 # Bug spam-429 opencode khusus muse-spark: upstream kadang mengembalikan 429
 # padahal belum limit. Untuk model Responses-only (muse-spark & co.), coba 1x
 # lagi ke route/relay YANG SAMA (sleep backoff dulu) sebelum ganti route.
@@ -542,3 +590,32 @@ PROXY_CONFIG_PATH = os.getenv("PROXY_CONFIG_PATH", _PROXY_DEFAULT_PATH)
 
 # Batas jumlah proxy (anti-abuse: dashboard tidak bisa menumpuk ribuan).
 PROXY_MAX_COUNT = int(os.getenv("PROXY_MAX_COUNT", "32"))
+
+
+# ==================== BUN SIDECAR (egress fingerprint TLS asli) ====================
+# Bun sidecar: proses `bun bun-sidecar.js` yang di-launch oleh gateway,
+# meneruskan SEMUA egress yang keluar dari server ini (direct + pool proxy
+# WARP-localhost) lewat runtime Bun -> fingerprint TLS = Bun asli
+# (bukan OpenSSL/Python). Relay Vercel TIDAK lewat sini (TLS di sisi Vercel).
+#
+# - `BUN_SIDEcar_ENABLED=true` (default false) mengaktifkan jalur ini.
+#   Bila false / bun tidak tersedia / sidecar mati -> gateway otomatis
+#   fallback ke httpx/socksio (perilaku lama 100%). Tidak ada crash.
+# - `BUN_SIDECAR_SCRIPT` = path file sidecar (default: <root>/bun-sidecar.js).
+# - `BUN_SIDECAR_PORT` / `BUN_SIDECAR_HOST` = alamat listen sidecar.
+# - `BUN_SIDECAR_CMD` = perintah launch (default: "bun <script>"). Isi path
+#   bun bila tidak ada di PATH.
+# - `BUN_SIDECAR_DIRECT_ONLY` (false) = hanya egress DIRECT lewat Bun;
+#   jalur proxy tetap httpx (bila proxy WARP tidak butuh fingerprint Bun).
+BUN_SIDECAR_ENABLED = os.getenv("BUN_SIDECAR_ENABLED", "false").lower() == "true"
+BUN_SIDECAR_SCRIPT = os.getenv(
+    "BUN_SIDECAR_SCRIPT",
+    str(Path(__file__).resolve().parents[2] / "bun-sidecar.js"),
+)
+BUN_SIDECAR_PORT = int(os.getenv("BUN_SIDECAR_PORT", "39001"))
+BUN_SIDECAR_HOST = os.getenv("BUN_SIDECAR_HOST", "127.0.0.1")
+BUN_SIDECAR_CMD = os.getenv("BUN_SIDECAR_CMD", "")  # kosong = "bun <script>"
+BUN_SIDECAR_DIRECT_ONLY = os.getenv("BUN_SIDECAR_DIRECT_ONLY", "false").lower() == "true"
+# Timeout (detik) menunggu sidecar siap saat start; 0 = tidak health-check.
+BUN_SIDECAR_START_TIMEOUT = float(os.getenv("BUN_SIDECAR_START_TIMEOUT", "5"))
+

@@ -244,6 +244,76 @@ def _e4():
     assert payload2["max_output_tokens"] == 65536, payload2["max_output_tokens"]
 
 
+@case("E5 estimasi input menghitung definisi tools")
+def _e5():
+    from app.services.opencode import estimate_prompt_tokens as est
+    tool = {"type": "function", "function": {
+        "name": "big",
+        "description": "d" * 4000,
+        "parameters": {"type": "object", "properties": {
+            "x": {"type": "string", "description": "s" * 4000}}},
+    }}
+    with_tool = est({"messages": [{"role": "user", "content": "hi"}], "tools": [tool]})
+    without = est({"messages": [{"role": "user", "content": "hi"}]})
+    assert with_tool - without >= 2000, (with_tool, without)
+
+
+@case("E6 clamp chat: deepseek 131K + prompt besar -> max_tokens turun")
+def _e6():
+    from app.services.opencode import clamp_max_tokens_for_model as c
+    payload = {"model": "deepseek-v4.1-flash",
+               "messages": [{"role": "user", "content": "x" * 260_000}]}
+    v = c(65536, payload, payload["model"])
+    assert v is not None and 1 <= v < 65536, v
+
+
+@case("E7 clamp chat tidak pernah menaikkan nilai klien")
+def _e7():
+    from app.services.opencode import clamp_max_tokens_for_model as c
+    payload = {"model": "muse-spark-1.3",
+               "messages": [{"role": "user", "content": "hi"}]}
+    assert c(120000, payload, payload["model"]) == 120000
+    assert c(32, payload, payload["model"]) == 32
+    assert c(None, payload) is None
+    assert c(0, payload) is None
+    assert c("bukan-angka", payload) is None
+
+
+@case("E8 tools besar ikut memicu clamp (MCP-heavy)")
+def _e8():
+    from app.services.opencode import clamp_max_tokens_for_model as c
+    big_schema = {"type": "object", "properties": {
+        "a": {"type": "string", "description": "z" * 300_000}}}
+    payload = {"model": "deepseek-v4.1-flash",
+               "messages": [{"role": "user", "content": "hi"}],
+               "tools": [{"type": "function", "function": {
+                   "name": "big", "parameters": big_schema}}]}
+    v = c(65536, payload, payload["model"])
+    assert v is not None and 1 <= v < 65536, v
+
+
+@case("E9 build_upstream_payload: default 65536 ikut di-clamp")
+def _e9():
+    from app.services.upstream import build_upstream_payload
+    from app.core.schemas import ChatCompletionRequest
+    req = ChatCompletionRequest(
+        model="deepseek-v4.1-flash",
+        messages=[{"role": "user", "content": "x" * 260_000}],
+    )
+    p = build_upstream_payload(req)
+    assert 1 <= p["max_tokens"] < 65536, p["max_tokens"]
+
+
+@case("E10 responses clamp ikut window model, guard 1M tetap")
+def _e10():
+    from app.services.opencode import clamp_responses_max_output_tokens as c
+    v = c(65536, {"model": "deepseek-v4.1-flash", "input": "x" * 260_000})
+    assert 16 <= v < 65536, v
+    legacy = c(65536, {"input": [{"role": "user", "content": [
+        {"type": "input_text", "text": "x" * 4_000_000}]}]})
+    assert legacy == 48_576, legacy
+
+
 # ---------- F. normalize_claude_tool_input ----------
 
 @case("F1 Bash: cmd/script/command_line/commandLine/input/code -> command")

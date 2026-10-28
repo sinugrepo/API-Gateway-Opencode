@@ -22,6 +22,7 @@ from app.core.logging_utils import _get_live_logs, _live_log_lock, _live_logs, _
 from app.core import logging_utils as _logging_utils
 from app.security.monitor_auth import _check_monitor, _make_monitor_token
 from app.services.relay import _relay_penalty, _relay_penalty_lock, _relay_stream_broken, _relay_stream_broken_lock, test_relay_connection
+from app.services import rate_guard as _rate_guard
 from app.security.scan_guard import _banned_ips, _scan_guard_lock, _scan_guard_prune, _scan_hits
 from app.services.usage import _query_recent_requests, _query_usage_history, _resolve_period
 from app.routes.misc import get_props, health
@@ -112,6 +113,28 @@ async def monitor_api_health(request: Request):
     if not _check_monitor(request):
         raise HTTPException(status_code=401)
     return await health()
+
+
+# ==================== RATE GUARD: admission + atribusi 429 ====================
+# Endpoint baca-saja: menampilkan laju yang diizinkan, rasio 429 terhadap
+# attempt, sebaran 429 per target/route/sesi/model, dan KLASIFIKASI pola
+# (target-scoped / session-scoped / account-scoped / relay-platform).
+# Tujuannya menjawab "kenapa 429" dengan data, bukan dengan menambah rotasi.
+@router.get("/monitor/api/ratelimit")
+async def monitor_api_ratelimit(request: Request):
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    return _rate_guard.snapshot()
+
+
+@router.post("/monitor/api/ratelimit/reset")
+async def monitor_api_ratelimit_reset(request: Request):
+    """Kosongkan recorder + statistik admission (bukan mengubah konfigurasi)."""
+    if not _check_monitor(request):
+        raise HTTPException(status_code=401)
+    cleared = _rate_guard.reset()
+    _log("MONITOR", f"rate-guard recorder direset: {cleared['events_cleared']} event dibuang")
+    return {"ok": True, **cleared}
 
 
 @router.get("/monitor/api/usage")
